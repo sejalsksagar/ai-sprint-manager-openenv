@@ -1,46 +1,88 @@
 """
-Gradio UI for AI Sprint Manager OpenEnv
+Combined FastAPI + Gradio app for AI Sprint Manager
+Runs everything on port 7860 for HF Spaces
 """
 import gradio as gr
 import requests
 import json
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+import uvicorn
 
-ENV_URL = "http://localhost:7860"
+from sprint_env.environment import SprintManagerEnv
+from sprint_env.models import SprintAction
+
+# ── Single shared env instance ────────────────────────────────────────────────
+env = SprintManagerEnv()
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+api = FastAPI()
+
+@api.post("/reset")
+def reset(req: dict = {}):
+    obs = env.reset(
+        task_name=req.get("task_name", "easy_sprint"),
+        seed=req.get("seed"),
+        episode_id=req.get("episode_id"),
+    )
+    return obs.model_dump()
+
+@api.post("/step")
+def step(req: dict):
+    action_data = req.get("action", {})
+    action = SprintAction(**action_data)
+    obs, reward, done, info = env.step(action)
+    return {"observation": obs.model_dump(), "reward": reward, "done": done, "info": info}
+
+@api.get("/state")
+def state():
+    return env.state.model_dump()
+
+@api.get("/health")
+def health():
+    return {"status": "ok", "env": "ai-sprint-manager"}
+
+@api.get("/tasks")
+def tasks():
+    return {"tasks": [
+        {"id": "easy_sprint", "difficulty": "easy"},
+        {"id": "medium_sprint", "difficulty": "medium"},
+        {"id": "hard_sprint", "difficulty": "hard"},
+    ]}
+
+# ── Gradio UI functions (call env directly, not via HTTP) ─────────────────────
 
 def reset_env(task_name):
     try:
-        r = requests.post(f"{ENV_URL}/reset", json={"task_name": task_name, "seed": 42})
-        obs = r.json()
-        return format_sprint_board(obs), format_developers(obs), format_events(obs), obs
+        obs = env.reset(task_name=task_name, seed=42)
+        obs_dict = obs.model_dump()
+        return format_sprint_board(obs_dict), format_developers(obs_dict), format_events(obs_dict), obs_dict
     except Exception as e:
         return str(e), "", "", {}
 
 def take_action(action_type, task_id, dev_id, new_priority, current_obs):
     try:
-        action = {
-            "action_type": action_type,
-            "task_id": task_id or None,
-            "dev_id": dev_id or None,
-            "new_priority": int(new_priority) if new_priority else None,
-        }
-        r = requests.post(f"{ENV_URL}/step", json={"action": action})
-        result = r.json()
-        obs = result["observation"]
-        reward = result["reward"]
-        done = result["done"]
+        action = SprintAction(
+            action_type=action_type,
+            task_id=task_id or None,
+            dev_id=dev_id or None,
+            new_priority=int(new_priority) if new_priority else None,
+        )
+        obs, reward, done, info = env.step(action)
+        obs_dict = obs.model_dump()
 
-        event_text = format_events(obs)
+        event_text = format_events(obs_dict)
         if reward != 0:
             event_text += f"\n💰 Step Reward: {reward:+.2f}"
         if done:
-            event_text += "\n\n🏁 SPRINT COMPLETE!"
+            event_text += f"\n\n🏁 SPRINT COMPLETE! Score: {info.get('final_score', 0):.2f}"
 
         return (
-            format_sprint_board(obs),
-            format_developers(obs),
+            format_sprint_board(obs_dict),
+            format_developers(obs_dict),
             event_text,
-            format_metrics(obs),
-            obs,
+            format_metrics(obs_dict),
+            obs_dict,
         )
     except Exception as e:
         return str(e), "", "", "", current_obs
@@ -51,9 +93,7 @@ def format_sprint_board(obs):
 
     sections = {"backlog": [], "in_progress": [], "done": [], "missed": [], "blocked": []}
     for t in obs["tasks"]:
-        s = t["status"]
-        if s not in sections:
-            s = "backlog"
+        s = t["status"] if t["status"] in sections else "backlog"
         bar = "█" * int(t["progress"] * 10) + "░" * (10 - int(t["progress"] * 10))
         sections[s].append(
             f"  [{t['id']}] {t['name']}\n"
@@ -65,26 +105,17 @@ def format_sprint_board(obs):
 
     day = obs.get("current_day", "?")
     sprint_len = obs.get("sprint_length", 10)
-    day_bar = "▓" * day + "░" * (sprint_len - day)
-
+    day_bar = "▓" * int(day) + "░" * (int(sprint_len) - int(day))
     out = f"📅 Day {day}/{sprint_len}  [{day_bar}]\n"
     out += f"✅ Done:{obs['tasks_completed']}  ❌ Missed:{obs['tasks_missed']}  "
     out += f"🔄 In Progress:{obs['tasks_in_progress']}  📋 Backlog:{obs['tasks_backlog']}\n"
     out += "─" * 50 + "\n"
 
-    labels = {
-        "backlog": "📋 BACKLOG",
-        "in_progress": "🔄 IN PROGRESS",
-        "done": "✅ DONE",
-        "missed": "❌ MISSED",
-        "blocked": "🚫 BLOCKED",
-    }
-    for key, label in labels.items():
-        items = sections[key]
-        if items:
-            out += f"\n{label} ({len(items)})\n"
-            out += "\n".join(items) + "\n"
-
+    for key, label in [("backlog","📋 BACKLOG"),("in_progress","🔄 IN PROGRESS"),
+                        ("done","✅ DONE"),("missed","❌ MISSED"),("blocked","🚫 BLOCKED")]:
+        if sections[key]:
+            out += f"\n{label} ({len(sections[key])})\n"
+            out += "\n".join(sections[key]) + "\n"
     return out
 
 def format_developers(obs):
@@ -92,23 +123,18 @@ def format_developers(obs):
         return ""
     out = "👥 DEVELOPER WORKLOAD\n" + "─" * 40 + "\n"
     for d in obs["developers"]:
-        load = d["current_load"]
-        cap = d["capacity"]
+        load, cap = d["current_load"], d["capacity"]
         filled = min(int((load / cap) * 10) if cap > 0 else 0, 10)
         bar = "█" * filled + "░" * (10 - filled)
         status = "✅" if d["is_available"] else "🤒"
-        out += (
-            f"{status} {d['name']} ({d['skill']})\n"
-            f"   Load: [{bar}] {load}/{cap} pts\n"
-            f"   Tasks: {d['assigned_tasks'] or 'none'}\n\n"
-        )
+        out += f"{status} {d['name']} ({d['skill']})\n"
+        out += f"   Load: [{bar}] {load}/{cap} pts\n"
+        out += f"   Tasks: {d['assigned_tasks'] or 'none'}\n\n"
     return out
 
 def format_events(obs):
     events = obs.get("events", [])
-    if not events:
-        return "No events yet."
-    return "\n".join(f"• {e}" for e in events)
+    return "\n".join(f"• {e}" for e in events) if events else "No events yet."
 
 def format_metrics(obs):
     if not obs:
@@ -120,104 +146,49 @@ def format_metrics(obs):
         f"❌ Missed: {obs.get('tasks_missed', 0)}"
     )
 
-# ── Build UI ──────────────────────────────────────────────────────────────────
-
-with gr.Blocks(
-    title="🤖 AI Sprint Manager",
-    theme=gr.themes.Soft(),
-    css=".gradio-container { max-width: 1200px; margin: auto; }"
-) as demo:
-
+# ── Gradio UI ─────────────────────────────────────────────────────────────────
+with gr.Blocks(title="🤖 AI Sprint Manager", theme=gr.themes.Soft()) as demo:
     current_obs = gr.State({})
 
-    gr.Markdown("""
-    # 🤖 AI Sprint Manager — OpenEnv
-    **An RL environment where an AI agent manages agile sprints.**
-    Assign tasks to developers, balance workload, and hit deadlines!
-    """)
+    gr.Markdown("# 🤖 AI Sprint Manager — OpenEnv\n**RL environment for agile sprint management.**")
 
     with gr.Row():
         task_selector = gr.Dropdown(
             choices=["easy_sprint", "medium_sprint", "hard_sprint"],
-            value="easy_sprint",
-            label="Select Sprint Scenario",
+            value="easy_sprint", label="Sprint Scenario"
         )
         reset_btn = gr.Button("🔄 Reset Sprint", variant="primary")
 
     with gr.Row():
         with gr.Column(scale=2):
-            sprint_board = gr.Textbox(
-                label="📋 Sprint Board",
-                lines=25,
-                interactive=False,
-            )
+            sprint_board = gr.Textbox(label="📋 Sprint Board", lines=25, interactive=False)
         with gr.Column(scale=1):
-            dev_panel = gr.Textbox(
-                label="👥 Developers",
-                lines=12,
-                interactive=False,
-            )
-            metrics_panel = gr.Textbox(
-                label="📊 Metrics",
-                lines=6,
-                interactive=False,
-            )
+            dev_panel = gr.Textbox(label="👥 Developers", lines=12, interactive=False)
+            metrics_panel = gr.Textbox(label="📊 Metrics", lines=6, interactive=False)
 
     gr.Markdown("### 🎮 Take Action")
     with gr.Row():
         action_type = gr.Dropdown(
-            choices=["assign", "reassign", "reprioritize", "unblock", "skip"],
-            value="assign",
-            label="Action Type",
+            choices=["assign","reassign","reprioritize","unblock","skip"],
+            value="assign", label="Action Type"
         )
-        task_id_input = gr.Textbox(label="Task ID (e.g. T1)", placeholder="T1")
-        dev_id_input = gr.Textbox(label="Developer ID (e.g. dev1)", placeholder="dev1")
-        priority_input = gr.Dropdown(
-            choices=["", "1", "2", "3", "4", "5"],
-            value="",
-            label="New Priority (reprioritize only)",
-        )
+        task_id_input = gr.Textbox(label="Task ID", placeholder="T1")
+        dev_id_input = gr.Textbox(label="Developer ID", placeholder="dev1")
+        priority_input = gr.Dropdown(choices=["","1","2","3","4","5"], value="", label="Priority")
 
     step_btn = gr.Button("▶️ Take Action", variant="primary")
-
-    event_log = gr.Textbox(
-        label="📜 Event Log",
-        lines=5,
-        interactive=False,
-    )
+    event_log = gr.Textbox(label="📜 Event Log", lines=5, interactive=False)
 
     gr.Markdown("""
-    ---
-    ### 📖 Quick Guide
-    | Action | What it does |
-    |--------|-------------|
-    | `assign` | Put a backlog task onto a developer |
-    | `reassign` | Move a task to a different developer |
-    | `reprioritize` | Change a task's priority (1=highest) |
-    | `unblock` | Unblock a stuck task |
-    | `skip` | Let the sprint advance without acting |
-
-    **Tips:** Match developer skills to task requirements for bonus reward!
-    Backend tasks → Alice (dev1) | Frontend → Bob (dev2) | Any → Carol (dev3)
+    **Tips:** Backend tasks → Alice (dev1) | Frontend → Bob (dev2) | Any → Carol (dev3)
     """)
 
-    reset_btn.click(
-        fn=reset_env,
-        inputs=[task_selector],
-        outputs=[sprint_board, dev_panel, event_log, current_obs],
-    )
+    reset_btn.click(reset_env, [task_selector], [sprint_board, dev_panel, event_log, current_obs])
+    step_btn.click(take_action, [action_type, task_id_input, dev_id_input, priority_input, current_obs],
+                   [sprint_board, dev_panel, event_log, metrics_panel, current_obs])
 
-    step_btn.click(
-        fn=take_action,
-        inputs=[action_type, task_id_input, dev_id_input, priority_input, current_obs],
-        outputs=[sprint_board, dev_panel, event_log, metrics_panel, current_obs],
-    )
-
-# ── Mount FastAPI routes into Gradio (single port 7860) ───────────────────────
-from server import app as fastapi_app
-
-for route in fastapi_app.routes:
-    demo.app.router.routes.append(route)
+# ── Mount Gradio into FastAPI and serve everything on 7860 ────────────────────
+app = gr.mount_gradio_app(api, demo, path="/")
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
