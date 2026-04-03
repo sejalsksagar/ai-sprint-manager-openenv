@@ -4,6 +4,10 @@ Gradio UI for AI Sprint Manager OpenEnv
 import gradio as gr
 import requests
 import json
+from fastapi import FastAPI
+from server import app as fastapi_app
+import uvicorn
+import threading
 
 ENV_URL = "http://localhost:8000"
 
@@ -216,6 +220,13 @@ with gr.Blocks(
         inputs=[action_type, task_id_input, dev_id_input, priority_input, current_obs],
         outputs=[sprint_board, dev_panel, event_log, metrics_panel, current_obs],
     )
+
+def run_fastapi():
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
+
+# Start FastAPI in background thread
+thread = threading.Thread(target=run_fastapi, daemon=True)
+thread.start()
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
