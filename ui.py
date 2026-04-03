@@ -4,12 +4,8 @@ Gradio UI for AI Sprint Manager OpenEnv
 import gradio as gr
 import requests
 import json
-from fastapi import FastAPI
-from server import app as fastapi_app
-import uvicorn
-import threading
 
-ENV_URL = "http://localhost:8000"
+ENV_URL = "http://localhost:7860"
 
 def reset_env(task_name):
     try:
@@ -33,7 +29,6 @@ def take_action(action_type, task_id, dev_id, new_priority, current_obs):
         reward = result["reward"]
         done = result["done"]
 
-        events = obs.get("events", [])
         event_text = format_events(obs)
         if reward != 0:
             event_text += f"\n💰 Step Reward: {reward:+.2f}"
@@ -99,8 +94,7 @@ def format_developers(obs):
     for d in obs["developers"]:
         load = d["current_load"]
         cap = d["capacity"]
-        filled = int((load / cap) * 10) if cap > 0 else 0
-        filled = min(filled, 10)
+        filled = min(int((load / cap) * 10) if cap > 0 else 0, 10)
         bar = "█" * filled + "░" * (10 - filled)
         status = "✅" if d["is_available"] else "🤒"
         out += (
@@ -207,8 +201,6 @@ with gr.Blocks(
     Backend tasks → Alice (dev1) | Frontend → Bob (dev2) | Any → Carol (dev3)
     """)
 
-    # ── Event handlers ────────────────────────────────────────────────────────
-
     reset_btn.click(
         fn=reset_env,
         inputs=[task_selector],
@@ -221,12 +213,11 @@ with gr.Blocks(
         outputs=[sprint_board, dev_panel, event_log, metrics_panel, current_obs],
     )
 
-def run_fastapi():
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
+# ── Mount FastAPI routes into Gradio (single port 7860) ───────────────────────
+from server import app as fastapi_app
 
-# Start FastAPI in background thread
-thread = threading.Thread(target=run_fastapi, daemon=True)
-thread.start()
+for route in fastapi_app.routes:
+    demo.app.router.routes.append(route)
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
