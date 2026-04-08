@@ -1,267 +1,245 @@
-# 📖 Technical Guide — AI Sprint Manager OpenEnv
+# 📖 Complete Guide — AI Sprint Manager OpenEnv
 
-**What exactly are we building, how does it work, and how do you know it's working?**
+**What we built, how to test it, how to demo it, and how to explain it.**
 
 ---
 
-## 🤔 What Are We Building — In Simple Words
+## 🤔 What Are We Building — Plain English
 
-Imagine you're a Tech Lead at a software company. Every 2 weeks (a "sprint"), your team gets a list of tasks — new features, bug fixes, etc. Your job is to decide:
+Imagine you're the Tech Lead of a software company. Every 2 weeks (called a "sprint"), your team gets a list of tasks — new features, bug fixes, tech debt. Your job is to decide:
+
 - Which developer gets which task?
-- What's most urgent?
-- What do you do when a developer is sick or a new bug appears?
+- What's most urgent when a new bug appears?
+- What do you do when someone calls in sick?
+- How do you avoid burning out your best developer?
 
-**We built a simulation of this scenario** so that an AI agent can practice making these decisions and learn to get better over time — the same way a human learns from experience.
+**We built a simulation of this scenario** so an AI agent can practice making these decisions thousands of times and learn to get better — just like how AlphaGo learned to play Go by playing millions of games against itself.
 
-The AI agent plays the role of the Tech Lead. It looks at the current state of the sprint (who's working on what, what's due soon, who's available) and decides what action to take next.
+The AI plays the role of the Tech Lead. It looks at the sprint state and decides what to do. The environment tells it how well it did (reward). Over time, it learns better strategies.
 
 ---
 
-## 🏗️ How The System Is Built — Layer by Layer
+## 🏗️ How It's Built — Layer by Layer
 
 ```
-┌─────────────────────────────────────────┐
-│         YOU / AI AGENT                  │
-│   (makes decisions: assign, skip, etc.) │
-└──────────────────┬──────────────────────┘
-                   │  HTTP requests
-                   ▼
-┌─────────────────────────────────────────┐
-│         FASTAPI SERVER                  │
-│   /reset  /step  /state  /health        │
-│   (receives actions, returns results)   │
-└──────────────────┬──────────────────────┘
-                   │  calls
-                   ▼
-┌─────────────────────────────────────────┐
-│      SPRINT ENVIRONMENT (core logic)    │
-│   - Tracks tasks, developers, days      │
-│   - Calculates rewards                  │
-│   - Simulates work progress             │
-│   - Fires random events (bugs, absence) │
-└─────────────────────────────────────────┘
-                   │  visualized by
-                   ▼
-┌─────────────────────────────────────────┐
-│         GRADIO UI                       │
-│   (Sprint board, dev workload, metrics) │
-└─────────────────────────────────────────┘
+YOU / AI AGENT
+  ↓  makes decisions (assign, skip, reprioritize...)
+FASTAPI SERVER  (ui.py / server/app.py)
+  ↓  receives actions, returns results
+SPRINT ENVIRONMENT  (sprint_env/environment.py)
+  ↓  core logic: tracks tasks, devs, days, rewards
+DATA  (data/sprint_data.json)
+  ↓  tasks and developers — fully customizable
+GRADIO UI  (ui.py)
+     visual sprint board, charts, controls
 ```
 
 ---
 
-## 🔄 What Happens Each "Step"
+## 📁 What Each File Does
 
-One step = one day in the sprint. Here's exactly what happens:
-
-1. **Agent sees the current state** — all tasks, all developers, current day, recent events
-2. **Agent picks an action** — e.g. "Assign Task T1 to Developer Alice"
-3. **Environment processes the action** — checks if it's valid, applies it
-4. **Sprint advances one day** — developers work on their assigned tasks, progress increases
-5. **Random events may fire** — developer goes sick, new urgent bug appears
-6. **Reward is calculated** — positive for good moves, negative for bad ones
-7. **Agent sees the new state** — repeat until sprint ends (day 10)
-
----
-
-## 🎯 The Three Tasks Explained
-
-| Task | What Makes It Hard |
-|------|-------------------|
-| `easy_sprint` | 3 devs, 5 tasks, no surprises. Just assign correctly. |
-| `medium_sprint` | 4 devs, 8 tasks. Devs randomly go unavailable. Bugs appear in backlog. |
-| `hard_sprint` | 5 devs, 12 tasks. Urgent bugs appear mid-sprint. Dev absences. Tasks cascade. |
+| File | Purpose | Change it to... |
+|------|---------|----------------|
+| `data/sprint_data.json` | All scenario data | Add your own tasks/devs |
+| `sprint_env/models.py` | Data contracts (Action/Observation/State) | Add new fields |
+| `sprint_env/tasks.py` | Task & Developer classes | Add new task types |
+| `sprint_env/environment.py` | Core RL logic | Change simulation rules |
+| `sprint_env/graders.py` | Scoring (easy/medium/hard) | Change scoring weights |
+| `sprint_env/data_loader.py` | Loads JSON data with caching | Point to custom data |
+| `server/app.py` | OpenEnv HTTP API entry point | Add new endpoints |
+| `client.py` | Typed Python client for RL training | Use in training scripts |
+| `ui.py` | Gradio UI + combined server | Change UI layout |
+| `inference.py` | Baseline LLM agent | Change model/strategy |
+| `openenv.yaml` | OpenEnv spec metadata | Update task list |
 
 ---
 
-## 💰 How Rewards Work
-
-The agent gets **positive rewards** for good behaviour:
-- ✅ Assigning a task to the right skill dev: **+0.5 to +1.0**
-- ✅ Task completed on time: **+0.5 to +2.5** (depends on priority)
-- ✅ Unblocking a blocked task: **+0.3**
-
-The agent gets **negative rewards** for bad behaviour:
-- ❌ Assigning to wrong skill: **-0.15**
-- ❌ Task missed deadline: **-0.3 to -1.5**
-- ❌ Doing nothing (skip): **-0.05**
-- ❌ Urgent bug missed: **-0.25 extra**
-
-At the end of the sprint, a **final score (0.0–1.0)** is computed by the grader and a bonus reward is given.
-
----
-
-## 📊 What the Scores Mean
+## 🔄 What Happens Each Step
 
 ```
-easy_sprint:   0.0  → Agent assigned wrong skills all game
-medium_sprint: 0.46 → Agent got some tasks done, missed others
-hard_sprint:   0.0  → Cascade failures overwhelmed the agent
+Day 1 → Day 2 → Day 3 → ... → Day 10 → DONE
+  ↑        ↑        ↑
+agent    agent    agent
+acts     acts     acts
 ```
 
-**A score of 0.0 doesn't mean broken** — it means the task is hard and the baseline LLM isn't smart enough yet. The environment is working correctly; the agent just needs improvement.
+**One step = one day in the sprint:**
 
-**A perfect agent would score:**
-- easy: ~0.85–1.0
-- medium: ~0.60–0.80
-- hard: ~0.40–0.60
+1. Agent receives observation (all tasks, all devs, current day)
+2. Agent picks an action (e.g. "assign T1 to dev1")
+3. Environment validates the action
+4. Developers work on assigned tasks — progress increases
+5. Random events fire (dev goes sick, new bug appears)
+6. Reward is calculated and returned
+7. Repeat until Day 10 or all tasks resolved
 
 ---
 
-## 🧪 How To Test Everything Is Working Correctly
+## 💰 Reward Design — Why It Works for RL
 
-### Test 1: Health Check ✅
+The reward function is **shaped** (signal at every step) not **sparse** (only at the end):
+
+```
+Good actions  →  positive reward immediately
+Bad actions   →  negative reward immediately
+Task done on time  →  bonus
+Task missed deadline  →  penalty
+Sprint ends  →  final_score × 10 bonus
+```
+
+This means a learning agent gets feedback on every single decision — critical for efficient RL training with GRPO, PPO, or any policy gradient algorithm.
+
+---
+
+## ✅ How To Know Everything Is Working
+
+### Quick 60-second check
+
 ```bash
-# Mac
+# 1. Start server
+python ui.py
+
+# 2. In another terminal — health check
 curl http://localhost:7860/health
+# Expected: {"status":"ok","env":"ai-sprint-manager"}
 
-# Windows
-Invoke-WebRequest -Uri http://localhost:7860/health -Method GET
-```
-**Expected:** `{"status":"ok","env":"ai-sprint-manager"}`
-**What it means:** The server is running and reachable.
-
----
-
-### Test 2: Reset Works ✅
-```bash
-# Mac
+# 3. Reset
 curl -X POST http://localhost:7860/reset \
   -H "Content-Type: application/json" \
-  -d '{"task_name": "easy_sprint", "seed": 42}'
-```
-**Expected:** JSON with `current_day: 1`, 5 tasks all in `backlog` status, 3 developers.
-**What it means:** A new sprint episode starts cleanly each time.
+  -d '{"task_name":"easy_sprint","seed":42}'
+# Expected: JSON with current_day=1, 5 tasks in backlog
 
----
-
-### Test 3: Step Works ✅
-```bash
-# Mac
+# 4. Step
 curl -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
-  -d '{"action": {"action_type": "assign", "task_id": "T1", "dev_id": "dev1"}}'
-```
-**Expected:** `reward` around `+1.2`, task T1 now shows `status: in_progress`, assigned to `dev1`.
-**What it means:** Actions are processed and the environment advances correctly.
+  -d '{"action":{"action_type":"assign","task_id":"T1","dev_id":"dev1"}}'
+# Expected: reward around +1.2, T1 now in_progress
 
----
-
-### Test 4: Skill Mismatch is Rejected ✅
-Try assigning a backend task to a frontend dev:
-```bash
-# T1 is backend, dev2 is frontend — should fail
-curl -X POST http://localhost:7860/step \
-  -H "Content-Type: application/json" \
-  -d '{"action": {"action_type": "assign", "task_id": "T1", "dev_id": "dev2"}}'
-```
-**Expected:** `reward: -0.15`, event says "can't take task (capacity/skill mismatch)"
-**What it means:** The environment correctly enforces skill constraints.
-
----
-
-### Test 5: Sprint Ends After Day 10 ✅
-Keep calling `/step` with skip actions:
-```bash
-curl -X POST http://localhost:7860/step \
-  -H "Content-Type: application/json" \
-  -d '{"action": {"action_type": "skip"}}'
-```
-After 10 calls, `done` should become `true`.
-**What it means:** Episode boundaries work correctly.
-
----
-
-### Test 6: State is Consistent ✅
-```bash
-curl http://localhost:7860/state
-```
-**Expected:** Full state including episode_id, current_day, all tasks and developers.
-**What it means:** The state endpoint returns accurate internal state.
-
----
-
-### Test 7: OpenEnv Validation ✅
-```bash
+# 5. Validate
 openenv validate
-```
-**Expected:** `[OK] ai-sprint-manager: Ready for multi-mode deployment`
-**What it means:** Your environment meets the official OpenEnv spec requirements.
+# Expected: [OK] ai-sprint-manager: Ready for multi-mode deployment
 
----
-
-### Test 8: Inference Script ✅
-```bash
+# 6. Run inference
 python inference.py
+# Expected: [START]/[STEP]/[END] lines, scores for all 3 tasks
 ```
-**Expected:** Scores printed for all 3 tasks, runtime under 20 minutes, no crashes.
-**What it means:** The baseline agent can run against your environment end-to-end.
+
+### Full test checklist
+
+| # | Test | How | Pass Condition |
+|---|------|-----|---------------|
+| 1 | Server health | `GET /health` | `{"status":"ok"}` |
+| 2 | Reset works | `POST /reset` | day=1, tasks in backlog |
+| 3 | Assign works | `POST /step` assign T1→dev1 | reward +1.2, T1 in_progress |
+| 4 | Skill mismatch rejected | Assign backend task to frontend dev | reward -0.15, error message |
+| 5 | Sprint ends | 10 skip steps | `done: true` |
+| 6 | Grader runs | Check final_score in info | value between 0.0 and 1.0 |
+| 7 | OpenEnv valid | `openenv validate` | `[OK]` message |
+| 8 | Inference output | `python inference.py` | `[START]` `[STEP]` `[END]` lines |
+| 9 | Docker build | `docker build .` | Exit code 0 |
+| 10 | Docker run | `docker run -p 7860:7860 ...` then health | `{"status":"ok"}` |
+| 11 | Live Space | `curl https://sejal-k-ai-sprint-manager.hf.space/health` | `{"status":"ok"}` |
+| 12 | UI loads | Open http://localhost:7860 | Gradio UI visible |
+| 13 | UI reset | Click Reset Sprint | Sprint board populates |
+| 14 | Auto-assign | Click Auto-Assign All | Tasks move to in_progress |
+| 15 | Reward chart | Take 3+ actions | Sparkline appears |
 
 ---
 
-### Test 9: Docker Works ✅
+## 🎤 Project Demo Script (10 minutes)
+
+### Before Demo
 ```bash
-docker build -t ai-sprint-manager .
-docker run -p 7860:7860 ai-sprint-manager
-# Then test health endpoint
-curl http://localhost:7860/health
+python ui.py
+# Open http://localhost:7860 in browser — full screen
+# Have terminal with inference.py output ready
 ```
-**What it means:** The environment can run in a clean isolated container.
 
----
+### [0:00 — 1:30] The Problem
+> "Software teams waste hours every sprint on planning. Which developer gets which task? What happens when someone goes sick? What if a critical bug appears on day 5? These decisions directly affect delivery speed and developer burnout."
 
-### Test 10: UI Works ✅
-Open http://localhost:7860 and:
-1. Reset with `easy_sprint` → see 5 tasks in backlog
-2. Assign T3 → dev2 → see reward and task move to in_progress
-3. Skip a few times → see days advance
-4. Let sprint end → see "SPRINT COMPLETE" message
+> "We built an RL environment that simulates exactly this — so an AI agent can learn to make these decisions better."
 
-**What it means:** The Gradio UI correctly communicates with the environment.
+### [1:30 — 3:00] Show the UI
+- Select `easy_sprint` → **🔄 Reset Sprint**
+- Point to sprint board: *"5 tasks in backlog, 3 developers, 10 day sprint"*
+- Point to Skill Guide: *"This tells you which dev is right for which task. Backend tasks need Alice, frontend tasks need Bob."*
 
----
+### [3:00 — 4:30] Manual Play — Good vs Bad Decision
+- Assign T3 (frontend) → dev1 (backend): *"Wrong skill — negative reward, task rejected"*
+- Assign T3 (frontend) → dev2 (frontend): *"Correct match — positive reward, task starts"*
+- Point to reward chart: *"See the reward signal? This is exactly what the AI learns from."*
 
-## 🚦 Quick Sanity Check Table
+### [4:30 — 6:00] Auto-Assign
+- Click **🤖 Auto-Assign All**
+- *"Rule-based auto-assign picks the best skill match for every task."*
+- Click **▶️ Take Action** (skip) a few times
+- *"Each day the sprint advances, tasks progress, deadlines approach."*
 
-| Check | Command | Pass Condition |
-|-------|---------|---------------|
-| Server running | GET /health | `{"status":"ok"}` |
-| Reset works | POST /reset | `current_day: 1`, tasks in backlog |
-| Step works | POST /step | reward changes, day advances |
-| Skill rules work | Assign wrong skill | Negative reward, error message |
-| Sprint ends | 10 skip steps | `done: true` |
-| Grader works | Check final score | Score between 0.0 and 1.0 |
-| OpenEnv valid | `openenv validate` | `[OK]` message |
-| Docker works | docker run + health | `{"status":"ok"}` |
-| Inference runs | `python inference.py` | 3 scores printed, no crash |
+### [6:00 — 7:30] Hard Sprint
+- Reset with `hard_sprint`
+- *"12 tasks, 5 developers, random events — developers go sick, urgent bugs appear mid-sprint."*
+- Auto-assign, then skip a few times
+- When a 🚨 event fires: *"There — urgent bug on day 4. A trained agent needs to react and reassign resources."*
+
+### [7:30 — 9:00] Inference Output
+- Show terminal with inference.py output
+- *"This is our Llama 3.1 baseline running against all 3 scenarios automatically."*
+- Point to structured output: *"`[START]` `[STEP]` `[END]` — machine-parseable format the judges require."*
+- Point to scores: *"Easy sprint perfect score of 1.0 — validates the environment works. Hard sprint 0.0 — shows it genuinely challenges frontier models."*
+
+### [9:00 — 10:00] Technical Highlights
+> "What makes this submission stand out:"
+
+- **Real-world domain** — not CartPole, not a game — actual software engineering
+- **External data file** — `data/sprint_data.json` — anyone can plug in their own team
+- **Typed Python client** — `client.py` makes it plug-and-play with TRL, Stable-Baselines3
+- **OpenEnv compliant** — passes all 3 validation checks
+- **Shaped rewards** — signal at every step, enables efficient RL training
 
 ---
 
 ## 🐛 Common Issues & Fixes
 
-| Problem | Likely Cause | Fix |
-|---------|-------------|-----|
+| Problem | Cause | Fix |
+|---------|-------|-----|
 | `ModuleNotFoundError` | Missing package | `pip install -r requirements.txt` |
-| `Connection refused` | Server not running | Start `python ui.py` first |
-| `401 Unauthorized` | Bad HF token | Check `.env` file, regenerate token |
-| `Skill mismatch` error | Wrong dev for task | Check dev skills in observation |
-| Score always 0.0 | All tasks missed | Assign tasks earlier in the sprint |
-| Docker timeout | Slow internet | Run `docker pull python:3.11-slim` first |
+| Port 7860 in use | Other process | Kill it or change port in ui.py |
+| `401 Unauthorized` in inference | Bad HF token | Regenerate at hf.co/settings/tokens |
+| Validate step 3 fails | openenv not in PATH | Activate venv before running script |
+| Tasks not progressing | No devs assigned | Auto-Assign or assign manually |
+| Score always 0.0 | All tasks missed | Assign earlier, prioritize urgent tasks |
+| Docker timeout | venv in context | Check `.dockerignore` has `venv/` |
 
 ---
 
-## 📁 File Reference
+## 🔬 Is This a Real RL Environment?
 
-| File | What It Does |
-|------|-------------|
-| `sprint_env/tasks.py` | Defines Task and Developer data, sprint scenarios |
-| `sprint_env/models.py` | Pydantic models for Action, Observation, State |
-| `sprint_env/environment.py` | Core RL logic: reset, step, reward calculation |
-| `sprint_env/graders.py` | Scoring functions for easy/medium/hard |
-| `server/app.py` | FastAPI endpoints (OpenEnv spec compliant) |
-| `ui.py` | Gradio UI + combined app entry point |
-| `inference.py` | Baseline LLM agent script |
-| `openenv.yaml` | OpenEnv metadata and task definitions |
-| `Dockerfile` | Container build instructions |
-| `pyproject.toml` | Python project dependencies for OpenEnv |
-| `.env` | Your secret tokens (never commit!) |
+| Criterion | Our Environment |
+|-----------|----------------|
+| Sequential decisions | ✅ Each day depends on previous assignments |
+| Large state space | ✅ Tasks × Developers × Day — combinatorial |
+| Non-trivial action space | ✅ 5 types × 12 tasks × 5 devs |
+| Shaped reward | ✅ Signal every step, not just episode end |
+| Stochastic transitions | ✅ Random dev absences, mid-sprint bugs |
+| Clean episode boundaries | ✅ reset() gives fresh state every time |
+| Partial observability | ✅ Agent can't predict future events |
+| Trainable with RL | ✅ GRPO / PPO / any policy gradient |
+
+**A trained RL agent (not zero-shot LLM) should score 0.7+ on medium and 0.4+ on hard** after sufficient training — currently it scores 0.42 and 0.0 with baseline Llama 3.1. That's the gap RL training is meant to close.
+
+---
+
+## 📊 Baseline Score Interpretation
+
+```
+easy_sprint:   1.00  ← LLM figured out skill matching perfectly
+medium_sprint: 0.42  ← Partial success, random events hurt performance
+hard_sprint:   0.00  ← Cascade failures overwhelm baseline LLM
+average:       0.47
+```
+
+These scores are intentional and show the difficulty curve works correctly:
+- Easy solvable by any agent → environment is correct
+- Medium shows partial success → reward shaping works
+- Hard challenges frontier models → difficulty is genuine
