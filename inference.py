@@ -169,7 +169,7 @@ def run_episode(task_name: str) -> float:
         )
 
         if done:
-            final_score = info.get("final_score", 0.0)
+            final_score = max(0.01, min(0.99, info.get("final_score", 0.01)))
             break
 
     # ── [END] block ───────────────────────────────────────────────────────────

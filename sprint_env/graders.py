@@ -1,6 +1,6 @@
 """
 Task graders: deterministic scoring functions for each difficulty level.
-Score range: 0.0 (complete failure) to 1.0 (perfect).
+Score range: 0 (complete failure) to 1 (perfect).
 """
 from __future__ import annotations
 from typing import List
@@ -10,10 +10,10 @@ from sprint_env.tasks import Task, TaskStatus, TaskType
 def grade_easy(tasks: List[Task], developers: list, sprint_length: int) -> float:
     """
     Easy grader: % of tasks completed on time, small penalties for overload.
-    Score 0.0-1.0.
+    Score 0-1
     """
     if not tasks:
-        return 0.0
+        return 0.01
 
     completed_on_time = sum(
         1 for t in tasks
@@ -31,7 +31,7 @@ def grade_easy(tasks: List[Task], developers: list, sprint_length: int) -> float
             overload_penalty += 0.05
 
     score = max(0.0, min(1.0, completion_score - overload_penalty))
-    return round(score, 4)
+    return round(max(0.01, min(0.99, score)), 4)
 
 
 def grade_medium(tasks: List[Task], developers: list, sprint_length: int) -> float:
@@ -40,7 +40,7 @@ def grade_medium(tasks: List[Task], developers: list, sprint_length: int) -> flo
     Also considers workload balance across the team.
     """
     if not tasks:
-        return 0.0
+        return 0.01
 
     priority_weights = {1: 3.0, 2: 2.0, 3: 1.5, 4: 1.0, 5: 0.5}
     total_weight = sum(priority_weights.get(t.priority, 1.0) for t in tasks)
@@ -70,7 +70,7 @@ def grade_medium(tasks: List[Task], developers: list, sprint_length: int) -> flo
         balance_score = 1.0
 
     score = 0.75 * completion_score + 0.25 * balance_score
-    return round(max(0.0, min(1.0, score)), 4)
+    return round(max(0.01, min(0.99, score)), 4)
 
 
 def grade_hard(tasks: List[Task], developers: list, sprint_length: int) -> float:
@@ -79,7 +79,7 @@ def grade_hard(tasks: List[Task], developers: list, sprint_length: int) -> float
     Requires near-perfect execution to score above 0.7.
     """
     if not tasks:
-        return 0.0
+        return 0.01
 
     # Base: priority-weighted completion (same as medium)
     priority_weights = {1: 4.0, 2: 2.5, 3: 1.5, 4: 0.8, 5: 0.3}
@@ -126,4 +126,4 @@ def grade_hard(tasks: List[Task], developers: list, sprint_length: int) -> float
         - burnout_penalty
         - urgent_penalty
     )
-    return round(max(0.0, min(1.0, score)), 4)
+    return round(max(0.01, min(0.99, score)), 4)

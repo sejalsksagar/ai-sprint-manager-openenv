@@ -12,10 +12,6 @@ tags: [openenv, reinforcement-learning, agile, sprint-management, fastapi, gradi
 
 > **A reinforcement learning environment where an AI agent acts as a Tech Lead managing agile software sprints.**
 
-[![OpenEnv](https://img.shields.io/badge/OpenEnv-Compatible-blue)](https://github.com/meta-pytorch/OpenEnv)
-[![HF Space](https://img.shields.io/badge/🤗-Live%20Demo-yellow)](https://huggingface.co/spaces/sejal-k/ai-sprint-manager)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-
 ---
 
 ## 🎯 What Is This?
@@ -65,7 +61,6 @@ The agent plays the role of a Tech Lead. Each step it observes the full sprint s
 
 ## 🎮 Live Demo
 
-👉 **[Try it on Hugging Face Spaces](https://huggingface.co/spaces/sejal-k/ai-sprint-manager)**
 
 1. Select a sprint scenario (easy / medium / hard)
 2. Click **🔄 Reset Sprint**
@@ -113,10 +108,10 @@ The agent plays the role of a Tech Lead. Each step it observes the full sprint s
 
 | Task | Score |
 |---|---|
-| `easy_sprint` | 1.00 ████████████████████ |
-| `medium_sprint` | 0.42 ████████ |
-| `hard_sprint` | 0.00 |
-| **Average** | **0.47** |
+| `easy_sprint` | 0.01 |
+| `medium_sprint` | 0.46 ████████ |
+| `hard_sprint` | 0.01 |
+| **Average** | **0.16** |
 
 ---
 
@@ -301,20 +296,6 @@ for episode in range(1000):
 
 The shaped reward function provides learning signal at every step — not just at episode end — which is critical for efficient RL training.
 
----
-
-## 📋 Submission Checklist
-
-- ✅ HF Space deploys and responds to `/reset`
-- ✅ OpenEnv spec compliance (`openenv validate` passes)
-- ✅ Docker build works
-- ✅ Baseline inference script runs and produces `[START]/[STEP]/[END]` output
-- ✅ 3 tasks with graders (easy/medium/hard), scores 0.0–1.0
-- ✅ Meaningful reward function (shaped, not sparse)
-- ✅ `openenv.yaml` present and valid
-- ✅ `pyproject.toml` with `openenv-core>=0.2.0`
-- ✅ `client.py` for RL training integration
-- ✅ External data file (`data/sprint_data.json`) — bring your own data
 
 ---
 
