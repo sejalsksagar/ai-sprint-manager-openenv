@@ -19,7 +19,7 @@ dependencies = [
 requires-dist = [
     { name = "fastapi", specifier = "==0.115.5" },
     { name = "openai" },
-    { name = "openenv-core", specifier = ">=0.2.0" },
+    { name = "openenv-core" },
     { name = "pydantic", specifier = "==2.10.3" },
     { name = "requests" },
     { name = "uvicorn", specifier = "==0.32.1" },

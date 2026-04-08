@@ -1,0 +1,65 @@
+{
+  "scenarios": {
+    "easy_sprint": {
+      "description": "Small team, clear tasks, no surprises. Good for baseline testing.",
+      "difficulty": "easy",
+      "developers": [
+        {"id": "dev1", "name": "Alice",  "skill": "backend",  "capacity": 5, "productivity": 1.2},
+        {"id": "dev2", "name": "Bob",    "skill": "frontend", "capacity": 4, "productivity": 1.0},
+        {"id": "dev3", "name": "Carol",  "skill": "fullstack","capacity": 6, "productivity": 1.1}
+      ],
+      "tasks": [
+        {"id": "T1", "name": "User Login API",        "task_type": "feature",    "priority": 2, "effort": 3, "deadline": 5,  "required_skill": "backend"},
+        {"id": "T2", "name": "Dashboard UI",          "task_type": "feature",    "priority": 2, "effort": 3, "deadline": 6,  "required_skill": "frontend"},
+        {"id": "T3", "name": "Fix CSS Layout Bug",    "task_type": "bug",        "priority": 1, "effort": 1, "deadline": 3,  "required_skill": "frontend"},
+        {"id": "T4", "name": "Database Migration",    "task_type": "feature",    "priority": 3, "effort": 4, "deadline": 7,  "required_skill": "backend"},
+        {"id": "T5", "name": "Setup CI/CD Pipeline",  "task_type": "feature",    "priority": 3, "effort": 3, "deadline": 8,  "required_skill": "devops"}
+      ]
+    },
+    "medium_sprint": {
+      "description": "Mid-size team with bugs and random dev absences.",
+      "difficulty": "medium",
+      "developers": [
+        {"id": "dev1", "name": "Alice", "skill": "backend",  "capacity": 5, "productivity": 1.1},
+        {"id": "dev2", "name": "Bob",   "skill": "frontend", "capacity": 4, "productivity": 0.9},
+        {"id": "dev3", "name": "Carol", "skill": "devops",   "capacity": 5, "productivity": 1.0},
+        {"id": "dev4", "name": "Dave",  "skill": "fullstack","capacity": 6, "productivity": 1.2}
+      ],
+      "tasks": [
+        {"id": "T1", "name": "Auth Service",           "task_type": "feature",    "priority": 1, "effort": 5, "deadline": 5, "required_skill": "backend"},
+        {"id": "T2", "name": "Profile Page UI",        "task_type": "feature",    "priority": 2, "effort": 4, "deadline": 6, "required_skill": "frontend"},
+        {"id": "T3", "name": "Payment Integration",    "task_type": "feature",    "priority": 1, "effort": 6, "deadline": 7, "required_skill": "backend"},
+        {"id": "T4", "name": "Docker Deployment",      "task_type": "feature",    "priority": 2, "effort": 3, "deadline": 5, "required_skill": "devops"},
+        {"id": "T5", "name": "Login Page",             "task_type": "feature",    "priority": 2, "effort": 3, "deadline": 5, "required_skill": "frontend"},
+        {"id": "T6", "name": "Prod DB Crash Fix",      "task_type": "bug",        "priority": 1, "effort": 2, "deadline": 3, "required_skill": "backend"},
+        {"id": "T7", "name": "API Rate Limiting",      "task_type": "tech_debt",  "priority": 4, "effort": 3, "deadline": 9, "required_skill": "backend"},
+        {"id": "T8", "name": "Mobile Layout Fix",      "task_type": "bug",        "priority": 2, "effort": 2, "deadline": 4, "required_skill": "frontend"}
+      ]
+    },
+    "hard_sprint": {
+      "description": "Large team, many tasks, urgent bugs appear mid-sprint, dev absences cascade.",
+      "difficulty": "hard",
+      "developers": [
+        {"id": "dev1", "name": "Alice", "skill": "backend",  "capacity": 5, "productivity": 1.3},
+        {"id": "dev2", "name": "Bob",   "skill": "frontend", "capacity": 4, "productivity": 0.8},
+        {"id": "dev3", "name": "Carol", "skill": "devops",   "capacity": 5, "productivity": 1.0},
+        {"id": "dev4", "name": "Dave",  "skill": "fullstack","capacity": 7, "productivity": 1.1},
+        {"id": "dev5", "name": "Eve",   "skill": "backend",  "capacity": 5, "productivity": 0.9}
+      ],
+      "tasks": [
+        {"id": "T1",  "name": "Microservices Refactor",    "task_type": "feature",     "priority": 1, "effort": 8, "deadline": 5, "required_skill": "backend"},
+        {"id": "T2",  "name": "Real-time Notifications",   "task_type": "feature",     "priority": 1, "effort": 6, "deadline": 5, "required_skill": "fullstack"},
+        {"id": "T3",  "name": "Security Audit Fixes",      "task_type": "bug",         "priority": 1, "effort": 5, "deadline": 4, "required_skill": "backend"},
+        {"id": "T4",  "name": "Kubernetes Migration",      "task_type": "feature",     "priority": 2, "effort": 7, "deadline": 6, "required_skill": "devops"},
+        {"id": "T5",  "name": "Homepage Redesign",         "task_type": "feature",     "priority": 2, "effort": 5, "deadline": 6, "required_skill": "frontend"},
+        {"id": "T6",  "name": "Payment Gateway Bug",       "task_type": "urgent_bug",  "priority": 1, "effort": 3, "deadline": 3, "required_skill": "backend"},
+        {"id": "T7",  "name": "Search Performance",        "task_type": "tech_debt",   "priority": 3, "effort": 4, "deadline": 7, "required_skill": "backend"},
+        {"id": "T8",  "name": "A/B Testing Framework",     "task_type": "feature",     "priority": 3, "effort": 5, "deadline": 8, "required_skill": "fullstack"},
+        {"id": "T9",  "name": "CDN Integration",           "task_type": "feature",     "priority": 3, "effort": 3, "deadline": 7, "required_skill": "devops"},
+        {"id": "T10", "name": "OAuth2 Provider",           "task_type": "feature",     "priority": 2, "effort": 6, "deadline": 6, "required_skill": "backend"},
+        {"id": "T11", "name": "Analytics Dashboard",       "task_type": "feature",     "priority": 3, "effort": 5, "deadline": 8, "required_skill": "fullstack"},
+        {"id": "T12", "name": "Accessibility Audit",       "task_type": "tech_debt",   "priority": 4, "effort": 3, "deadline": 9, "required_skill": "frontend"}
+      ]
+    }
+  }
+}

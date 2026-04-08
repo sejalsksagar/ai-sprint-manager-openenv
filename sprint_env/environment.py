@@ -7,10 +7,8 @@ import uuid
 from typing import Optional, List, Tuple
 
 from sprint_env.models import SprintAction, SprintObservation, SprintState
-from sprint_env.tasks import (
-    Task, Developer, TaskStatus, TaskType,
-    make_easy_sprint, make_medium_sprint, make_hard_sprint,
-)
+from sprint_env.tasks import Task, Developer, TaskStatus, TaskType
+from sprint_env.data_loader import build_scenario
 from sprint_env.graders import grade_easy, grade_medium, grade_hard
 
 SPRINT_LENGTH = 10  # days per episode
@@ -58,15 +56,14 @@ class SprintManagerEnv:
         self._cumulative_reward = 0.0
         self._events_log = []
 
-        if self._task_name == "easy_sprint":
-            self._tasks, self._developers = make_easy_sprint()
-            self._grader = grade_easy
-        elif self._task_name == "medium_sprint":
-            self._tasks, self._developers = make_medium_sprint()
-            self._grader = grade_medium
-        else:
-            self._tasks, self._developers = make_hard_sprint()
-            self._grader = grade_hard
+        self._tasks, self._developers, _ = build_scenario(self._task_name)
+
+        grader_map = {
+            "easy_sprint":   grade_easy,
+            "medium_sprint": grade_medium,
+            "hard_sprint":   grade_hard,
+        }
+        self._grader = grader_map.get(self._task_name, grade_easy)
 
         return self._make_observation(reward=0.0, events=["Sprint started!"])
 

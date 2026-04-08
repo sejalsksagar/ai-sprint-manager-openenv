@@ -9,7 +9,7 @@ dependencies = [
     "pydantic==2.10.3",
     "openai",
     "requests",
-    "openenv-core>=0.2.0",
+    "openenv-core",
 ]
 
 [project.scripts]

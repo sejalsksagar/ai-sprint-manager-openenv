@@ -5,16 +5,17 @@ MANDATORY:
   API_BASE_URL  : LLM endpoint
   MODEL_NAME    : Model identifier
   HF_TOKEN      : Hugging Face / API key
-
-Usage:
-  python inference.py
 """
 from __future__ import annotations
 import os
 import json
 import time
+import sys
 import requests
+from dotenv import load_dotenv
 from openai import OpenAI
+
+load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
@@ -22,20 +23,17 @@ API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "dummy")
 MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 
-MAX_STEPS    = 12   # per episode
-TEMPERATURE  = 0.2
-MAX_TOKENS   = 300
-
-TASKS = ["easy_sprint", "medium_sprint", "hard_sprint"]
+MAX_STEPS   = 12
+TEMPERATURE = 0.2
+MAX_TOKENS  = 300
+TASKS       = ["easy_sprint", "medium_sprint", "hard_sprint"]
 
 client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-# ── Prompts ───────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert Tech Lead managing an agile sprint.
 Your goal: maximize task completion, balance developer workload, and meet deadlines.
 
-Each step you must output a JSON action with this exact schema:
+Each step output a JSON action with this exact schema:
 {
   "action_type": "<assign|reassign|reprioritize|unblock|skip>",
   "task_id": "<task id or null>",
@@ -45,50 +43,40 @@ Each step you must output a JSON action with this exact schema:
 
 Rules:
 - assign: put a backlog task onto an available developer
-- reassign: move an in-progress task to a different developer  
-- reprioritize: change a task's priority (1=highest, 5=lowest)
+- reassign: move an in-progress task to a different developer
+- reprioritize: change a task priority (1=highest)
 - unblock: unblock a blocked task
-- skip: do nothing this step
+- skip: do nothing
 
-Output ONLY the JSON object. No explanation, no markdown fences."""
+Output ONLY the JSON object. No explanation."""
 
 
 def build_user_prompt(obs: dict) -> str:
-    tasks_summary = []
-    for t in obs["tasks"]:
-        tasks_summary.append(
-            f"  [{t['id']}] {t['name']} | type={t['task_type']} | "
-            f"priority={t['priority']} | effort={t['effort']} | "
-            f"deadline=day{t['deadline']} | status={t['status']} | "
-            f"assigned={t['assigned_to']} | progress={t['progress']:.0%}"
-        )
-
-    devs_summary = []
-    for d in obs["developers"]:
-        devs_summary.append(
-            f"  [{d['id']}] {d['name']} | skill={d['skill']} | "
-            f"load={d['current_load']}/{d['capacity']} | "
-            f"available={d['is_available']} | tasks={d['assigned_tasks']}"
-        )
-
+    tasks_summary = "\n".join(
+        f"  [{t['id']}] {t['name']} | {t['task_type']} | P{t['priority']} | "
+        f"effort={t['effort']} | due=Day{t['deadline']} | status={t['status']} | "
+        f"dev={t['assigned_to']} | progress={t['progress']:.0%}"
+        for t in obs["tasks"]
+    )
+    devs_summary = "\n".join(
+        f"  [{d['id']}] {d['name']} | skill={d['skill']} | "
+        f"load={d['current_load']}/{d['capacity']} | available={d['is_available']}"
+        for d in obs["developers"]
+    )
     events_str = "\n  ".join(obs.get("events", [])) or "None"
-
-    return f"""=== SPRINT STATUS ===
-Day: {obs['current_day']} / {obs['sprint_length']}
-Completed: {obs['tasks_completed']} | Missed: {obs['tasks_missed']} | In Progress: {obs['tasks_in_progress']} | Backlog: {obs['tasks_backlog']}
-Workload Balance: {obs['workload_balance_score']:.2f} (1=perfect)
+    return f"""Day: {obs['current_day']}/{obs['sprint_length']}
+Done:{obs['tasks_completed']} Missed:{obs['tasks_missed']} InProgress:{obs['tasks_in_progress']} Backlog:{obs['tasks_backlog']}
 Cumulative Reward: {obs['cumulative_reward']:.2f}
 
-Recent Events:
-  {events_str}
+Events: {events_str}
 
 TASKS:
-{chr(10).join(tasks_summary)}
+{tasks_summary}
 
 DEVELOPERS:
-{chr(10).join(devs_summary)}
+{devs_summary}
 
-What is your next action? Output only the JSON."""
+Output your JSON action:"""
 
 
 def call_env(endpoint: str, payload: dict = None, method: str = "POST") -> dict:
@@ -101,97 +89,106 @@ def call_env(endpoint: str, payload: dict = None, method: str = "POST") -> dict:
     return resp.json()
 
 
+def get_rule_based_action(obs: dict) -> str:
+    """Fallback rule-based action when LLM unavailable."""
+    tasks = obs.get("tasks", [])
+    devs = obs.get("developers", [])
+    backlog = sorted(
+        [t for t in tasks if t["status"] == "backlog"],
+        key=lambda t: (t["priority"], t["deadline"])
+    )
+    if not backlog:
+        return '{"action_type": "skip"}'
+    task = backlog[0]
+    available = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"]]
+    skill_match = [d for d in available if d["skill"] == task["required_skill"] or d["skill"] == "fullstack"]
+    dev = skill_match[0] if skill_match else (available[0] if available else None)
+    if not dev:
+        return '{"action_type": "skip"}'
+    return json.dumps({"action_type": "assign", "task_id": task["id"], "dev_id": dev["id"], "new_priority": None})
+
+
 def parse_action(text: str) -> dict:
-    """Extract JSON action from model response."""
     text = text.strip()
-    # Strip markdown fences if present
     if "```" in text:
-        lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
         text = "\n".join(lines)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to find first { ... } block
-        start = text.find("{")
-        end = text.rfind("}") + 1
+        start, end = text.find("{"), text.rfind("}") + 1
         if start >= 0 and end > start:
             try:
                 return json.loads(text[start:end])
-            except json.JSONDecodeError:
+            except Exception:
                 pass
     return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
 
 def run_episode(task_name: str) -> float:
     """Run one complete episode and return final score."""
-    print(f"\n{'='*60}")
-    print(f"  Task: {task_name}")
-    print(f"{'='*60}")
 
-    # Reset
+    # ── [START] block ─────────────────────────────────────────────────────────
+    print(f"[START] task={task_name}", flush=True)
+
     obs = call_env("reset", {"task_name": task_name, "seed": 42})
-    print(f"  Sprint started. Tasks: {obs['tasks_backlog']} | Devs: {len(obs['developers'])}")
-
     final_score = 0.0
+    step_num = 0
+
     for step_num in range(1, MAX_STEPS + 1):
         if obs.get("done", False):
             break
-
-        user_prompt = build_user_prompt(obs)
 
         try:
             completion = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_prompt},
+                    {"role": "user",   "content": build_user_prompt(obs)},
                 ],
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
             )
             response_text = completion.choices[0].message.content or ""
         except Exception as e:
-            print(f"  [Step {step_num}] LLM error: {e}. Using skip.")
-            response_text = '{"action_type": "skip"}'
+            response_text = get_rule_based_action(obs)
 
         action = parse_action(response_text)
-        print(f"  [Step {step_num}] Action: {action}")
-
-        # Step environment
         result = call_env("step", {"action": action})
         obs = result["observation"]
         reward = result["reward"]
         done = result["done"]
         info = result.get("info", {})
 
-        events = obs.get("events", [])
-        if events:
-            for ev in events:
-                print(f"    → {ev}")
-        print(f"    Reward: {reward:+.2f} | Cumulative: {obs['cumulative_reward']:.2f} | Done: {done}")
+        # ── [STEP] block ──────────────────────────────────────────────────────
+        print(
+            f"[STEP] task={task_name} step={step_num} "
+            f"action={action.get('action_type')} reward={reward:.4f} "
+            f"cumulative={obs.get('cumulative_reward', 0):.4f} done={done}",
+            flush=True
+        )
 
         if done:
             final_score = info.get("final_score", 0.0)
             break
 
-    print(f"\n  ✅ Episode complete. Final score: {final_score:.4f}")
+    # ── [END] block ───────────────────────────────────────────────────────────
+    print(
+        f"[END] task={task_name} score={final_score:.4f} steps={step_num}",
+        flush=True
+    )
     return final_score
 
 
 def main():
-    print("\n🚀 AI Sprint Manager — Baseline Inference")
-    print(f"   Model : {MODEL_NAME}")
-    print(f"   Server: {ENV_BASE_URL}")
+    print(f"[INFO] model={MODEL_NAME} server={ENV_BASE_URL}", flush=True)
 
-    # Health check
     try:
         health = call_env("health", method="GET")
-        print(f"   Health: {health}")
+        print(f"[INFO] health={health}", flush=True)
     except Exception as e:
-        print(f"   ⚠️  Could not reach env server at {ENV_BASE_URL}: {e}")
-        print("   Make sure the server is running: uvicorn server:app --host 0.0.0.0 --port 8000")
-        return
+        print(f"[ERROR] Cannot reach env server: {e}", flush=True)
+        sys.exit(1)
 
     scores = {}
     start_time = time.time()
@@ -201,21 +198,22 @@ def main():
             score = run_episode(task)
             scores[task] = score
         except Exception as e:
-            print(f"  ❌ Error on {task}: {e}")
+            print(f"[ERROR] task={task} error={e}", flush=True)
             scores[task] = 0.0
 
     elapsed = time.time() - start_time
 
-    print(f"\n{'='*60}")
-    print("  BASELINE SCORES")
-    print(f"{'='*60}")
+    # Human-readable summary
+    print("\n" + "="*60, flush=True)
+    print("  BASELINE SCORES", flush=True)
+    print("="*60, flush=True)
     for task, score in scores.items():
         bar = "█" * int(score * 20)
-        print(f"  {task:<20} {score:.4f}  {bar}")
+        print(f"  {task:<20} {score:.4f}  {bar}", flush=True)
     avg = sum(scores.values()) / len(scores) if scores else 0.0
-    print(f"  {'AVERAGE':<20} {avg:.4f}")
-    print(f"\n  Runtime: {elapsed:.1f}s")
-    print(f"{'='*60}")
+    print(f"  {'AVERAGE':<20} {avg:.4f}", flush=True)
+    print(f"\n  Runtime: {elapsed:.1f}s", flush=True)
+    print("="*60, flush=True)
 
 
 if __name__ == "__main__":
