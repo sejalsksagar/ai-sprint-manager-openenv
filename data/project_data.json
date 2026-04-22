@@ -1,0 +1,231 @@
+{
+  "scenarios": {
+    "project_easy": {
+      "description": "Small stable team, clear backlog, no cascade failures. Good for baseline LLM testing on multi-sprint horizon.",
+      "difficulty": "easy",
+      "num_sprints": 6,
+      "days_per_sprint": 10,
+      "developers": [
+        {"id": "dev1", "name": "Alice",  "skill": "backend",   "capacity": 5, "productivity": 1.2},
+        {"id": "dev2", "name": "Bob",    "skill": "frontend",  "capacity": 4, "productivity": 1.0},
+        {"id": "dev3", "name": "Carol",  "skill": "fullstack", "capacity": 6, "productivity": 1.1},
+        {"id": "dev4", "name": "Dave",   "skill": "devops",    "capacity": 4, "productivity": 1.0}
+      ],
+      "tasks": [
+        {"id": "T01", "name": "User Auth API",            "task_type": "feature",    "priority": 1, "effort": 3, "sprint": 1, "deadline_day": 8,  "required_skill": "backend",   "depends_on": []},
+        {"id": "T02", "name": "Login UI",                 "task_type": "feature",    "priority": 1, "effort": 3, "sprint": 1, "deadline_day": 9,  "required_skill": "frontend",  "depends_on": []},
+        {"id": "T03", "name": "CI/CD Setup",              "task_type": "feature",    "priority": 2, "effort": 3, "sprint": 1, "deadline_day": 10, "required_skill": "devops",    "depends_on": []},
+        {"id": "T04", "name": "Database Schema v1",       "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 1, "deadline_day": 9,  "required_skill": "backend",   "depends_on": []},
+
+        {"id": "T05", "name": "User Profile API",         "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 2, "deadline_day": 18, "required_skill": "backend",   "depends_on": ["T01"]},
+        {"id": "T06", "name": "Profile Page UI",          "task_type": "feature",    "priority": 2, "effort": 3, "sprint": 2, "deadline_day": 19, "required_skill": "frontend",  "depends_on": ["T02"]},
+        {"id": "T07", "name": "Fix Login CSS Bug",        "task_type": "bug",        "priority": 1, "effort": 1, "sprint": 2, "deadline_day": 13, "required_skill": "frontend",  "depends_on": []},
+        {"id": "T08", "name": "Docker Deployment",        "task_type": "feature",    "priority": 2, "effort": 3, "sprint": 2, "deadline_day": 20, "required_skill": "devops",    "depends_on": ["T03"]},
+
+        {"id": "T09", "name": "Search API",               "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 3, "deadline_day": 28, "required_skill": "backend",   "depends_on": ["T04"]},
+        {"id": "T10", "name": "Search UI",                "task_type": "feature",    "priority": 2, "effort": 3, "sprint": 3, "deadline_day": 29, "required_skill": "frontend",  "depends_on": []},
+        {"id": "T11", "name": "Email Notifications",      "task_type": "feature",    "priority": 3, "effort": 3, "sprint": 3, "deadline_day": 30, "required_skill": "backend",   "depends_on": ["T05"]},
+        {"id": "T12", "name": "Staging Environment",      "task_type": "feature",    "priority": 2, "effort": 2, "sprint": 3, "deadline_day": 27, "required_skill": "devops",    "depends_on": ["T08"]},
+
+        {"id": "T13", "name": "Payment Integration",      "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 4, "deadline_day": 38, "required_skill": "backend",   "depends_on": ["T05"]},
+        {"id": "T14", "name": "Checkout UI",              "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 4, "deadline_day": 39, "required_skill": "frontend",  "depends_on": ["T10"]},
+        {"id": "T15", "name": "API Rate Limiting",        "task_type": "tech_debt",  "priority": 3, "effort": 3, "sprint": 4, "deadline_day": 40, "required_skill": "backend",   "depends_on": []},
+        {"id": "T16", "name": "Load Balancer Config",     "task_type": "feature",    "priority": 2, "effort": 3, "sprint": 4, "deadline_day": 38, "required_skill": "devops",    "depends_on": ["T12"]},
+
+        {"id": "T17", "name": "Analytics Dashboard",      "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 5, "deadline_day": 49, "required_skill": "fullstack",  "depends_on": ["T13"]},
+        {"id": "T18", "name": "Accessibility Audit",      "task_type": "tech_debt",  "priority": 3, "effort": 3, "sprint": 5, "deadline_day": 50, "required_skill": "frontend",   "depends_on": []},
+        {"id": "T19", "name": "Performance Optimisation", "task_type": "tech_debt",  "priority": 3, "effort": 3, "sprint": 5, "deadline_day": 48, "required_skill": "backend",    "depends_on": []},
+        {"id": "T20", "name": "Monitoring & Alerting",    "task_type": "feature",    "priority": 2, "effort": 3, "sprint": 5, "deadline_day": 50, "required_skill": "devops",     "depends_on": ["T16"]},
+
+        {"id": "T21", "name": "Final Security Hardening", "task_type": "bug",        "priority": 1, "effort": 4, "sprint": 6, "deadline_day": 58, "required_skill": "backend",    "depends_on": ["T15"]},
+        {"id": "T22", "name": "Production Release UI",    "task_type": "feature",    "priority": 1, "effort": 3, "sprint": 6, "deadline_day": 59, "required_skill": "frontend",   "depends_on": ["T14", "T18"]},
+        {"id": "T23", "name": "Runbook Documentation",    "task_type": "tech_debt",  "priority": 3, "effort": 2, "sprint": 6, "deadline_day": 60, "required_skill": "fullstack",  "depends_on": []},
+        {"id": "T24", "name": "Production Deploy",        "task_type": "feature",    "priority": 1, "effort": 3, "sprint": 6, "deadline_day": 60, "required_skill": "devops",     "depends_on": ["T20", "T21"]}
+      ],
+      "instructions": [
+        {"id": "I01", "release_day": 1,  "text": "Prioritise auth tasks above all others in sprint 1.", "target_sprint": 1, "affects_tasks": ["T01", "T02"]},
+        {"id": "I02", "release_day": 5,  "text": "Ensure CI/CD is completed before sprint 1 ends.", "target_sprint": 1, "affects_tasks": ["T03"]},
+        {"id": "I03", "release_day": 11, "text": "The login CSS bug is blocking QA — resolve first in sprint 2.", "target_sprint": 2, "affects_tasks": ["T07"]},
+        {"id": "I04", "release_day": 14, "text": "Docker deployment must be validated by day 20.", "target_sprint": 2, "affects_tasks": ["T08"]},
+        {"id": "I05", "release_day": 21, "text": "Search must be demo-ready by end of sprint 3.", "target_sprint": 3, "affects_tasks": ["T09", "T10"]},
+        {"id": "I06", "release_day": 25, "text": "Email notifications are now a stakeholder requirement for sprint 3.", "target_sprint": 3, "affects_tasks": ["T11"]},
+        {"id": "I07", "release_day": 31, "text": "Payment integration is the top priority for sprint 4 — assign best backend dev.", "target_sprint": 4, "affects_tasks": ["T13"]},
+        {"id": "I08", "release_day": 35, "text": "API rate limiting must ship in sprint 4 before production scaling.", "target_sprint": 4, "affects_tasks": ["T15"]},
+        {"id": "I09", "release_day": 41, "text": "Analytics dashboard needs to be interactive — fullstack only.", "target_sprint": 5, "affects_tasks": ["T17"]},
+        {"id": "I10", "release_day": 45, "text": "Accessibility audit result must be attached to sprint 5 report.", "target_sprint": 5, "affects_tasks": ["T18"]},
+        {"id": "I11", "release_day": 51, "text": "Security hardening is a release gate — cannot ship without it.", "target_sprint": 6, "affects_tasks": ["T21"]},
+        {"id": "I12", "release_day": 55, "text": "Production deploy is on day 60 — no delays accepted.", "target_sprint": 6, "affects_tasks": ["T24"]}
+      ]
+    },
+
+    "project_medium": {
+      "description": "Mid-size team with developer absences, mid-sprint urgent bugs, and instructions that conflict with prior plans.",
+      "difficulty": "medium",
+      "num_sprints": 6,
+      "days_per_sprint": 10,
+      "developers": [
+        {"id": "dev1", "name": "Alice", "skill": "backend",   "capacity": 5, "productivity": 1.1},
+        {"id": "dev2", "name": "Bob",   "skill": "frontend",  "capacity": 4, "productivity": 0.9},
+        {"id": "dev3", "name": "Carol", "skill": "devops",    "capacity": 5, "productivity": 1.0},
+        {"id": "dev4", "name": "Dave",  "skill": "fullstack", "capacity": 6, "productivity": 1.2},
+        {"id": "dev5", "name": "Eve",   "skill": "backend",   "capacity": 5, "productivity": 1.0}
+      ],
+      "absences": [
+        {"dev_id": "dev2", "day_start": 14, "day_end": 16, "reason": "sick leave"},
+        {"dev_id": "dev4", "day_start": 33, "day_end": 35, "reason": "conference"},
+        {"dev_id": "dev1", "day_start": 52, "day_end": 54, "reason": "vacation"}
+      ],
+      "tasks": [
+        {"id": "T01", "name": "Auth Microservice",          "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 1, "deadline_day": 8,  "required_skill": "backend",   "depends_on": []},
+        {"id": "T02", "name": "Login & Register UI",        "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 1, "deadline_day": 9,  "required_skill": "frontend",  "depends_on": []},
+        {"id": "T03", "name": "Kubernetes Base Setup",      "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 1, "deadline_day": 10, "required_skill": "devops",    "depends_on": []},
+        {"id": "T04", "name": "DB Schema & Migrations",     "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 1, "deadline_day": 9,  "required_skill": "backend",   "depends_on": []},
+        {"id": "T05", "name": "API Gateway Setup",          "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 1, "deadline_day": 10, "required_skill": "fullstack", "depends_on": []},
+
+        {"id": "T06", "name": "User Profile Service",       "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 2, "deadline_day": 18, "required_skill": "backend",   "depends_on": ["T01"]},
+        {"id": "T07", "name": "Profile & Settings UI",      "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 2, "deadline_day": 19, "required_skill": "frontend",  "depends_on": ["T02"]},
+        {"id": "T08", "name": "Prod DB Crash Fix",          "task_type": "urgent_bug", "priority": 1, "effort": 2, "sprint": 2, "deadline_day": 12, "required_skill": "backend",   "depends_on": []},
+        {"id": "T09", "name": "Helm Chart Deployment",      "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 2, "deadline_day": 20, "required_skill": "devops",    "depends_on": ["T03"]},
+        {"id": "T10", "name": "Inter-Service Auth",         "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 2, "deadline_day": 19, "required_skill": "fullstack", "depends_on": ["T05"]},
+
+        {"id": "T11", "name": "Notification Service",       "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 3, "deadline_day": 28, "required_skill": "backend",   "depends_on": ["T06"]},
+        {"id": "T12", "name": "Notification Preference UI", "task_type": "feature",    "priority": 2, "effort": 3, "sprint": 3, "deadline_day": 29, "required_skill": "frontend",  "depends_on": ["T07"]},
+        {"id": "T13", "name": "Payment Gateway API",        "task_type": "feature",    "priority": 1, "effort": 6, "sprint": 3, "deadline_day": 30, "required_skill": "backend",   "depends_on": ["T04"]},
+        {"id": "T14", "name": "Service Mesh (Istio)",       "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 3, "deadline_day": 28, "required_skill": "devops",    "depends_on": ["T09"]},
+        {"id": "T15", "name": "Search & Filter API",        "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 3, "deadline_day": 29, "required_skill": "fullstack", "depends_on": ["T10"]},
+
+        {"id": "T16", "name": "Checkout & Orders API",      "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 4, "deadline_day": 38, "required_skill": "backend",   "depends_on": ["T13"]},
+        {"id": "T17", "name": "Checkout Flow UI",           "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 4, "deadline_day": 39, "required_skill": "frontend",  "depends_on": ["T12"]},
+        {"id": "T18", "name": "Payment Security Audit",     "task_type": "bug",        "priority": 1, "effort": 3, "sprint": 4, "deadline_day": 36, "required_skill": "backend",   "depends_on": ["T13"]},
+        {"id": "T19", "name": "Canary Deployment Setup",    "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 4, "deadline_day": 39, "required_skill": "devops",    "depends_on": ["T14"]},
+        {"id": "T20", "name": "Full-Text Search (ES)",      "task_type": "feature",    "priority": 3, "effort": 5, "sprint": 4, "deadline_day": 40, "required_skill": "fullstack", "depends_on": ["T15"]},
+
+        {"id": "T21", "name": "Reporting & Analytics API",  "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 5, "deadline_day": 49, "required_skill": "backend",   "depends_on": ["T16"]},
+        {"id": "T22", "name": "Analytics Dashboard UI",     "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 5, "deadline_day": 49, "required_skill": "frontend",  "depends_on": ["T17"]},
+        {"id": "T23", "name": "SLA & SLO Monitoring",       "task_type": "tech_debt",  "priority": 3, "effort": 3, "sprint": 5, "deadline_day": 50, "required_skill": "devops",    "depends_on": ["T19"]},
+        {"id": "T24", "name": "Mobile API Optimisation",    "task_type": "tech_debt",  "priority": 3, "effort": 4, "sprint": 5, "deadline_day": 50, "required_skill": "fullstack", "depends_on": ["T20"]},
+        {"id": "T25", "name": "Data Privacy Compliance",    "task_type": "tech_debt",  "priority": 2, "effort": 3, "sprint": 5, "deadline_day": 48, "required_skill": "backend",   "depends_on": []},
+
+        {"id": "T26", "name": "Pen Test & Remediation",     "task_type": "bug",        "priority": 1, "effort": 5, "sprint": 6, "deadline_day": 57, "required_skill": "backend",   "depends_on": ["T18", "T25"]},
+        {"id": "T27", "name": "Final UI Polish & QA",       "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 6, "deadline_day": 59, "required_skill": "frontend",  "depends_on": ["T22"]},
+        {"id": "T28", "name": "Blue-Green Production Swap", "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 6, "deadline_day": 60, "required_skill": "devops",    "depends_on": ["T23"]},
+        {"id": "T29", "name": "Runbooks & Postmortem Docs", "task_type": "tech_debt",  "priority": 3, "effort": 3, "sprint": 6, "deadline_day": 60, "required_skill": "fullstack", "depends_on": []},
+        {"id": "T30", "name": "Stakeholder Demo Prep",      "task_type": "feature",    "priority": 2, "effort": 2, "sprint": 6, "deadline_day": 60, "required_skill": "fullstack", "depends_on": ["T21", "T22"]}
+      ],
+      "instructions": [
+        {"id": "I01", "release_day": 1,  "text": "Auth microservice is a hard dependency for all downstream services — finish before day 8.", "target_sprint": 1, "affects_tasks": ["T01"]},
+        {"id": "I02", "release_day": 3,  "text": "API gateway must be validated with at least one downstream service by end of sprint 1.", "target_sprint": 1, "affects_tasks": ["T05"]},
+        {"id": "I03", "release_day": 7,  "text": "Kubernetes base setup is blocking the DevOps track — escalate if behind.", "target_sprint": 1, "affects_tasks": ["T03"]},
+        {"id": "I04", "release_day": 11, "text": "Production DB crash is P0 — drop everything and assign a backend dev immediately.", "target_sprint": 2, "affects_tasks": ["T08"]},
+        {"id": "I05", "release_day": 15, "text": "Bob is on sick leave — redistribute frontend tasks for sprint 2.", "target_sprint": 2, "affects_tasks": ["T07"]},
+        {"id": "I06", "release_day": 18, "text": "Inter-service auth must be ready before notification service starts in sprint 3.", "target_sprint": 2, "affects_tasks": ["T10"]},
+        {"id": "I07", "release_day": 21, "text": "Payment gateway is now a sprint 3 commitment to the business — no slip.", "target_sprint": 3, "affects_tasks": ["T13"]},
+        {"id": "I08", "release_day": 24, "text": "Service mesh complexity is underestimated — pair Carol with Dave on Istio.", "target_sprint": 3, "affects_tasks": ["T14"]},
+        {"id": "I09", "release_day": 27, "text": "Add payment security audit as a sprint 3 exit gate before sprint 4 checkout work begins.", "target_sprint": 3, "affects_tasks": ["T18"]},
+        {"id": "I10", "release_day": 31, "text": "Checkout flow is top priority — nothing ships in sprint 4 before T16 and T17 are green.", "target_sprint": 4, "affects_tasks": ["T16", "T17"]},
+        {"id": "I11", "release_day": 33, "text": "Dave is at conference days 33-35 — replan sprint 4 fullstack tasks.", "target_sprint": 4, "affects_tasks": ["T20"]},
+        {"id": "I12", "release_day": 36, "text": "Canary deployment must be validated before blue-green swap in sprint 6.", "target_sprint": 4, "affects_tasks": ["T19"]},
+        {"id": "I13", "release_day": 41, "text": "Data privacy compliance is now a legal requirement — must complete sprint 5.", "target_sprint": 5, "affects_tasks": ["T25"]},
+        {"id": "I14", "release_day": 44, "text": "Analytics dashboard needs real-time updates — scope increase noted.", "target_sprint": 5, "affects_tasks": ["T22"]},
+        {"id": "I15", "release_day": 48, "text": "SLA monitoring must include payment service endpoints.", "target_sprint": 5, "affects_tasks": ["T23"]},
+        {"id": "I16", "release_day": 51, "text": "Alice is on vacation days 52-54 — replan sprint 6 backend tasks.", "target_sprint": 6, "affects_tasks": ["T26"]},
+        {"id": "I17", "release_day": 53, "text": "Pen test results are back — two critical findings must be fixed before blue-green swap.", "target_sprint": 6, "affects_tasks": ["T26", "T28"]},
+        {"id": "I18", "release_day": 56, "text": "Stakeholder demo is on day 60 — runbooks and demo prep are release gates.", "target_sprint": 6, "affects_tasks": ["T29", "T30"]}
+      ]
+    },
+
+    "project_hard": {
+      "description": "Large team, cascading failures, urgent mid-project pivots, conflicting instructions, and hard delivery deadline with zero tolerance for missed dependencies.",
+      "difficulty": "hard",
+      "num_sprints": 6,
+      "days_per_sprint": 10,
+      "developers": [
+        {"id": "dev1", "name": "Alice",   "skill": "backend",   "capacity": 5, "productivity": 1.3},
+        {"id": "dev2", "name": "Bob",     "skill": "frontend",  "capacity": 4, "productivity": 0.8},
+        {"id": "dev3", "name": "Carol",   "skill": "devops",    "capacity": 5, "productivity": 1.0},
+        {"id": "dev4", "name": "Dave",    "skill": "fullstack", "capacity": 7, "productivity": 1.1},
+        {"id": "dev5", "name": "Eve",     "skill": "backend",   "capacity": 5, "productivity": 0.9},
+        {"id": "dev6", "name": "Frank",   "skill": "frontend",  "capacity": 4, "productivity": 1.0},
+        {"id": "dev7", "name": "Grace",   "skill": "devops",    "capacity": 5, "productivity": 1.1}
+      ],
+      "absences": [
+        {"dev_id": "dev2", "day_start": 12, "day_end": 15, "reason": "sick leave"},
+        {"dev_id": "dev5", "day_start": 23, "day_end": 26, "reason": "family emergency"},
+        {"dev_id": "dev4", "day_start": 33, "day_end": 37, "reason": "conference"},
+        {"dev_id": "dev1", "day_start": 51, "day_end": 55, "reason": "vacation"},
+        {"dev_id": "dev3", "day_start": 43, "day_end": 45, "reason": "sick leave"}
+      ],
+      "tasks": [
+        {"id": "T01", "name": "Auth & IAM Service",            "task_type": "feature",    "priority": 1, "effort": 6, "sprint": 1, "deadline_day": 7,  "required_skill": "backend",   "depends_on": []},
+        {"id": "T02", "name": "API Gateway + Rate Limiting",   "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 1, "deadline_day": 8,  "required_skill": "fullstack", "depends_on": []},
+        {"id": "T03", "name": "Design System Setup",           "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 1, "deadline_day": 9,  "required_skill": "frontend",  "depends_on": []},
+        {"id": "T04", "name": "Kubernetes + Helm Base",        "task_type": "feature",    "priority": 1, "effort": 6, "sprint": 1, "deadline_day": 9,  "required_skill": "devops",    "depends_on": []},
+        {"id": "T05", "name": "Core DB Schema & Seed Data",    "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 1, "deadline_day": 8,  "required_skill": "backend",   "depends_on": []},
+        {"id": "T06", "name": "Service-to-Service Auth",       "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 1, "deadline_day": 10, "required_skill": "fullstack", "depends_on": ["T01"]},
+        {"id": "T07", "name": "CI/CD Pipelines",               "task_type": "feature",    "priority": 2, "effort": 4, "sprint": 1, "deadline_day": 10, "required_skill": "devops",    "depends_on": []},
+
+        {"id": "T08", "name": "User Management API",           "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 2, "deadline_day": 17, "required_skill": "backend",   "depends_on": ["T01", "T05"]},
+        {"id": "T09", "name": "User Management UI",            "task_type": "feature",    "priority": 1, "effort": 4, "sprint": 2, "deadline_day": 18, "required_skill": "frontend",  "depends_on": ["T03"]},
+        {"id": "T10", "name": "Istio Service Mesh",            "task_type": "feature",    "priority": 2, "effort": 6, "sprint": 2, "deadline_day": 20, "required_skill": "devops",    "depends_on": ["T04"]},
+        {"id": "T11", "name": "Event Bus (Kafka)",             "task_type": "feature",    "priority": 1, "effort": 6, "sprint": 2, "deadline_day": 19, "required_skill": "fullstack", "depends_on": ["T06"]},
+        {"id": "T12", "name": "Prod DB Failure — Hotfix",      "task_type": "urgent_bug", "priority": 1, "effort": 3, "sprint": 2, "deadline_day": 12, "required_skill": "backend",   "depends_on": []},
+        {"id": "T13", "name": "Payment Compliance Spike",      "task_type": "tech_debt",  "priority": 2, "effort": 3, "sprint": 2, "deadline_day": 20, "required_skill": "backend",   "depends_on": []},
+
+        {"id": "T14", "name": "Payment Gateway Service",       "task_type": "feature",    "priority": 1, "effort": 7, "sprint": 3, "deadline_day": 28, "required_skill": "backend",   "depends_on": ["T08", "T13"]},
+        {"id": "T15", "name": "Checkout UI — Multi-step",      "task_type": "feature",    "priority": 1, "effort": 6, "sprint": 3, "deadline_day": 29, "required_skill": "frontend",  "depends_on": ["T09"]},
+        {"id": "T16", "name": "Canary + Rollback Automation",  "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 3, "deadline_day": 30, "required_skill": "devops",    "depends_on": ["T10"]},
+        {"id": "T17", "name": "Notification & Event Service",  "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 3, "deadline_day": 29, "required_skill": "fullstack", "depends_on": ["T11"]},
+        {"id": "T18", "name": "Inventory & Orders API",        "task_type": "feature",    "priority": 1, "effort": 6, "sprint": 3, "deadline_day": 28, "required_skill": "backend",   "depends_on": ["T05"]},
+        {"id": "T19", "name": "Payment Security Audit",        "task_type": "bug",        "priority": 1, "effort": 3, "sprint": 3, "deadline_day": 27, "required_skill": "backend",   "depends_on": ["T14"]},
+
+        {"id": "T20", "name": "Order Management UI",           "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 4, "deadline_day": 37, "required_skill": "frontend",  "depends_on": ["T15", "T18"]},
+        {"id": "T21", "name": "Fraud Detection Service",       "task_type": "feature",    "priority": 1, "effort": 6, "sprint": 4, "deadline_day": 38, "required_skill": "fullstack", "depends_on": ["T14", "T17"]},
+        {"id": "T22", "name": "Full-Text Search (ES)",         "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 4, "deadline_day": 39, "required_skill": "backend",   "depends_on": ["T18"]},
+        {"id": "T23", "name": "Multi-Region Failover",         "task_type": "feature",    "priority": 2, "effort": 6, "sprint": 4, "deadline_day": 40, "required_skill": "devops",    "depends_on": ["T16"]},
+        {"id": "T24", "name": "Mid-Sprint Scope Pivot — Recs", "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 4, "deadline_day": 39, "required_skill": "fullstack", "depends_on": []},
+        {"id": "T25", "name": "Payment Gateway Bug Surge",     "task_type": "urgent_bug", "priority": 1, "effort": 4, "sprint": 4, "deadline_day": 34, "required_skill": "backend",   "depends_on": []},
+
+        {"id": "T26", "name": "Reporting & BI API",            "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 5, "deadline_day": 48, "required_skill": "backend",   "depends_on": ["T22"]},
+        {"id": "T27", "name": "Executive Dashboard UI",        "task_type": "feature",    "priority": 2, "effort": 5, "sprint": 5, "deadline_day": 49, "required_skill": "frontend",  "depends_on": ["T20"]},
+        {"id": "T28", "name": "SLO / SLA Monitoring",          "task_type": "tech_debt",  "priority": 2, "effort": 4, "sprint": 5, "deadline_day": 49, "required_skill": "devops",    "depends_on": ["T23"]},
+        {"id": "T29", "name": "Recommendation Engine v1",      "task_type": "feature",    "priority": 2, "effort": 6, "sprint": 5, "deadline_day": 50, "required_skill": "fullstack", "depends_on": ["T24"]},
+        {"id": "T30", "name": "GDPR / Data Privacy Pass",      "task_type": "tech_debt",  "priority": 1, "effort": 4, "sprint": 5, "deadline_day": 48, "required_skill": "backend",   "depends_on": []},
+        {"id": "T31", "name": "Mobile API Adaptation Layer",   "task_type": "feature",    "priority": 3, "effort": 4, "sprint": 5, "deadline_day": 50, "required_skill": "fullstack", "depends_on": ["T21"]},
+
+        {"id": "T32", "name": "Penetration Test & Fixes",      "task_type": "bug",        "priority": 1, "effort": 6, "sprint": 6, "deadline_day": 56, "required_skill": "backend",   "depends_on": ["T19", "T30"]},
+        {"id": "T33", "name": "Final UI QA & Accessibility",   "task_type": "bug",        "priority": 1, "effort": 4, "sprint": 6, "deadline_day": 58, "required_skill": "frontend",  "depends_on": ["T27"]},
+        {"id": "T34", "name": "Blue-Green Production Deploy",  "task_type": "feature",    "priority": 1, "effort": 5, "sprint": 6, "deadline_day": 60, "required_skill": "devops",    "depends_on": ["T28", "T32"]},
+        {"id": "T35", "name": "Fraud Rule Tuning",             "task_type": "tech_debt",  "priority": 2, "effort": 3, "sprint": 6, "deadline_day": 58, "required_skill": "fullstack", "depends_on": ["T21"]},
+        {"id": "T36", "name": "Runbooks & DR Documentation",   "task_type": "tech_debt",  "priority": 2, "effort": 3, "sprint": 6, "deadline_day": 59, "required_skill": "fullstack", "depends_on": []},
+        {"id": "T37", "name": "Stakeholder Demo & Handoff",    "task_type": "feature",    "priority": 1, "effort": 2, "sprint": 6, "deadline_day": 60, "required_skill": "fullstack", "depends_on": ["T33", "T35", "T36"]}
+      ],
+      "instructions": [
+        {"id": "I01", "release_day": 1,  "text": "Auth & IAM must be done before day 7 — it gates all other services.", "target_sprint": 1, "affects_tasks": ["T01"]},
+        {"id": "I02", "release_day": 2,  "text": "API gateway rate limiting is a launch requirement — not optional.", "target_sprint": 1, "affects_tasks": ["T02"]},
+        {"id": "I03", "release_day": 5,  "text": "Service-to-service auth must be validated in sprint 1 before Kafka work begins.", "target_sprint": 1, "affects_tasks": ["T06"]},
+        {"id": "I04", "release_day": 8,  "text": "Kubernetes must be ready for sprint 2 deployments — escalate any blockers.", "target_sprint": 1, "affects_tasks": ["T04"]},
+        {"id": "I05", "release_day": 11, "text": "Prod DB failure is P0 — assign Alice immediately, push T08 if needed.", "target_sprint": 2, "affects_tasks": ["T12"]},
+        {"id": "I06", "release_day": 12, "text": "Bob is on sick leave days 12-15 — redistribute T09 to Frank.", "target_sprint": 2, "affects_tasks": ["T09"]},
+        {"id": "I07", "release_day": 16, "text": "Kafka event bus is a hard dependency for notification service in sprint 3.", "target_sprint": 2, "affects_tasks": ["T11"]},
+        {"id": "I08", "release_day": 19, "text": "Payment compliance spike must close before sprint 3 payment work starts.", "target_sprint": 2, "affects_tasks": ["T13"]},
+        {"id": "I09", "release_day": 21, "text": "Payment gateway is the sprint 3 critical path — assign Eve and Alice.", "target_sprint": 3, "affects_tasks": ["T14"]},
+        {"id": "I10", "release_day": 23, "text": "Eve is out days 23-26 — replan sprint 3 backend with Alice carrying payment.", "target_sprint": 3, "affects_tasks": ["T14", "T18"]},
+        {"id": "I11", "release_day": 25, "text": "Payment security audit is a release gate — must pass before checkout UI is signed off.", "target_sprint": 3, "affects_tasks": ["T19"]},
+        {"id": "I12", "release_day": 28, "text": "Canary rollback automation must be validated before multi-region failover in sprint 4.", "target_sprint": 3, "affects_tasks": ["T16"]},
+        {"id": "I13", "release_day": 31, "text": "Fraud detection is now a sprint 4 commitment — do not descope.", "target_sprint": 4, "affects_tasks": ["T21"]},
+        {"id": "I14", "release_day": 33, "text": "Dave is at conference days 33-37 — all fullstack sprint 4 tasks need replan.", "target_sprint": 4, "affects_tasks": ["T21", "T24"]},
+        {"id": "I15", "release_day": 33, "text": "Payment bug surge T25 is P0 — assign best available backend dev.", "target_sprint": 4, "affects_tasks": ["T25"]},
+        {"id": "I16", "release_day": 36, "text": "Recommendation engine scope has been greenlit — T24 must ship in sprint 4.", "target_sprint": 4, "affects_tasks": ["T24"]},
+        {"id": "I17", "release_day": 39, "text": "Multi-region failover must be tested before sprint 6 production deploy.", "target_sprint": 4, "affects_tasks": ["T23"]},
+        {"id": "I18", "release_day": 41, "text": "GDPR pass is now a legal requirement — must complete in sprint 5 no exceptions.", "target_sprint": 5, "affects_tasks": ["T30"]},
+        {"id": "I19", "release_day": 43, "text": "Carol is sick days 43-45 — DevOps SLO monitoring may slip, flag risk.", "target_sprint": 5, "affects_tasks": ["T28"]},
+        {"id": "I20", "release_day": 45, "text": "Executive dashboard needs live data feed — scope increase, coordinate with backend.", "target_sprint": 5, "affects_tasks": ["T27", "T26"]},
+        {"id": "I21", "release_day": 47, "text": "Mobile API layer has been reprioritised by CPO — must not miss sprint 5.", "target_sprint": 5, "affects_tasks": ["T31"]},
+        {"id": "I22", "release_day": 51, "text": "Alice is on vacation days 51-55 — pen test fixes must be pre-assigned.", "target_sprint": 6, "affects_tasks": ["T32"]},
+        {"id": "I23", "release_day": 53, "text": "Pen test returned 3 critical CVEs — T32 scope has increased, adjust sprint 6 plan.", "target_sprint": 6, "affects_tasks": ["T32"]},
+        {"id": "I24", "release_day": 55, "text": "Blue-green deploy is hard-locked to day 60 — no rescheduling.", "target_sprint": 6, "affects_tasks": ["T34"]},
+        {"id": "I25", "release_day": 57, "text": "Stakeholder demo requires fraud rule tuning and runbooks to be complete first.", "target_sprint": 6, "affects_tasks": ["T35", "T36", "T37"]}
+      ]
+    }
+  }
+}

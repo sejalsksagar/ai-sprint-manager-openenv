@@ -18,3 +18,71 @@ tasks:
   - id: hard_sprint
     name: "Hard Sprint: Cascading Failures & Scope Changes"
     difficulty: hard
+
+  - id: project_easy
+    description: >
+      AI Engineering Manager — 6-sprint project (60 days), small stable team,
+      clear backlog, no cascade failures. Tests long-horizon planning baseline.
+    difficulty: easy
+    reset_endpoint: /project/reset
+    step_endpoint: /project/step
+    state_endpoint: /project/state
+    health_endpoint: /project/health
+    reset_payload:
+      task_name: project_easy
+      seed: 42
+    max_steps: 60
+    score_field: instruction_following_score
+    metadata:
+      round: 2
+      num_sprints: 6
+      total_days: 60
+      num_tasks: 24
+      num_instructions: 12
+      theme: long_horizon_planning
+
+  - id: project_medium
+    description: >
+      AI Engineering Manager — 6-sprint project (60 days), mid-size team with
+      developer absences, urgent bugs, and conflicting instructions mid-sprint.
+    difficulty: medium
+    reset_endpoint: /project/reset
+    step_endpoint: /project/step
+    state_endpoint: /project/state
+    health_endpoint: /project/health
+    reset_payload:
+      task_name: project_medium
+      seed: 42
+    max_steps: 60
+    score_field: instruction_following_score
+    metadata:
+      round: 2
+      num_sprints: 6
+      total_days: 60
+      num_tasks: 30
+      num_instructions: 18
+      theme: long_horizon_planning
+
+  - id: project_hard
+    description: >
+      AI Engineering Manager — 6-sprint project (60 days), large team with
+      cascading failures, scope pivots, conflicting instructions, and hard
+      delivery deadline. Scale AI bonus prize target scenario.
+    difficulty: hard
+    reset_endpoint: /project/reset
+    step_endpoint: /project/step
+    state_endpoint: /project/state
+    health_endpoint: /project/health
+    reset_payload:
+      task_name: project_hard
+      seed: 42
+    max_steps: 60
+    score_field: instruction_following_score
+    metadata:
+      round: 2
+      num_sprints: 6
+      total_days: 60
+      num_tasks: 37
+      num_instructions: 25
+      theme: long_horizon_planning
+      scale_ai_bonus: true

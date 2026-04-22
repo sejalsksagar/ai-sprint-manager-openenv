@@ -1,0 +1,359 @@
+{
+  "metadata": {
+    "timestamp": "2026-04-21 23:48:27",
+    "model": "rule-based",
+    "env_url": "http://localhost:7860",
+    "n_episodes": 3,
+    "baseline_only": true
+  },
+  "r1_baseline_qwen": {
+    "easy_sprint": 0.99,
+    "medium_sprint": 0.6667,
+    "hard_sprint": 0.3716
+  },
+  "r1_rule_based": {
+    "easy_sprint": {
+      "avg_score": 0.99,
+      "episodes": [
+        {
+          "task": "easy_sprint",
+          "score": 0.99,
+          "cumulative_reward": 27.5,
+          "steps": 7,
+          "tasks_completed": 5,
+          "tasks_missed": 0,
+          "action_breakdown": {
+            "skip": 2,
+            "assign": 5
+          }
+        },
+        {
+          "task": "easy_sprint",
+          "score": 0.99,
+          "cumulative_reward": 27.5,
+          "steps": 7,
+          "tasks_completed": 5,
+          "tasks_missed": 0,
+          "action_breakdown": {
+            "skip": 2,
+            "assign": 5
+          }
+        },
+        {
+          "task": "easy_sprint",
+          "score": 0.99,
+          "cumulative_reward": 27.5,
+          "steps": 7,
+          "tasks_completed": 5,
+          "tasks_missed": 0,
+          "action_breakdown": {
+            "skip": 2,
+            "assign": 5
+          }
+        }
+      ]
+    },
+    "medium_sprint": {
+      "avg_score": 0.35,
+      "episodes": [
+        {
+          "task": "medium_sprint",
+          "score": 0.35,
+          "cumulative_reward": 15.867,
+          "steps": 10,
+          "tasks_completed": 4,
+          "tasks_missed": 4,
+          "action_breakdown": {
+            "skip": 2,
+            "assign": 8
+          }
+        },
+        {
+          "task": "medium_sprint",
+          "score": 0.35,
+          "cumulative_reward": 15.867,
+          "steps": 10,
+          "tasks_completed": 4,
+          "tasks_missed": 4,
+          "action_breakdown": {
+            "skip": 2,
+            "assign": 8
+          }
+        },
+        {
+          "task": "medium_sprint",
+          "score": 0.35,
+          "cumulative_reward": 15.867,
+          "steps": 10,
+          "tasks_completed": 4,
+          "tasks_missed": 4,
+          "action_breakdown": {
+            "skip": 2,
+            "assign": 8
+          }
+        }
+      ]
+    },
+    "hard_sprint": {
+      "avg_score": 0.01,
+      "episodes": [
+        {
+          "task": "hard_sprint",
+          "score": 0.01,
+          "cumulative_reward": 2.516,
+          "steps": 10,
+          "tasks_completed": 2,
+          "tasks_missed": 10,
+          "action_breakdown": {
+            "assign": 10
+          }
+        },
+        {
+          "task": "hard_sprint",
+          "score": 0.01,
+          "cumulative_reward": 2.516,
+          "steps": 10,
+          "tasks_completed": 2,
+          "tasks_missed": 10,
+          "action_breakdown": {
+            "assign": 10
+          }
+        },
+        {
+          "task": "hard_sprint",
+          "score": 0.01,
+          "cumulative_reward": 2.516,
+          "steps": 10,
+          "tasks_completed": 2,
+          "tasks_missed": 10,
+          "action_breakdown": {
+            "assign": 10
+          }
+        }
+      ]
+    }
+  },
+  "r1_llm": {},
+  "r2_baseline_rules": {
+    "project_easy": 0.2125,
+    "project_medium": 0.275,
+    "project_hard": 0.3
+  },
+  "r2_rule_based": {
+    "project_easy": {
+      "avg_score": 0.2727,
+      "episodes": [
+        {
+          "task": "project_easy",
+          "score": 0.2727,
+          "cumulative_reward": 13.2071,
+          "steps": 60,
+          "tasks_completed": 3,
+          "tasks_missed": 7,
+          "instruction_following_score": 0.25,
+          "tech_debt_count": 7,
+          "sprint_rewards": [
+            0.8,
+            0.978,
+            0.5251,
+            0.46,
+            0.7656,
+            0.744
+          ],
+          "action_breakdown": {
+            "skip": 32,
+            "assign": 28
+          }
+        },
+        {
+          "task": "project_easy",
+          "score": 0.2727,
+          "cumulative_reward": 13.2071,
+          "steps": 60,
+          "tasks_completed": 3,
+          "tasks_missed": 7,
+          "instruction_following_score": 0.25,
+          "tech_debt_count": 7,
+          "sprint_rewards": [
+            0.8,
+            0.978,
+            0.5251,
+            0.46,
+            0.7656,
+            0.744
+          ],
+          "action_breakdown": {
+            "skip": 32,
+            "assign": 28
+          }
+        },
+        {
+          "task": "project_easy",
+          "score": 0.2727,
+          "cumulative_reward": 13.2071,
+          "steps": 60,
+          "tasks_completed": 3,
+          "tasks_missed": 7,
+          "instruction_following_score": 0.25,
+          "tech_debt_count": 7,
+          "sprint_rewards": [
+            0.8,
+            0.978,
+            0.5251,
+            0.46,
+            0.7656,
+            0.744
+          ],
+          "action_breakdown": {
+            "skip": 32,
+            "assign": 28
+          }
+        }
+      ]
+    },
+    "project_medium": {
+      "avg_score": 0.2063,
+      "episodes": [
+        {
+          "task": "project_medium",
+          "score": 0.2063,
+          "cumulative_reward": 0.5116,
+          "steps": 60,
+          "tasks_completed": 0,
+          "tasks_missed": 9,
+          "instruction_following_score": 0.2778,
+          "tech_debt_count": 9,
+          "sprint_rewards": [
+            0.85,
+            0.7886,
+            0.644,
+            0.4948,
+            0.5315,
+            0.5027
+          ],
+          "action_breakdown": {
+            "skip": 25,
+            "assign": 35
+          }
+        },
+        {
+          "task": "project_medium",
+          "score": 0.2063,
+          "cumulative_reward": 0.5116,
+          "steps": 60,
+          "tasks_completed": 0,
+          "tasks_missed": 9,
+          "instruction_following_score": 0.2778,
+          "tech_debt_count": 9,
+          "sprint_rewards": [
+            0.85,
+            0.7886,
+            0.644,
+            0.4948,
+            0.5315,
+            0.5027
+          ],
+          "action_breakdown": {
+            "skip": 25,
+            "assign": 35
+          }
+        },
+        {
+          "task": "project_medium",
+          "score": 0.2063,
+          "cumulative_reward": 0.5116,
+          "steps": 60,
+          "tasks_completed": 0,
+          "tasks_missed": 9,
+          "instruction_following_score": 0.2778,
+          "tech_debt_count": 9,
+          "sprint_rewards": [
+            0.85,
+            0.7886,
+            0.644,
+            0.4948,
+            0.5315,
+            0.5027
+          ],
+          "action_breakdown": {
+            "skip": 25,
+            "assign": 35
+          }
+        }
+      ]
+    },
+    "project_hard": {
+      "avg_score": 0.261,
+      "episodes": [
+        {
+          "task": "project_hard",
+          "score": 0.261,
+          "cumulative_reward": -6.9774,
+          "steps": 60,
+          "tasks_completed": 0,
+          "tasks_missed": 15,
+          "instruction_following_score": 0.52,
+          "tech_debt_count": 15,
+          "sprint_rewards": [
+            0.88,
+            0.6949,
+            0.5939,
+            0.6533,
+            0.6505,
+            0.6
+          ],
+          "action_breakdown": {
+            "skip": 8,
+            "assign": 52
+          }
+        },
+        {
+          "task": "project_hard",
+          "score": 0.261,
+          "cumulative_reward": -6.9774,
+          "steps": 60,
+          "tasks_completed": 0,
+          "tasks_missed": 15,
+          "instruction_following_score": 0.52,
+          "tech_debt_count": 15,
+          "sprint_rewards": [
+            0.88,
+            0.6949,
+            0.5939,
+            0.6533,
+            0.6505,
+            0.6
+          ],
+          "action_breakdown": {
+            "skip": 8,
+            "assign": 52
+          }
+        },
+        {
+          "task": "project_hard",
+          "score": 0.261,
+          "cumulative_reward": -6.9774,
+          "steps": 60,
+          "tasks_completed": 0,
+          "tasks_missed": 15,
+          "instruction_following_score": 0.52,
+          "tech_debt_count": 15,
+          "sprint_rewards": [
+            0.88,
+            0.6949,
+            0.5939,
+            0.6533,
+            0.6505,
+            0.6
+          ],
+          "action_breakdown": {
+            "skip": 8,
+            "assign": 52
+          }
+        }
+      ]
+    }
+  },
+  "r2_llm": {},
+  "improvement": {}
+}
