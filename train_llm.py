@@ -43,7 +43,7 @@ from typing import Any
 
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:7860")
 HF_TOKEN     = os.getenv("HF_TOKEN", "")
-MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
+MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 HF_REPO_ID   = os.getenv("HF_REPO_ID", "")    # optional push target
 
 # Training hyperparameters — tuned for a single A100/H100 with ~40GB VRAM.

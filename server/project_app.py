@@ -215,17 +215,57 @@ def project_tasks() -> Dict[str, Any]:
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+_VALID_ACTIONS = {"assign", "reassign", "reprioritize", "skip", "unblock", "sprint_plan"}
+
+
 def _parse_action(action_dict: Dict[str, Any]) -> ProjectAction:
     """
-    Parse and validate an action dict into a ProjectAction.
+    Sanitise and validate an action dict from the LLM into a ProjectAction.
 
-    Falls back gracefully: unknown extra keys are ignored by Pydantic,
-    missing optional keys use defaults.
+    Handles all common LLM output mistakes to eliminate 422 errors:
+    - Unknown action_type → replaced with "skip"
+    - "null" string → None
+    - sprint_plan without task_ids → replaced with "skip"
+    - assign/reassign without task_id or dev_id → replaced with "skip"
+    - Extra unknown keys are ignored by Pydantic
     """
-    # Normalise action_type casing before Pydantic sees it
-    if "action_type" in action_dict:
-        action_dict = {**action_dict, "action_type": str(action_dict["action_type"]).lower().strip()}
-    return ProjectAction(**action_dict)
+    # Deep copy so we don't mutate caller's dict
+    d: Dict[str, Any] = dict(action_dict)
+
+    # 1. Normalise action_type
+    raw_type = str(d.get("action_type", "skip")).lower().strip()
+    if raw_type not in _VALID_ACTIONS:
+        raw_type = "skip"
+    d["action_type"] = raw_type
+
+    # 2. Convert "null" strings → None (Llama often outputs "null" as a string)
+    for key in ("task_id", "dev_id", "new_priority", "task_ids", "notes"):
+        if d.get(key) in ("null", "none", "None", "Null", "", "undefined"):
+            d[key] = None
+
+    # 3. Convert new_priority to int if it's a numeric string
+    if d.get("new_priority") is not None:
+        try:
+            d["new_priority"] = int(d["new_priority"])
+            if d["new_priority"] not in range(1, 6):
+                d["new_priority"] = None
+        except (ValueError, TypeError):
+            d["new_priority"] = None
+
+    # 4. Safety: demote invalid action types to skip before cross-field validation
+    atype = d["action_type"]
+    if atype == "assign" and (not d.get("task_id") or not d.get("dev_id")):
+        d["action_type"] = "skip"
+    if atype == "reassign" and (not d.get("task_id") or not d.get("dev_id")):
+        d["action_type"] = "skip"
+    if atype == "reprioritize" and (not d.get("task_id") or not d.get("new_priority")):
+        d["action_type"] = "skip"
+    if atype == "unblock" and not d.get("task_id"):
+        d["action_type"] = "skip"
+    if atype == "sprint_plan" and not d.get("task_ids"):
+        d["action_type"] = "skip"  # sprint_plan without task_ids is a no-op anyway
+
+    return ProjectAction(**d)
 
 
 def _fmt_error(exc: Exception) -> str:

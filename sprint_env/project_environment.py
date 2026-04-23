@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sprint_env.tasks import Task, Developer, TaskStatus, TaskType
 from sprint_env.models import SprintAction
-from sprint_env.project_data_loader import load_project_data
+
 # ---------------------------------------------------------------------------
 # Data path
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ def _build_project_scenario(
     Tasks are constructed as R1-compatible Task objects with the extra fields
     (sprint, deadline_day, depends_on) stored in task.metadata.
     """
-    data = load_project_data()
+    data = _load_project_data()
     sc = data["scenarios"][scenario_name]
 
     developers: List[Developer] = []
@@ -133,7 +133,7 @@ def _make_project_observation(
     done_count = sum(1 for t in tasks if t.status == TaskStatus.DONE)
     missed_count = sum(1 for t in tasks if t.status == TaskStatus.MISSED)
     in_prog = sum(1 for t in tasks if t.status == TaskStatus.IN_PROGRESS)
-    backlog = sum(1 for t in tasks if t.status == TaskStatus.BACKLOG)
+    backlog = sum(1 for t in tasks if t.status == TaskStatus.BLOCKED or t.status == TaskStatus.BACKLOG)
 
     load_ratios = [d.current_load / d.capacity for d in developers if d.capacity > 0]
     if load_ratios:
@@ -143,13 +143,25 @@ def _make_project_observation(
     else:
         balance = 1.0
 
+    def _task_to_dict(t) -> dict:
+        """
+        Serialize a Task to dict, guaranteeing the 'metadata' key is present.
+        R1's Task.to_dict() may not include metadata (it's set as a dynamic
+        attribute in project_environment.py). We always inject it here so the
+        UI and graders can read sprint / depends_on / tech_debt fields.
+        """
+        d = t.to_dict()
+        # Always overwrite with the live metadata attribute (may be {} if unset)
+        d["metadata"] = getattr(t, "metadata", {})
+        return d
+
     return {
         # ── Core fields (same as R1 SprintObservation) ──
         "current_day": current_day,
         "sprint_length": TOTAL_DAYS,
         "task_id": task_name,
         "developers": [d.to_dict() for d in developers],
-        "tasks": [t.to_dict() for t in tasks],
+        "tasks": [_task_to_dict(t) for t in tasks],
         "reward": round(reward, 4),
         "cumulative_reward": round(cumulative_reward, 4),
         "tasks_completed": done_count,

@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ENV_URL        = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
-BASELINE_MODEL = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
+BASELINE_MODEL = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 API_BASE_URL   = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY        = os.getenv("HF_TOKEN", "dummy")
 POLICY_PATH    = "./results/best_policy.json"

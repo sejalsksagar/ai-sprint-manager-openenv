@@ -38,12 +38,12 @@ load_dotenv()
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "dummy")
-MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
+MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 
 MAX_STEPS   = 60        # full 60-day project
 TEMPERATURE = 0.2
-MAX_TOKENS  = 350       # slightly more than R1 — instructions need space
+MAX_TOKENS  = 80        # action JSON is tiny — 80 tokens is plenty
 
 TASKS = ["project_easy", "project_medium", "project_hard"]
 
@@ -56,148 +56,82 @@ client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 #   - sprint context (current sprint, days remaining)
 #   - sprint_plan action type for batch planning
 
-R2_SYSTEM_PROMPT = """You are an expert Engineering Manager running a 6-sprint software project (60 days).
+R2_SYSTEM_PROMPT = """You are an Engineering Manager. Output ONLY a JSON action each step.
 
-Your goals:
-1. Complete tasks on time, highest priority first
-2. Follow EVERY active instruction — these come from stakeholders and must not be ignored
-3. Keep tech debt low — each missed task permanently reduces team productivity
-4. Balance developer workload to avoid burnout
+Schema: {"action_type":"<assign|reassign|reprioritize|unblock|skip>","task_id":"<id or null>","dev_id":"<id or null>","new_priority":<1-5 or null>}
 
-Each step output a JSON action with this exact schema:
-{
-  "action_type": "<assign|reassign|reprioritize|unblock|skip>",
-  "task_id": "<task id or null>",
-  "dev_id": "<developer id or null>",
-  "new_priority": <1-5 or null>
-}
+Rules:
+- Follow ACTIVE INSTRUCTIONS first — assign their tasks immediately
+- assign: only if task deps (✓) are satisfied and dev is available (✓)
+- unblock: only if task status is "blocked"
+- skip: last resort only
 
-Action rules:
-- assign       : assign a BACKLOG task to an available developer — ALWAYS prefer skill match
-- reassign     : move an IN_PROGRESS task to a different developer
-- reprioritize : change task priority (1=highest, 5=lowest)
-- unblock      : use ONLY when a task status is "blocked" — do NOT use on backlog tasks
-- skip         : do nothing (costs -0.05 reward — avoid unless truly nothing to do)
-
-Critical rules:
-- ALWAYS act on ACTIVE INSTRUCTIONS first — assign their referenced tasks immediately
-- Only assign tasks whose depends_on tasks are already "done"
-- Match developer skill to task required_skill when possible
-- Never assign to an unavailable developer (is_available=false)
-- Do NOT repeat the same action if it failed last step — try a different task or dev
-
-Output ONLY the JSON object. No explanation, no markdown."""
+Output ONLY the JSON. No explanation."""
 
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
 def build_user_prompt(obs: dict) -> str:
     """
-    Build the per-step user prompt including R2 fields:
-    sprint context, active instructions, tech debt, tasks, developers.
+    Compact per-step prompt for R2. Kept short to avoid HF router token limits.
+    Qwen2.5-1.5B context via HF router: ~2048 tokens total (system + user + completion).
+    Target: user prompt under 600 tokens.
     """
     current_day    = obs["current_day"]
     current_sprint = obs.get("current_sprint", 1)
-    sprint_end     = current_sprint * 10
-    days_left      = max(0, sprint_end - current_day + 1)
-    total_days     = obs.get("sprint_length", 60)
+    days_left      = max(0, current_sprint * 10 - current_day + 1)
 
-    # ── Active instructions (R2 key feature) ─────────────────────────────────
-    active_insts = [
-        i for i in obs.get("instruction_queue", [])
-        if not i.get("followed", False)
-    ]
+    # Active instructions — most critical, show up to 3
+    active_insts = [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)]
     if active_insts:
-        inst_lines = "\n".join(
-            f"  [{i['id']}] (Sprint {i.get('target_sprint','?')}) {i['text']}"
-            for i in active_insts
+        inst_lines = " | ".join(
+            f"[{i['id']}] {i['text'][:50]}" for i in active_insts[:3]
         )
-        inst_section = f"⚠️  ACTIVE INSTRUCTIONS (follow these NOW):\n{inst_lines}"
+        inst_section = f"FOLLOW NOW: {inst_lines}"
     else:
-        inst_section = "✅ No active instructions pending."
+        inst_section = "No pending instructions."
 
-    # ── Tech debt ─────────────────────────────────────────────────────────────
+    # Tech debt — just count and IDs
     tech_debt = obs.get("tech_debt", [])
-    debt_section = (
-        f"🔴 TECH DEBT ({len(tech_debt)} tasks): {', '.join(tech_debt)}"
-        if tech_debt else
-        "✅ No tech debt."
+    debt_str = f"DEBT({len(tech_debt)}): {','.join(tech_debt[:5])}" if tech_debt else "No debt."
+
+    # Tasks — compact format, top 6 backlog only
+    tasks    = obs["tasks"]
+    done_ids = {t["id"] for t in tasks if t["status"] == "done"}
+    backlog  = sorted(
+        [t for t in tasks if t["status"] == "backlog"],
+        key=lambda t: (t["priority"], t["deadline"])
     )
+    in_prog  = [t for t in tasks if t["status"] == "in_progress"]
 
-    # ── Sprint rewards so far ─────────────────────────────────────────────────
-    sprint_rewards = obs.get("sprint_rewards", [])
-    rewards_str = (
-        "  ".join(f"S{i+1}:{r:.2f}" for i, r in enumerate(sprint_rewards))
-        or "none yet"
-    )
+    def fmt(t: dict) -> str:
+        deps = t.get("metadata", {}).get("depends_on", [])
+        ok = "✓" if all(d in done_ids for d in deps) else "✗"
+        return f"[{t['id']}]P{t['priority']} {t['required_skill']} {ok} due=D{t['deadline']}"
 
-    # ── Tasks (grouped by status for clarity) ─────────────────────────────────
-    tasks = obs["tasks"]
+    backlog_str  = " ".join(fmt(t) for t in backlog[:6])
+    if len(backlog) > 6:
+        backlog_str += f" +{len(backlog)-6}more"
+    inprog_str   = " ".join(f"[{t['id']}]→{t['assigned_to']}" for t in in_prog) or "none"
+    missed_str   = ",".join(t["id"] for t in tasks if t["status"] == "missed") or "none"
 
-    def fmt_task(t: dict) -> str:
-        dep = t.get("metadata", {}).get("depends_on", [])
-        dep_str = f" deps={dep}" if dep else ""
-        return (
-            f"  [{t['id']}] {t['name']} | {t['task_type']} | P{t['priority']} | "
-            f"effort={t['effort']} | due=Day{t['deadline']} | "
-            f"skill={t['required_skill']} | status={t['status']} | "
-            f"sprint={t.get('metadata',{}).get('sprint','?')} | "
-            f"dev={t['assigned_to']} | prog={t['progress']:.0%}{dep_str}"
-        )
-
-    backlog     = [t for t in tasks if t["status"] == "backlog"]
-    in_progress = [t for t in tasks if t["status"] == "in_progress"]
-    blocked     = [t for t in tasks if t["status"] == "blocked"]
-    done        = [t for t in tasks if t["status"] == "done"]
-    missed      = [t for t in tasks if t["status"] == "missed"]
-
-    # Sort backlog by priority then deadline
-    backlog_sorted = sorted(backlog, key=lambda t: (t["priority"], t["deadline"]))
-
-    tasks_section = ""
-    if backlog_sorted:
-        tasks_section += "BACKLOG (assign these):\n" + "\n".join(fmt_task(t) for t in backlog_sorted[:8])
-        if len(backlog_sorted) > 8:
-            tasks_section += f"\n  ... and {len(backlog_sorted)-8} more backlog tasks"
-    if in_progress:
-        tasks_section += "\nIN PROGRESS:\n" + "\n".join(fmt_task(t) for t in in_progress)
-    if blocked:
-        tasks_section += "\nBLOCKED:\n" + "\n".join(fmt_task(t) for t in blocked)
-    if missed:
-        tasks_section += f"\nMISSED: {', '.join(t['id'] for t in missed)}"
-    if done:
-        tasks_section += f"\nDONE: {', '.join(t['id'] for t in done)}"
-
-    # ── Developers ────────────────────────────────────────────────────────────
-    devs_section = "\n".join(
-        f"  [{d['id']}] {d['name']} | skill={d['skill']} | "
-        f"load={d['current_load']}/{d['capacity']} | "
-        f"avail={'YES' if d['is_available'] else 'NO (absent)'}"
+    # Developers — compact
+    devs_str = " | ".join(
+        f"[{d['id']}]{d['name']}({d['skill']}) {d['current_load']}/{d['capacity']} {'✓' if d['is_available'] else '✗'}"
         for d in obs["developers"]
     )
 
-    events_str = "\n  ".join(obs.get("events", [])[-5:]) or "None"
-
-    return f"""═══ PROJECT STATUS ═══════════════════════════════════════
-Day {current_day}/{total_days} | Sprint {current_sprint}/6 | {days_left} days left in sprint
-Completed:{obs['tasks_completed']}  Missed:{obs['tasks_missed']}  In-Progress:{obs['tasks_in_progress']}  Backlog:{obs['tasks_backlog']}
-Inst-Following: {obs.get('instruction_following_score', 1.0):.2f} | Cumulative Reward: {obs['cumulative_reward']:.2f}
-Sprint rewards so far: {rewards_str}
-
-{inst_section}
-
-{debt_section}
-
-TASKS:
-{tasks_section}
-
-DEVELOPERS:
-{devs_section}
-
-Recent events:
-  {events_str}
-══════════════════════════════════════════════════════════
-Output your JSON action:"""
+    return (
+        f"D{current_day}/60 S{current_sprint}/6 ({days_left}d left) "
+        f"done={obs['tasks_completed']} missed={obs['tasks_missed']} inst={obs.get('instruction_following_score',1):.2f}\n"
+        f"{inst_section}\n"
+        f"{debt_str}\n"
+        f"BACKLOG(✓=deps_ok): {backlog_str}\n"
+        f"IN_PROGRESS: {inprog_str}\n"
+        f"MISSED: {missed_str}\n"
+        f"DEVS: {devs_str}\n"
+        f"Output JSON action:"
+    )
 
 
 # ── Environment HTTP helpers ───────────────────────────────────────────────────
@@ -293,11 +227,14 @@ def get_rule_based_action(obs: dict) -> str:
 
 # ── JSON parser ────────────────────────────────────────────────────────────────
 
+_VALID_ACTIONS = {"assign", "reassign", "reprioritize", "skip", "unblock"}
+_NULL_STRINGS  = {"null", "none", "None", "Null", "", "undefined", "N/A"}
+
+
 def parse_action(text: str) -> dict:
     """
-    Parse LLM output into an action dict.
-    Strips markdown fences, extracts first JSON object found.
-    Falls back to skip on any parse error.
+    Parse LLM output into a clean action dict the server will accept without 422.
+    Handles: markdown fences, "null" strings, sprint_plan, missing fields.
     """
     text = text.strip()
 
@@ -306,26 +243,56 @@ def parse_action(text: str) -> dict:
         lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
         text = "\n".join(lines).strip()
 
-    # Try direct parse first
+    # Parse JSON
+    d = None
     try:
-        return json.loads(text)
+        d = json.loads(text)
     except json.JSONDecodeError:
-        pass
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                d = json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
 
-    # Extract first {...} block
-    start = text.find("{")
-    end   = text.rfind("}") + 1
-    if start >= 0 and end > start:
+    if d is None:
+        return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
+
+    # Normalise action_type — sprint_plan and unknowns → skip
+    raw = str(d.get("action_type", "skip")).lower().strip()
+    if raw not in _VALID_ACTIONS:
+        raw = "skip"
+    d["action_type"] = raw
+
+    # Convert "null" strings → None
+    for key in ("task_id", "dev_id", "new_priority"):
+        if str(d.get(key, "")).strip() in _NULL_STRINGS:
+            d[key] = None
+
+    # Convert new_priority to int
+    if d.get("new_priority") is not None:
         try:
-            return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            pass
+            d["new_priority"] = int(d["new_priority"])
+            if d["new_priority"] not in range(1, 6):
+                d["new_priority"] = None
+        except (ValueError, TypeError):
+            d["new_priority"] = None
 
-    # Fallback
+    # Demote actions missing required fields → skip (avoids server 422)
+    atype = d["action_type"]
+    if atype in ("assign", "reassign") and (not d.get("task_id") or not d.get("dev_id")):
+        d["action_type"] = "skip"
+    if atype == "reprioritize" and (not d.get("task_id") or not d.get("new_priority")):
+        d["action_type"] = "skip"
+    if atype == "unblock" and not d.get("task_id"):
+        d["action_type"] = "skip"
+
     return {
-        "action_type": "skip",
-        "task_id": None, "dev_id": None,
-        "new_priority": None, "task_ids": None, "notes": None,
+        "action_type":  d["action_type"],
+        "task_id":      d.get("task_id"),
+        "dev_id":       d.get("dev_id"),
+        "new_priority": d.get("new_priority"),
     }
 
 
@@ -352,18 +319,41 @@ def run_episode(task_name: str) -> float:
 
         # ── LLM call with rule-based fallback ─────────────────────────────────
         try:
-            completion = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": R2_SYSTEM_PROMPT},
-                    {"role": "user",   "content": build_user_prompt(obs)},
-                ],
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-            )
+            # First try: system + user roles
+            messages = [
+                {"role": "system", "content": R2_SYSTEM_PROMPT},
+                {"role": "user",   "content": build_user_prompt(obs)},
+            ]
+            try:
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
+            except Exception as e1:
+                # Log the real error detail for debugging
+                err_detail = getattr(e1, 'response', None)
+                err_text = err_detail.text if err_detail else str(e1)
+                if step_num == 1:  # only log on first step to avoid spam
+                    print(f"[DEBUG] LLM error detail: {err_text[:200]}", flush=True)
+
+                # Retry: merge system + user into single user message
+                # (some HF endpoints don't support system role)
+                merged = f"{R2_SYSTEM_PROMPT}\n\n{build_user_prompt(obs)}"
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[{"role": "user", "content": merged}],
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
+
             response_text = completion.choices[0].message.content or ""
         except Exception as e:
-            print(f"[WARN] LLM unavailable ({type(e).__name__}), using rule-based fallback", flush=True)
+            if step_num == 1:
+                print(f"[WARN] LLM unavailable ({type(e).__name__}: {str(e)[:100]}), using rule-based fallback", flush=True)
+            else:
+                print(f"[WARN] LLM unavailable ({type(e).__name__}), using rule-based fallback", flush=True)
             response_text = get_rule_based_action(obs)
 
         action = parse_action(response_text)
