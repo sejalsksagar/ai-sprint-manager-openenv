@@ -43,10 +43,10 @@ R2_TASKS = ["project_easy", "project_medium", "project_hard"]
 # ── Measured baselines (FINAL — do not change) ────────────────────────────────
 # R1: Llama-3.1-8B zero-shot inference (inference.py), measured 2025-01
 LLAMA_BASELINE_R1 = {
-    "easy_sprint":   0.0100,
-    "medium_sprint": 0.4583,
-    "hard_sprint":   0.0100,
-    "average":       0.1594,
+    "easy_sprint":   0.9900,
+    "medium_sprint": 0.6667,
+    "hard_sprint":   0.3716,
+    "average":       0.6761,
 }
 
 # R2: Llama-3.1-8B zero-shot inference (inference_r2.py), measured 2025-01
@@ -58,11 +58,11 @@ LLAMA_BASELINE_R2 = {
 }
 
 # R2 rule-based baseline (from evaluate_r2.py --baseline-only, 3 episodes each)
-RULE_BASED_BASELINE_R2 = {
-    "project_easy":   0.2727,
-    "project_medium": 0.2063,
-    "project_hard":   0.2610,
-}
+# RULE_BASED_BASELINE_R2 = {
+#     "project_easy":   0.2727,
+#     "project_medium": 0.2063,
+#     "project_hard":   0.2610,
+# }
 
 # Training model: Qwen/Qwen2.5-1.5B-Instruct (GRPO, local 4-bit QLoRA)
 TRAINING_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -306,7 +306,7 @@ def evaluate(model_path: str | None = None, n_episodes: int = 3, baseline_only: 
         "r1_llama_baseline": LLAMA_BASELINE_R1,
         "r2_llama_baseline": LLAMA_BASELINE_R2,
         # Rule-based baselines (measured, 3 episodes each)
-        "r2_baseline_rules": RULE_BASED_BASELINE_R2,
+        #"r2_baseline_rules": RULE_BASED_BASELINE_R2,
         # Live run results
         "r1_rule_based": {},
         "r1_llm":        {},

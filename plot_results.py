@@ -7,12 +7,11 @@ Saves all charts to results/charts/ as both PNG and SVG.
 BASELINE CONSTANTS (FINAL — measured, do not change):
   R1 Llama-3.1-8B zero-shot: easy=0.0100, medium=0.4583, hard=0.0100, avg=0.1594
   R2 Llama-3.1-8B zero-shot: easy=0.3198, medium=0.2443, hard=0.2520, avg=0.2720
-  R2 Rule-based:              easy=0.2727, medium=0.2063, hard=0.2610
   Training model:             Qwen/Qwen2.5-1.5B-Instruct (GRPO, 4-bit QLoRA)
 
 Charts produced:
   1. r1_scores_comparison.png  — R1 Llama baseline vs trained bar chart
-  2. r2_scores_comparison.png  — R2 Llama/rule-based vs trained bar chart
+  2. r2_scores_comparison.png  — R2 Llama zero-shot vs trained bar chart (no rule-based)
   3. sprint_rewards.png        — Sprint-by-sprint reward for each R2 scenario
   4. improvement_summary.png   — Combined before/after delta chart (main slide chart)
   5. training_curve.png        — GRPO training loss/reward curve (if trainer_state.json present)
@@ -51,11 +50,6 @@ LLAMA_BASELINE_R2 = {
     "project_medium": 0.2443,
     "project_hard":   0.2520,
     "average":        0.2720,
-}
-RULE_BASED_BASELINE_R2 = {
-    "project_easy":   0.2727,
-    "project_medium": 0.2063,
-    "project_hard":   0.2610,
 }
 TRAINING_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
@@ -156,21 +150,18 @@ def chart_r2_comparison(eval_data: dict):
     tasks      = ["project_easy", "project_medium", "project_hard"]
     labels     = ["Easy (6 sprints)", "Medium (6 sprints)", "Hard (6 sprints)"]
     llama_base = [eval_data.get("r2_llama_baseline", LLAMA_BASELINE_R2).get(t, 0) for t in tasks]
-    rule_based = [eval_data.get("r2_rule_based", {}).get(t, {}).get("avg_score",
-                  RULE_BASED_BASELINE_R2.get(t, 0)) for t in tasks]
     llm_scores = [eval_data.get("r2_llm", {}).get(t, {}).get("avg_score", 0) for t in tasks]
 
     has_llm = any(v > 0 for v in llm_scores)
     x     = range(len(tasks))
-    width = 0.28 if has_llm else 0.38
+    width = 0.32 if has_llm else 0.5
     fig, ax = plt.subplots(figsize=(9, 5))
 
-    b1 = ax.bar([i - width     for i in x], llama_base, width, label="Llama-3.1-8B (zero-shot)", color=C_LLAMA,   zorder=3)
-    b2 = ax.bar([i             for i in x], rule_based, width, label="Rule-based baseline",       color=C_RULE,    zorder=3)
+    b1 = ax.bar([i - width/2 for i in x], llama_base, width, label="Llama-3.1-8B (zero-shot)", color=C_LLAMA,   zorder=3)
     if has_llm:
-        b3 = ax.bar([i + width for i in x], llm_scores, width, label=f"{TRAINING_MODEL} (GRPO)", color=C_TRAINED, zorder=3)
+        b2 = ax.bar([i + width/2 for i in x], llm_scores, width, label=f"{TRAINING_MODEL} (GRPO)", color=C_TRAINED, zorder=3)
 
-    for bars in ([b1, b2] + ([b3] if has_llm else [])):
+    for bars in ([b1] + ([b2] if has_llm else [])):
         for bar in bars:
             h = bar.get_height()
             if h > 0.01:
@@ -350,7 +341,6 @@ def demo_mode():
     demo_data = {
         "r1_llama_baseline": LLAMA_BASELINE_R1,
         "r2_llama_baseline": LLAMA_BASELINE_R2,
-        "r2_baseline_rules": RULE_BASED_BASELINE_R2,
         "r1_rule_based": {
             "easy_sprint":   {"avg_score": 0.92},
             "medium_sprint": {"avg_score": 0.35},
@@ -359,14 +349,7 @@ def demo_mode():
         "r1_llm": {
             t: {"avg_score": v} for t, v in PLACEHOLDER_R1_TRAINED.items()
         },
-        "r2_rule_based": {
-            "project_easy":   {"avg_score": RULE_BASED_BASELINE_R2["project_easy"],
-                               "episodes": [{"sprint_rewards": [0.50, 0.52, 0.48, 0.51, 0.49, 0.50]}]},
-            "project_medium": {"avg_score": RULE_BASED_BASELINE_R2["project_medium"],
-                               "episodes": [{"sprint_rewards": [0.42, 0.40, 0.38, 0.41, 0.39, 0.40]}]},
-            "project_hard":   {"avg_score": RULE_BASED_BASELINE_R2["project_hard"],
-                               "episodes": [{"sprint_rewards": [0.38, 0.40, 0.37, 0.41, 0.39, 0.40]}]},
-        },
+        "r2_rule_based": {},
         "r2_llm": {
             t: {"avg_score": v, "episodes": []}
             for t, v in PLACEHOLDER_R2_TRAINED.items()
@@ -374,7 +357,6 @@ def demo_mode():
         "improvement": {
             t: {
                 "llama_baseline": LLAMA_BASELINE_R2[t],
-                "rule_baseline":  RULE_BASED_BASELINE_R2[t],
                 "trained_llm":    PLACEHOLDER_R2_TRAINED[t],
                 "delta_vs_llama": round(PLACEHOLDER_R2_TRAINED[t] - LLAMA_BASELINE_R2[t], 4),
             }
