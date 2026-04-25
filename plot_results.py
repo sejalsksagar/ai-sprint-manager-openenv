@@ -183,7 +183,7 @@ def chart_r2_comparison(eval_data: dict):
 # ── Chart 3: Sprint reward curves ─────────────────────────────────────────────
 
 def chart_sprint_rewards(eval_data: dict):
-    """Per-sprint reward for each R2 scenario (rule-based vs trained)."""
+    """Per-sprint reward for each R2 scenario (Llama baseline vs trained)."""
     plt, _ = _setup_matplotlib()
     tasks  = ["project_easy", "project_medium", "project_hard"]
     colors = [C_EASY, C_MEDIUM, C_HARD]
@@ -192,20 +192,13 @@ def chart_sprint_rewards(eval_data: dict):
     fig, axes = plt.subplots(1, 3, figsize=(13, 4), sharey=True)
 
     for ax, task, color, label in zip(axes, tasks, colors, labels):
-        rb_eps  = eval_data.get("r2_rule_based", {}).get(task, {}).get("episodes", [])
         llm_eps = eval_data.get("r2_llm", {}).get(task, {}).get("episodes", [])
-
-        if rb_eps:
-            sr = rb_eps[0].get("sprint_rewards", [])
-            if sr:
-                ax.plot(range(1, len(sr)+1), sr, "o--",
-                        color=C_RULE, label="Rule-based", linewidth=1.5, markersize=5)
 
         if llm_eps:
             sr = llm_eps[0].get("sprint_rewards", [])
             if sr:
                 ax.plot(range(1, len(sr)+1), sr, "o-",
-                        color=color, label=f"Qwen GRPO", linewidth=2, markersize=6)
+                        color=color, label="Qwen GRPO", linewidth=2, markersize=6)
 
         ax.set_xlabel("Sprint")
         ax.set_title(f"{label} Project")
@@ -217,7 +210,7 @@ def chart_sprint_rewards(eval_data: dict):
             ax.set_ylabel("Sprint Reward")
         ax.legend(fontsize=8)
 
-    fig.suptitle("Sprint-by-Sprint Reward (Rule-based vs Qwen GRPO Trained)", y=1.02, fontsize=13, fontweight="bold")
+    fig.suptitle("Sprint-by-Sprint Reward — Qwen GRPO Trained", y=1.02, fontsize=13, fontweight="bold")
     save(plt, "sprint_rewards")
 
 

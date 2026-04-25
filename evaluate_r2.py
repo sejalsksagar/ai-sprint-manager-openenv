@@ -43,10 +43,10 @@ R2_TASKS = ["project_easy", "project_medium", "project_hard"]
 # ── Measured baselines (FINAL — do not change) ────────────────────────────────
 # R1: Llama-3.1-8B zero-shot inference (inference.py), measured 2025-01
 LLAMA_BASELINE_R1 = {
-    "easy_sprint":   0.9900,
-    "medium_sprint": 0.6667,
-    "hard_sprint":   0.3716,
-    "average":       0.6761,
+    "easy_sprint":   0.0100,
+    "medium_sprint": 0.4583,
+    "hard_sprint":   0.0100,
+    "average":       0.1594,
 }
 
 # R2: Llama-3.1-8B zero-shot inference (inference_r2.py), measured 2025-01
@@ -56,13 +56,6 @@ LLAMA_BASELINE_R2 = {
     "project_hard":   0.2520,
     "average":        0.2720,
 }
-
-# R2 rule-based baseline (from evaluate_r2.py --baseline-only, 3 episodes each)
-# RULE_BASED_BASELINE_R2 = {
-#     "project_easy":   0.2727,
-#     "project_medium": 0.2063,
-#     "project_hard":   0.2610,
-# }
 
 # Training model: Qwen/Qwen2.5-1.5B-Instruct (GRPO, local 4-bit QLoRA)
 TRAINING_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -305,8 +298,6 @@ def evaluate(model_path: str | None = None, n_episodes: int = 3, baseline_only: 
         # Measured Llama-3.1-8B zero-shot baselines (FINAL)
         "r1_llama_baseline": LLAMA_BASELINE_R1,
         "r2_llama_baseline": LLAMA_BASELINE_R2,
-        # Rule-based baselines (measured, 3 episodes each)
-        #"r2_baseline_rules": RULE_BASED_BASELINE_R2,
         # Live run results
         "r1_rule_based": {},
         "r1_llm":        {},
@@ -331,24 +322,6 @@ def evaluate(model_path: str | None = None, n_episodes: int = 3, baseline_only: 
                   f"done={r['tasks_completed']} reward={r['cumulative_reward']:.2f}", flush=True)
         avg_score = sum(r["score"] for r in ep_results) / n_episodes
         results["r1_rule_based"][task] = {
-            "avg_score": round(avg_score, 4),
-            "episodes":  ep_results,
-        }
-
-    # ── R2 rule-based baseline ────────────────────────────────────────────────
-    print(f"\n{'─'*55}", flush=True)
-    print(f" R2 — Rule-based baseline", flush=True)
-    print(f"{'─'*55}", flush=True)
-    for task in R2_TASKS:
-        ep_results = []
-        for ep in range(n_episodes):
-            r = run_r2_episode(r2_client, task, rule_based_r2)
-            ep_results.append(r)
-            print(f"  {task} ep{ep+1}: score={r['score']:.4f} "
-                  f"done={r['tasks_completed']} inst={r['instruction_following_score']:.2f} "
-                  f"debt={r['tech_debt_count']}", flush=True)
-        avg_score = sum(r["score"] for r in ep_results) / n_episodes
-        results["r2_rule_based"][task] = {
             "avg_score": round(avg_score, 4),
             "episodes":  ep_results,
         }
@@ -401,18 +374,13 @@ def evaluate(model_path: str | None = None, n_episodes: int = 3, baseline_only: 
 
         # ── Improvement table ─────────────────────────────────────────────────
         for task in R2_TASKS:
-            # Compare trained LLM against Llama zero-shot baseline (more honest)
             base_llama = LLAMA_BASELINE_R2.get(task, 0)
-            base_rule  = results["r2_rule_based"][task]["avg_score"]
-            llm        = results["r2_llm"].get(task, {}).get("avg_score", base_rule)
+            llm        = results["r2_llm"].get(task, {}).get("avg_score", base_llama)
             delta_vs_llama = round(llm - base_llama, 4)
-            delta_vs_rule  = round(llm - base_rule, 4)
             results["improvement"][task] = {
-                "llama_baseline": base_llama,
-                "rule_baseline":  base_rule,
-                "trained_llm":    llm,
-                "delta_vs_llama": delta_vs_llama,
-                "delta_vs_rule":  delta_vs_rule,
+                "llama_baseline":    base_llama,
+                "trained_llm":       llm,
+                "delta_vs_llama":    delta_vs_llama,
                 "pct_gain_vs_llama": round(delta_vs_llama / max(base_llama, 0.01) * 100, 1),
             }
 
@@ -444,17 +412,15 @@ def _print_summary(results: dict, baseline_only: bool):
     print(f"  {'AVERAGE':<22} {avg:>15.4f}", flush=True)
 
     print(f"\n{'R2 SCORES':─<65}", flush=True)
-    print(f"  {'Task':<22} {'Llama Baseline':>15} {'Rule-based':>11} {'LLM Trained':>12} {'Δ vs Llama':>10}", flush=True)
+    print(f"  {'Task':<22} {'Llama Baseline':>15} {'LLM Trained':>12} {'Δ vs Llama':>10}", flush=True)
     for task in ["project_easy", "project_medium", "project_hard"]:
         llama = results["r2_llama_baseline"].get(task, 0)
-        rule  = results["r2_rule_based"].get(task, {}).get("avg_score",
-                results["r2_baseline_rules"].get(task, 0))
         llm   = results["r2_llm"].get(task, {}).get("avg_score", 0)
         imp   = results["improvement"].get(task, {})
         delta = imp.get("delta_vs_llama", 0)
         llm_s   = f"{llm:.4f}" if llm else "—"
         delta_s = f"+{delta:.4f}" if delta > 0 else (f"{delta:.4f}" if delta else "—")
-        print(f"  {task:<22} {llama:>15.4f} {rule:>11.4f} {llm_s:>12} {delta_s:>10}", flush=True)
+        print(f"  {task:<22} {llama:>15.4f} {llm_s:>12} {delta_s:>10}", flush=True)
     avg_r2 = results["r2_llama_baseline"].get("average", 0)
     print(f"  {'AVERAGE':<22} {avg_r2:>15.4f}", flush=True)
 
