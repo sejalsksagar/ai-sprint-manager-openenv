@@ -545,6 +545,19 @@ def make_reward_fn(env_base_url: str, phase: str):
         seed = n % 100
 
         for completion in completions:
+            # Normalize completion → string
+            if isinstance(completion, list):
+                # Case 1: ["text"]
+                if len(completion) > 0 and isinstance(completion[0], str):
+                    completion = completion[0]
+
+                # Case 2: [{"content": "..."}]
+                elif len(completion) > 0 and isinstance(completion[0], dict):
+                    completion = completion[0].get("content", "")
+
+                else:
+                    completion = str(completion)
+
             action = _parse_action(completion)
             r = 0.5   # true-neutral fallback [FIX-T8]
             try:
