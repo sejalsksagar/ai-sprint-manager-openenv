@@ -339,7 +339,15 @@ def _parse_action(text: str) -> dict:
     Parse LLM completion → action dict.
     Takes the LAST JSON object in the text (handles chain-of-thought prefix).
     """
-    text = text.strip()
+    # FIX: handle list outputs from GRPO / Unsloth
+    if isinstance(text, list):
+        text = text[0] if len(text) > 0 else ""
+
+    if text is None:
+        text = ""
+
+    text = str(text).strip()
+    
     if "```" in text:
         text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
 
