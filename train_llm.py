@@ -25,19 +25,26 @@ Run locally (no LLM — rule-based fallback):
 
 Run with LLM:
     HF_TOKEN=hf_... python inference_r2.py
+
+SFT (supervised fine-tuning) — collect rule-based (prompt → JSON action) pairs:
+    python inference_r2.py --sft-collect --sft-out data/r2_sft.jsonl --sft-n 200
+
+Optional in-process SFT warm-up (GPU + trl + unsloth/transformers required):
+    python inference_r2.py --sft-train --sft-out-dir results/sft_warmup --sft-n 200
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
 
 load_dotenv()
 
@@ -62,9 +69,37 @@ RETRY_DELAYS = [1, 2, 4]  # seconds between retries (exponential-ish)
 # Set to 2-3 to halve/third token usage (helps stay under HF free-tier quota).
 LLM_CALL_EVERY = 1  # call every step — adjust to 2 if rate limits are severe
 
+# Episode-level score shaping (client-side): strongly discourage skip / overload patterns
+SKIP_SCORE_PENALTY_PER_STEP   = 0.022   # subtract from blended raw per skip
+SKIP_SCORE_PENALTY_CAP        = 0.38
+OVERLOAD_SCORE_PENALTY_ASSIGN = 0.028  # per assign to a dev already ≥ OVERLOAD_LOAD_RATIO of capacity
+OVERLOAD_SCORE_PENALTY_CAP    = 0.32
+OVERLOAD_LOAD_RATIO           = 0.78   # load/capacity at or above this counts as overloaded partner
+
 TASKS = ["project_easy", "project_medium", "project_hard"]
 
-client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+# SFT warm-up defaults (same spirit as train_llm.py SFT_CONFIG; LR tuned for small JSON completions)
+SFT_TRAIN_CONFIG: dict[str, Any] = {
+    "num_train_epochs": 2,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 2e-5,
+    "warmup_ratio": 0.05,
+    "logging_steps": 5,
+    "save_steps": 100,
+}
+
+_openai_client = None
+
+
+def _get_openai_client():
+    """Lazy import so --sft-collect / --help work without openai installed."""
+    global _openai_client
+    if _openai_client is None:
+        from openai import OpenAI
+
+        _openai_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    return _openai_client
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 # Kept deliberately short. Every token in the system prompt burns quota.
@@ -78,8 +113,9 @@ Rules:
 - Follow ACTIVE INSTRUCTIONS first — assign their tasks immediately
 - Only assign BACKLOG tasks (not in_progress or done)
 - Only assign if deps marked ✓ and developer is available (✓)
+- NEVER overload one developer: pick whoever has the most headroom under capacity; do not assign if their load is already near capacity
 - unblock: only for blocked tasks
-- skip: last resort
+- skip is catastrophic for delivery and scores — use ONLY when literally no assign/unblock/reprioritize is legal
 
 Output ONLY the JSON. No explanation."""
 
@@ -155,6 +191,7 @@ def build_user_prompt(obs: dict, assigned_this_episode: set) -> str:
         f"BACKLOG(✓=ok ★=assigned): {backlog_str}\n"
         f"IN_PROG: {inprog_str}\n"
         f"DEVS(avail): {devs_str}\n"
+        f"PENALTY_HINT: skip and overload(assign to nearly-full dev) tank score heavily.\n"
         f"JSON:"
     )
 
@@ -171,6 +208,46 @@ def call_env(endpoint: str, payload: Optional[dict] = None, method: str = "POST"
     return resp.json()
 
 
+def unwrap_observation(data: dict) -> dict:
+    """Reset/step payloads may nest state under 'observation'."""
+    obs = data.get("observation")
+    if isinstance(obs, dict):
+        return obs
+    return data
+
+
+def dev_headroom(d: dict) -> int:
+    """Integer slots left before hard capacity (uses remaining_capacity when present)."""
+    cap = int(d.get("capacity", 5) or 5)
+    load = int(d.get("current_load", 0) or 0)
+    rem = d.get("remaining_capacity")
+    if rem is not None:
+        try:
+            return max(0, int(rem))
+        except (TypeError, ValueError):
+            pass
+    return max(0, cap - load)
+
+
+def dev_is_overloaded(d: dict, ratio: float = OVERLOAD_LOAD_RATIO) -> bool:
+    """True when current_load already consumes ≥ ratio of nominal capacity."""
+    cap = int(d.get("capacity", 5) or 5)
+    if cap <= 0:
+        return False
+    load = int(d.get("current_load", 0) or 0)
+    return (load / cap) >= ratio
+
+
+def pick_least_loaded_dev(candidates: list) -> Optional[dict]:
+    """Prefer max headroom, then min current_load (spread work; avoid overload)."""
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda d: (dev_headroom(d), -int(d.get("current_load", 0) or 0)),
+    )
+
+
 # ── Rule-based fallback ────────────────────────────────────────────────────────
 
 def get_rule_based_action(obs: dict, assigned_this_episode: set,
@@ -185,12 +262,19 @@ def get_rule_based_action(obs: dict, assigned_this_episode: set,
     tasks     = obs.get("tasks", [])
     devs      = obs.get("developers", [])
     done_ids  = {t["id"] for t in tasks if t["status"] == "done"}
-    available = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"] * 2]
+    # Strict capacity: never treat 2× capacity as "available" (that caused overload).
+    available = [
+        d for d in devs
+        if d.get("is_available", False) and dev_headroom(d) > 0
+    ]
 
     def best_dev(task: dict):
-        skill_match = [d for d in available
-                       if d["skill"] == task["required_skill"] or d["skill"] == "fullstack"]
-        return skill_match[0] if skill_match else (available[0] if available else None)
+        skill_match = [
+            d for d in available
+            if d["skill"] == task["required_skill"] or d["skill"] == "fullstack"
+        ]
+        pool = skill_match if skill_match else available
+        return pick_least_loaded_dev(pool)
 
     def can_assign(task: dict) -> bool:
         if task["status"] != "backlog":
@@ -239,6 +323,38 @@ def get_rule_based_action(obs: dict, assigned_this_episode: set,
                         "dev_id": None, "new_priority": None}
 
     return skip
+
+
+def rule_based_would_skip(obs: dict, assigned_this_episode: set,
+                          last_failed_task: Optional[str]) -> bool:
+    """True only when deterministic policy would also skip (no productive work)."""
+    a = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
+    return a.get("action_type") == "skip"
+
+
+def resolve_action_avoid_skip_and_overload(
+    obs: dict,
+    action: dict,
+    assigned_this_episode: set,
+    last_failed_task: Optional[str],
+) -> dict:
+    """
+    If the model skips while work exists, or assigns onto an overloaded dev,
+    replace with rule-based action (same policy as fallback).
+    """
+    devs = obs.get("developers", [])
+
+    if action.get("action_type") == "skip":
+        if not rule_based_would_skip(obs, assigned_this_episode, last_failed_task):
+            return get_rule_based_action(obs, assigned_this_episode, last_failed_task)
+        return action
+
+    if action.get("action_type") in ("assign", "reassign") and action.get("dev_id"):
+        dev = next((d for d in devs if d.get("id") == action.get("dev_id")), None)
+        if dev is None or dev_headroom(dev) <= 0 or dev_is_overloaded(dev):
+            return get_rule_based_action(obs, assigned_this_episode, last_failed_task)
+
+    return action
 
 
 # ── JSON parser ────────────────────────────────────────────────────────────────
@@ -311,6 +427,237 @@ def parse_action(text: str) -> dict:
     }
 
 
+# ── SFT: supervised dataset + optional TRL warm-up ───────────────────────────
+# Pairs (R2_SYSTEM_PROMPT + build_user_prompt, rule-based JSON) teach format +
+# reasonable policy before RL-style methods (see train_llm.py).
+
+
+def action_to_sft_completion(action: dict) -> str:
+    """Target string for SFT: one compact JSON object per line."""
+    return json.dumps(
+        {
+            "action_type": action.get("action_type", "skip"),
+            "task_id": action.get("task_id"),
+            "dev_id": action.get("dev_id"),
+            "new_priority": action.get("new_priority"),
+        },
+        separators=(",", ":"),
+    )
+
+
+def build_sft_chat_example(user_text: str, completion_json: str) -> dict:
+    """TRL-compatible row: chat messages + assistant completion."""
+    return {
+        "prompt": [
+            {"role": "system", "content": R2_SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ],
+        "completion": completion_json,
+    }
+
+
+def collect_r2_sft_examples(
+    n_target: int = 200,
+    *,
+    min_record_step: int = 3,
+    max_record_step: int = 12,
+    max_steps_per_episode: int = 60,
+    seed_base: int = 1000,
+    scenarios: Optional[list[str]] = None,
+) -> list[dict]:
+    """
+    Roll the live R2 env using only get_rule_based_action; record (prompt, completion).
+
+    Only steps in [min_record_step, max_record_step] are written (per-episode window)
+    so the set is not dominated by trivial early states (same motivation as train_llm
+    sampling mid-episode).
+    """
+    scenarios = scenarios or list(TASKS)
+    examples: list[dict] = []
+    per_task = max(1, (n_target + len(scenarios) - 1) // len(scenarios))
+
+    for task_name in scenarios:
+        for ep in range(per_task):
+            if len(examples) >= n_target:
+                print(f"  [SFT] Collected {len(examples)} examples (target {n_target})", flush=True)
+                return examples
+            try:
+                raw = call_env("reset", {"task_name": task_name, "seed": seed_base + ep})
+                obs = unwrap_observation(raw)
+                assigned: set[str] = set()
+                last_failed: Optional[str] = None
+                for step_i in range(1, max_steps_per_episode + 1):
+                    if obs.get("done", False):
+                        break
+                    user_text    = build_user_prompt(obs, assigned)
+                    action       = get_rule_based_action(obs, assigned, last_failed)
+                    completion   = action_to_sft_completion(action)
+                    if min_record_step <= step_i <= max_record_step:
+                        examples.append(build_sft_chat_example(user_text, completion))
+                        if len(examples) >= n_target:
+                            print(
+                                f"  [SFT] Collected {len(examples)} examples (target {n_target})",
+                                flush=True,
+                            )
+                            return examples
+                    if action["action_type"] == "assign" and action.get("task_id"):
+                        assigned.add(action["task_id"])
+                    result = call_env("step", {"action": action})
+                    obs    = unwrap_observation(result)
+                    reward = float(result.get("reward", 0.0))
+                    if reward < -0.5 and action.get("task_id"):
+                        last_failed = action["task_id"]
+                    elif reward > 0:
+                        last_failed = None
+                    if result.get("done", False):
+                        break
+            except Exception as e:
+                print(f"  [WARN] SFT collect task={task_name} ep={ep}: {e}", flush=True)
+
+    print(f"  [SFT] Collected {len(examples)} examples (target {n_target})", flush=True)
+    return examples
+
+
+def save_sft_jsonl(path: str | Path, rows: list[dict]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"  [SFT] Wrote {len(rows)} rows → {path}", flush=True)
+
+
+def _sft_row_to_text(row: dict) -> dict:
+    parts = []
+    for msg in row["prompt"]:
+        parts.append(f"<|{msg['role']}|>\n{msg['content']}")
+    parts.append(f"<|assistant|>\n{row['completion']}")
+    return {"text": "\n".join(parts)}
+
+
+def _load_model_for_sft(model_name: str):
+    """Prefer Unsloth 4-bit + LoRA; fall back to transformers + PEFT."""
+    token = os.getenv("HF_TOKEN") or None
+    try:
+        from unsloth import FastLanguageModel
+
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=2048,
+            dtype=None,
+            load_in_4bit=True,
+            token=token,
+        )
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=16,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+            lora_alpha=32,
+            lora_dropout=0.05,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=42,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        return model, tokenizer, "unsloth"
+    except ImportError:
+        pass
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb,
+        device_map="auto",
+        token=token,
+    )
+    peft_cfg = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, peft_cfg)
+    return model, tokenizer, "hf_peft"
+
+
+def run_sft_trainer(
+    output_dir: str | Path,
+    n_examples: int = 200,
+    *,
+    min_step: int = 3,
+    max_step: int = 12,
+    model_name: Optional[str] = None,
+) -> None:
+    """
+    Collect trajectories from ENV_BASE_URL, then run TRL SFTTrainer when installed.
+    On missing GPU stack, still writes JSONL for offline training (e.g. train_llm.py).
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_path = output_dir / "sft_dataset.jsonl"
+
+    rows = collect_r2_sft_examples(
+        n_target=n_examples,
+        min_record_step=min_step,
+        max_record_step=max_step,
+    )
+    if not rows:
+        print("[SFT] No examples collected — aborting.", flush=True)
+        return
+    save_sft_jsonl(dataset_path, rows)
+
+    try:
+        from datasets import Dataset
+        from trl import SFTConfig, SFTTrainer
+    except ImportError as e:
+        print(
+            f"[SFT] Saved dataset only. For in-process training install datasets+trl: {e}",
+            flush=True,
+        )
+        return
+
+    mname = model_name or MODEL_NAME
+    try:
+        model, tokenizer, backend = _load_model_for_sft(mname)
+        print(f"[SFT] Loaded {mname} via {backend}", flush=True)
+    except Exception as e:
+        print(f"[SFT] Model load failed ({e}). Dataset: {dataset_path}", flush=True)
+        return
+
+    ds     = Dataset.from_list(rows).map(_sft_row_to_text)
+    sft_hf = str(output_dir / "sft_warmup_hf")
+    cfg    = SFTConfig(
+        output_dir=sft_hf,
+        dataset_text_field="text",
+        max_seq_length=1024,
+        report_to="none",
+        **SFT_TRAIN_CONFIG,
+    )
+    trainer = SFTTrainer(
+        model=model,
+        processing_class=tokenizer,
+        train_dataset=ds,
+        args=cfg,
+    )
+    trainer.train()
+    print(f"[SFT] Warm-up complete → {sft_hf}", flush=True)
+
+
 # ── LLM call with retry ────────────────────────────────────────────────────────
 
 def call_llm(obs: dict, assigned_this_episode: set, step_num: int) -> tuple[str, bool]:
@@ -333,7 +680,7 @@ def call_llm(obs: dict, assigned_this_episode: set, step_num: int) -> tuple[str,
         try:
             # First attempt: system+user. Subsequent: merged (some endpoints reject system role)
             msgs = messages_sys if attempt == 0 else messages_usr
-            completion = client.chat.completions.create(
+            completion = _get_openai_client().chat.completions.create(
                 model=MODEL_NAME,
                 messages=msgs,
                 temperature=TEMPERATURE,
@@ -381,7 +728,7 @@ def run_episode(task_name: str) -> float:
     """
     print(f"[START] task={task_name}", flush=True)
 
-    obs = call_env("reset", {"task_name": task_name, "seed": 42})
+    obs = unwrap_observation(call_env("reset", {"task_name": task_name, "seed": 42}))
     final_score = 0.01
 
     # ── Episode memory ────────────────────────────────────────────────────────
@@ -389,6 +736,8 @@ def run_episode(task_name: str) -> float:
     last_failed_task: Optional[str] = None    # last task that got negative reward
     llm_fail_streak: int            = 0       # consecutive LLM failures
     LLM_ABANDON_AFTER               = 5       # give up on LLM after this many consecutive failures
+    episode_skip_steps              = 0
+    episode_overload_assign_steps   = 0
 
     step_num = 0
     for step_num in range(1, MAX_STEPS + 1):
@@ -419,12 +768,32 @@ def run_episode(task_name: str) -> float:
                         action = get_rule_based_action(
                             obs, assigned_this_episode, last_failed_task
                         )
+                action = resolve_action_avoid_skip_and_overload(
+                    obs, action, assigned_this_episode, last_failed_task
+                )
             else:
                 llm_fail_streak += 1
                 action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
+                action = resolve_action_avoid_skip_and_overload(
+                    obs, action, assigned_this_episode, last_failed_task
+                )
         else:
             # Either LLM abandoned or between batch intervals
             action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
+            action = resolve_action_avoid_skip_and_overload(
+                obs, action, assigned_this_episode, last_failed_task
+            )
+
+        # Penalty accounting (pre-step state)
+        if action.get("action_type") == "skip":
+            episode_skip_steps += 1
+        if action.get("action_type") in ("assign", "reassign") and action.get("dev_id"):
+            _d = next(
+                (d for d in obs.get("developers", []) if d.get("id") == action.get("dev_id")),
+                None,
+            )
+            if _d is not None and dev_is_overloaded(_d):
+                episode_overload_assign_steps += 1
 
         # Track assigned tasks to avoid re-assigning
         if action["action_type"] == "assign" and action.get("task_id"):
@@ -432,7 +801,7 @@ def run_episode(task_name: str) -> float:
 
         # ── Call environment ──────────────────────────────────────────────────
         result = call_env("step", {"action": action})
-        obs    = result["observation"]
+        obs    = unwrap_observation(result)
         reward = result["reward"]
         done   = result["done"]
 
@@ -466,6 +835,15 @@ def run_episode(task_name: str) -> float:
             team_health   = max(0.01, 1.0 - debt_count * 0.02)
             # Weighted: delivery 55%, inst 30%, health 15%
             raw = delivery_rate * 0.55 + inst_score * 0.30 + team_health * 0.15
+            skip_penalty = min(
+                SKIP_SCORE_PENALTY_CAP,
+                episode_skip_steps * SKIP_SCORE_PENALTY_PER_STEP,
+            )
+            overload_penalty = min(
+                OVERLOAD_SCORE_PENALTY_CAP,
+                episode_overload_assign_steps * OVERLOAD_SCORE_PENALTY_ASSIGN,
+            )
+            raw -= skip_penalty + overload_penalty
             final_score = max(0.01, min(0.99, raw))
             break
 
@@ -475,7 +853,8 @@ def run_episode(task_name: str) -> float:
         f"completed={obs.get('tasks_completed', 0)} "
         f"missed={obs.get('tasks_missed', 0)} "
         f"inst_score={obs.get('instruction_following_score', 0):.3f} "
-        f"debt={len(obs.get('tech_debt', []))}",
+        f"debt={len(obs.get('tech_debt', []))} "
+        f"skips={episode_skip_steps} overload_assigns={episode_overload_assign_steps}",
         flush=True,
     )
 
@@ -524,5 +903,92 @@ def main() -> None:
     print("=" * 62, flush=True)
 
 
-if __name__ == "__main__":
+def _cli() -> None:
+    parser = argparse.ArgumentParser(
+        description="R2 OpenEnv inference, SFT JSONL export, or TRL SFT warm-up.",
+    )
+    parser.add_argument(
+        "--sft-collect",
+        action="store_true",
+        help="Collect rule-based (prompt→JSON) pairs and write JSONL, then exit",
+    )
+    parser.add_argument(
+        "--sft-train",
+        action="store_true",
+        help="Collect pairs and run TRL SFTTrainer (GPU + trl + transformers)",
+    )
+    parser.add_argument(
+        "--sft-out",
+        type=str,
+        default="data/r2_sft.jsonl",
+        help="Output path for --sft-collect",
+    )
+    parser.add_argument(
+        "--sft-out-dir",
+        type=str,
+        default="results/sft_r2",
+        help="Output directory for --sft-train (JSONL + HF checkpoints)",
+    )
+    parser.add_argument(
+        "--sft-n",
+        type=int,
+        default=200,
+        help="Target number of supervised rows",
+    )
+    parser.add_argument(
+        "--sft-min-step",
+        type=int,
+        default=3,
+        help="First timestep index (per episode) to record",
+    )
+    parser.add_argument(
+        "--sft-max-step",
+        type=int,
+        default=12,
+        help="Last timestep index (per episode) to record",
+    )
+    parser.add_argument(
+        "--sft-model",
+        type=str,
+        default=None,
+        help="HF model id for --sft-train (default: MODEL_NAME env / default)",
+    )
+    args = parser.parse_args()
+
+    if args.sft_collect or args.sft_train:
+        try:
+            health = call_env("health", method="GET")
+            print(f"[INFO] health={health}", flush=True)
+            if health.get("round") != 2:
+                print("[WARN] health.round != 2 — continuing anyway", flush=True)
+        except Exception as e:
+            print(f"[ERROR] Cannot reach R2 env: {e}", flush=True)
+            sys.exit(1)
+
+    if args.sft_train:
+        run_sft_trainer(
+            args.sft_out_dir,
+            n_examples=args.sft_n,
+            min_step=args.sft_min_step,
+            max_step=args.sft_max_step,
+            model_name=args.sft_model,
+        )
+        return
+
+    if args.sft_collect:
+        rows = collect_r2_sft_examples(
+            n_target=args.sft_n,
+            min_record_step=args.sft_min_step,
+            max_record_step=args.sft_max_step,
+        )
+        if not rows:
+            print("[SFT] No rows collected.", flush=True)
+            sys.exit(1)
+        save_sft_jsonl(args.sft_out, rows)
+        return
+
     main()
+
+
+if __name__ == "__main__":
+    _cli()
