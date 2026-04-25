@@ -30,7 +30,9 @@ import requests
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 HF_TOKEN     = os.getenv("HF_TOKEN", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+# NOTE: MODEL_NAME here is for INFERENCE comparison only.
+# For TRAINING, use Qwen/Qwen2.5-1.5B-Instruct (loaded locally in train_llm.py).
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -38,11 +40,21 @@ RESULTS_DIR.mkdir(exist_ok=True)
 R1_TASKS = ["easy_sprint", "medium_sprint", "hard_sprint"]
 R2_TASKS = ["project_easy", "project_medium", "project_hard"]
 
-# Qwen2.5-1.5B baseline scores (from inference.py run — your actual measured baseline)
-QWEN_BASELINE_R1 = {
-    "easy_sprint":   0.9900,
-    "medium_sprint": 0.6667,
-    "hard_sprint":   0.3716,
+# ── Measured baselines (FINAL — do not change) ────────────────────────────────
+# R1: Llama-3.1-8B zero-shot inference (inference.py), measured 2025-01
+LLAMA_BASELINE_R1 = {
+    "easy_sprint":   0.0100,
+    "medium_sprint": 0.4583,
+    "hard_sprint":   0.0100,
+    "average":       0.1594,
+}
+
+# R2: Llama-3.1-8B zero-shot inference (inference_r2.py), measured 2025-01
+LLAMA_BASELINE_R2 = {
+    "project_easy":   0.3198,
+    "project_medium": 0.2443,
+    "project_hard":   0.2520,
+    "average":        0.2720,
 }
 
 # R2 rule-based baseline (from evaluate_r2.py --baseline-only, 3 episodes each)
@@ -51,6 +63,9 @@ RULE_BASED_BASELINE_R2 = {
     "project_medium": 0.2063,
     "project_hard":   0.2610,
 }
+
+# Training model: Qwen/Qwen2.5-1.5B-Instruct (GRPO, local 4-bit QLoRA)
+TRAINING_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 
 # ── Rule-based policies ───────────────────────────────────────────────────────
@@ -113,7 +128,9 @@ def score_r1_obs(obs: dict) -> float:
 
 
 def score_r2_obs(obs: dict) -> float:
-    """Compute R2 project score from terminal observation."""
+    """Compute R2 project score from terminal observation.
+    Formula: delivery×0.55 + instruction_following×0.30 + team_health×0.15
+    """
     tasks_total   = len(obs.get("tasks", [])) or 1
     tasks_done    = obs.get("tasks_completed", 0)
     inst_score    = obs.get("instruction_following_score", 0.01)
@@ -185,114 +202,117 @@ def run_r2_episode(r2_client, task_name: str, policy_fn) -> dict:
     }
 
 
-# ── LLM policy builder ────────────────────────────────────────────────────────
+# ── LLM policy builders ───────────────────────────────────────────────────────
+
+def _build_api_policy(model_id: str, system_prompt: str):
+    """Build an LLM policy that calls the HF router API."""
+    from openai import OpenAI
+    client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+
+    def policy(obs: dict) -> dict:
+        import json as _json
+        user_msg = f"Current state:\n{_json.dumps(obs, indent=2)}\nOutput JSON action only."
+        try:
+            resp = client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "system", "content": system_prompt},
+                          {"role": "user",   "content": user_msg}],
+                max_tokens=60,
+                temperature=0.1,
+            )
+            raw = resp.choices[0].message.content.strip()
+            start = raw.find("{")
+            end   = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                return _json.loads(raw[start:end])
+        except Exception:
+            pass
+        return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
+
+    return policy
+
 
 def build_llm_policy(model_path: str, system_prompt: str):
-    """
-    Load a trained model from disk and return a policy function obs->action dict.
-    Supports: local LoRA checkpoint, HF Hub model ID, or HF router API.
-    """
-    # Try loading locally with transformers
-    try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-        import torch
-
-        print(f"[INFO] Loading model from {model_path}...", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, token=HF_TOKEN or None)
-
-        # Try Unsloth first for LoRA merge
+    """Build R2 LLM policy — tries local model first, falls back to API."""
+    # Try local model (after training)
+    local_path = Path(model_path)
+    if local_path.exists():
         try:
-            from unsloth import FastLanguageModel
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=model_path,
-                max_seq_length=2048,
-                load_in_4bit=True,
-                token=HF_TOKEN or None,
-            )
-            FastLanguageModel.for_inference(model)
-            print(f"[INFO] Loaded with Unsloth (4-bit inference mode)", flush=True)
-        except Exception:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import torch, json as _json
+            tokenizer = AutoTokenizer.from_pretrained(str(local_path))
             model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                device_map="auto",
-                torch_dtype=torch.bfloat16,
-                token=HF_TOKEN or None,
+                str(local_path), torch_dtype=torch.float16, device_map="auto"
             )
-            print(f"[INFO] Loaded with standard transformers", flush=True)
+            print(f"[INFO] Loaded local model from {local_path}", flush=True)
 
-        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer,
-                        max_new_tokens=80, temperature=0.1, do_sample=True)
-
-        def policy_fn(obs: dict) -> dict:
-            from inference_r2 import _build_r2_prompt, _parse_action
-            prompt = _build_r2_prompt(obs)
-            messages = [{"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": prompt}]
-            try:
-                out = pipe(messages)[0]["generated_text"]
-                text = out[-1]["content"] if isinstance(out, list) else str(out)
-                return _parse_action(text)
-            except Exception:
+            def local_policy(obs: dict) -> dict:
+                prompt = f"{system_prompt}\n\nState:\n{_json.dumps(obs)}\nAction:"
+                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                with torch.no_grad():
+                    outputs = model.generate(**inputs, max_new_tokens=60, temperature=0.1, do_sample=True)
+                raw = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                try:
+                    start = raw.find("{"); end = raw.rfind("}") + 1
+                    if start >= 0 and end > start:
+                        return _json.loads(raw[start:end])
+                except Exception:
+                    pass
                 return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
-        return policy_fn
+            return local_policy
+        except Exception as e:
+            print(f"[WARN] Could not load local model: {e}", flush=True)
 
-    except Exception as e:
-        print(f"[WARN] Could not load local model ({e}). Using OpenAI API with {model_path}.", flush=True)
-        return _build_api_policy(model_path, system_prompt)
-
-
-def _build_api_policy(model_name: str, system_prompt: str):
-    """Fallback: use OpenAI-compatible API (HF router)."""
-    from openai import OpenAI
-    llm_client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN or "dummy")
-
-    def policy_fn(obs: dict) -> dict:
-        from inference_r2 import _build_r2_prompt, _parse_action
-        try:
-            resp = llm_client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "system", "content": system_prompt},
-                          {"role": "user",   "content": _build_r2_prompt(obs)}],
-                temperature=0.1,
-                max_tokens=80,
-            )
-            return _parse_action(resp.choices[0].message.content or "")
-        except Exception:
-            return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
-
-    return policy_fn
+    # Fall back to HF API (model_path is an HF model ID like "sejal-k/ai-sprint-manager-trained")
+    print(f"[INFO] Using HF API for model {model_path}", flush=True)
+    return _build_api_policy(model_path, system_prompt)
 
 
 # ── Main evaluation ───────────────────────────────────────────────────────────
 
-def evaluate(model_path: str | None, n_episodes: int = 3, baseline_only: bool = False):
+def evaluate(model_path: str | None = None, n_episodes: int = 3, baseline_only: bool = False):
     from client import SprintEnvClient
     from project_client import ProjectEnvClient
 
-    # Health checks
+    print(f"\n{'='*60}", flush=True)
+    print(f" AI Sprint Manager — Evaluation", flush=True)
+    print(f" Env:   {ENV_BASE_URL}", flush=True)
+    print(f" Model: {model_path or 'rule-based only'}", flush=True)
+    print(f" Training model: {TRAINING_MODEL}", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    # Health check
     try:
-        requests.get(f"{ENV_BASE_URL}/health", timeout=10).raise_for_status()
-        requests.get(f"{ENV_BASE_URL}/project/health", timeout=10).raise_for_status()
+        r = requests.get(f"{ENV_BASE_URL}/health", timeout=10)
+        r.raise_for_status()
+        r2 = requests.get(f"{ENV_BASE_URL}/project/health", timeout=10)
+        r2.raise_for_status()
+        print(f"[OK] Environment is live", flush=True)
     except Exception as e:
         print(f"[ERROR] Server unreachable: {e}", flush=True)
         sys.exit(1)
 
     results = {
         "metadata": {
-            "timestamp":     time.strftime("%Y-%m-%d %H:%M:%S"),
-            "model":         model_path or "rule-based",
-            "env_url":       ENV_BASE_URL,
-            "n_episodes":    n_episodes,
-            "baseline_only": baseline_only,
+            "timestamp":       time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model":           model_path or "rule-based",
+            "training_model":  TRAINING_MODEL,
+            "env_url":         ENV_BASE_URL,
+            "n_episodes":      n_episodes,
+            "baseline_only":   baseline_only,
         },
-        "r1_baseline_qwen":  QWEN_BASELINE_R1,
-        "r1_rule_based":     {},
-        "r1_llm":            {},
+        # Measured Llama-3.1-8B zero-shot baselines (FINAL)
+        "r1_llama_baseline": LLAMA_BASELINE_R1,
+        "r2_llama_baseline": LLAMA_BASELINE_R2,
+        # Rule-based baselines (measured, 3 episodes each)
         "r2_baseline_rules": RULE_BASED_BASELINE_R2,
-        "r2_rule_based":     {},
-        "r2_llm":            {},
-        "improvement":       {},
+        # Live run results
+        "r1_rule_based": {},
+        "r1_llm":        {},
+        "r2_rule_based": {},
+        "r2_llm":        {},
+        "improvement":   {},
     }
 
     r1_client = SprintEnvClient(base_url=ENV_BASE_URL)
@@ -336,7 +356,6 @@ def evaluate(model_path: str | None, n_episodes: int = 3, baseline_only: bool = 
     if not baseline_only and model_path:
         from inference_r2 import R2_SYSTEM_PROMPT
 
-        # R1 system prompt (inline to avoid import dependency on inference.py internals)
         R1_SYSTEM_PROMPT = (
             "You are an expert Tech Lead managing an agile sprint. "
             "Output a JSON action: {\"action_type\":\"<assign|reassign|reprioritize|unblock|skip>\","
@@ -382,20 +401,26 @@ def evaluate(model_path: str | None, n_episodes: int = 3, baseline_only: bool = 
 
         # ── Improvement table ─────────────────────────────────────────────────
         for task in R2_TASKS:
-            base  = results["r2_rule_based"][task]["avg_score"]
-            llm   = results["r2_llm"].get(task, {}).get("avg_score", base)
-            delta = round(llm - base, 4)
-            pct   = round(delta / max(base, 0.01) * 100, 1)
-            results["improvement"][task] = {"baseline": base, "llm": llm,
-                                            "delta": delta, "pct_gain": pct}
+            # Compare trained LLM against Llama zero-shot baseline (more honest)
+            base_llama = LLAMA_BASELINE_R2.get(task, 0)
+            base_rule  = results["r2_rule_based"][task]["avg_score"]
+            llm        = results["r2_llm"].get(task, {}).get("avg_score", base_rule)
+            delta_vs_llama = round(llm - base_llama, 4)
+            delta_vs_rule  = round(llm - base_rule, 4)
+            results["improvement"][task] = {
+                "llama_baseline": base_llama,
+                "rule_baseline":  base_rule,
+                "trained_llm":    llm,
+                "delta_vs_llama": delta_vs_llama,
+                "delta_vs_rule":  delta_vs_rule,
+                "pct_gain_vs_llama": round(delta_vs_llama / max(base_llama, 0.01) * 100, 1),
+            }
 
     r1_client.close()
     r2_client.close()
 
-    # ── Print summary table ───────────────────────────────────────────────────
     _print_summary(results, baseline_only)
 
-    # ── Save JSON ─────────────────────────────────────────────────────────────
     out_path = RESULTS_DIR / "r2_evaluation.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
@@ -404,33 +429,39 @@ def evaluate(model_path: str | None, n_episodes: int = 3, baseline_only: bool = 
 
 
 def _print_summary(results: dict, baseline_only: bool):
-    print(f"\n{'='*60}", flush=True)
+    print(f"\n{'='*65}", flush=True)
     print(f" EVALUATION SUMMARY", flush=True)
-    print(f"{'='*60}", flush=True)
+    print(f"{'='*65}", flush=True)
 
-    print(f"\n{'R1 SCORES':─<55}", flush=True)
-    print(f"  {'Task':<22} {'Qwen Baseline':>14} {'LLM Trained':>12}", flush=True)
-    for task in R1_TASKS:
-        qwen  = results["r1_baseline_qwen"].get(task, 0)
+    print(f"\n{'R1 SCORES (Llama-3.1-8B zero-shot — measured baseline)':─<65}", flush=True)
+    print(f"  {'Task':<22} {'Llama Baseline':>15} {'LLM Trained':>12}", flush=True)
+    for task in ["easy_sprint", "medium_sprint", "hard_sprint"]:
+        llama = results["r1_llama_baseline"].get(task, 0)
         llm   = results["r1_llm"].get(task, {}).get("avg_score", 0)
         llm_s = f"{llm:.4f}" if llm else "—"
-        print(f"  {task:<22} {qwen:>14.4f} {llm_s:>12}", flush=True)
+        print(f"  {task:<22} {llama:>15.4f} {llm_s:>12}", flush=True)
+    avg = results["r1_llama_baseline"].get("average", 0)
+    print(f"  {'AVERAGE':<22} {avg:>15.4f}", flush=True)
 
-    print(f"\n{'R2 SCORES':─<55}", flush=True)
-    print(f"  {'Task':<22} {'Rule-based':>12} {'LLM Trained':>12} {'Δ':>7} {'%gain':>7}", flush=True)
-    for task in R2_TASKS:
+    print(f"\n{'R2 SCORES':─<65}", flush=True)
+    print(f"  {'Task':<22} {'Llama Baseline':>15} {'Rule-based':>11} {'LLM Trained':>12} {'Δ vs Llama':>10}", flush=True)
+    for task in ["project_easy", "project_medium", "project_hard"]:
+        llama = results["r2_llama_baseline"].get(task, 0)
         rule  = results["r2_rule_based"].get(task, {}).get("avg_score",
                 results["r2_baseline_rules"].get(task, 0))
         llm   = results["r2_llm"].get(task, {}).get("avg_score", 0)
         imp   = results["improvement"].get(task, {})
-        delta = imp.get("delta", 0)
-        pct   = imp.get("pct_gain", 0)
+        delta = imp.get("delta_vs_llama", 0)
         llm_s   = f"{llm:.4f}" if llm else "—"
         delta_s = f"+{delta:.4f}" if delta > 0 else (f"{delta:.4f}" if delta else "—")
-        pct_s   = f"+{pct:.1f}%" if pct > 0 else (f"{pct:.1f}%" if pct else "—")
-        print(f"  {task:<22} {rule:>12.4f} {llm_s:>12} {delta_s:>7} {pct_s:>7}", flush=True)
+        print(f"  {task:<22} {llama:>15.4f} {rule:>11.4f} {llm_s:>12} {delta_s:>10}", flush=True)
+    avg_r2 = results["r2_llama_baseline"].get("average", 0)
+    print(f"  {'AVERAGE':<22} {avg_r2:>15.4f}", flush=True)
 
-    print(f"\n{'='*60}", flush=True)
+    print(f"\n{'='*65}", flush=True)
+    print(f"  Training model: Qwen/Qwen2.5-1.5B-Instruct (GRPO, 4-bit QLoRA)", flush=True)
+    print(f"  Baselines: Llama-3.1-8B zero-shot (via HF Router)", flush=True)
+    print(f"{'='*65}", flush=True)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
