@@ -509,10 +509,16 @@ def make_reward_fn(env_base_url: str, phase: str):
 
     prompt_counter = [0]
 
-    def _post(url: str, payload: dict) -> dict:
-        resp = requests.post(url, json=payload, timeout=60)
-        resp.raise_for_status()
-        return resp.json()
+    def _post(url: str, payload: dict, retries: int = 3, backoff: float = 1.5) -> dict:
+        for attempt in range(retries):
+            try:
+                resp = requests.post(url, json=payload, timeout=60)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(backoff ** attempt)
 
     def reward_fn(prompts, completions, **kwargs) -> list[float]:
         rewards = []
