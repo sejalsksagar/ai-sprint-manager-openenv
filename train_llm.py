@@ -31,6 +31,9 @@ SFT (supervised fine-tuning) — collect rule-based (prompt → JSON action) pai
 
 Optional in-process SFT warm-up (GPU + trl + unsloth/transformers required):
     python inference_r2.py --sft-train --sft-out-dir results/sft_warmup --sft-n 200
+
+Smoke test (no GPU / no LLM; needs live ENV_BASE_URL):
+    python inference_r2.py --smoke-test
 """
 
 from __future__ import annotations
@@ -51,7 +54,7 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY      = os.getenv("HF_TOKEN","")
+API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "dummy")
 MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 
@@ -863,6 +866,139 @@ def run_episode(task_name: str) -> float:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def smoke_test() -> None:
+    """
+    Short connectivity + policy smoke — no GPU, no model loading.
+    Verifies R2 server, this file's rule-based path, optional R1 + GRPO dataset (train_llm).
+    Run before a GPU training session.
+    """
+    print("\n=== SMOKE TEST (no GPU, no LLM) ===\n", flush=True)
+
+    # R2 health is required for this repo entrypoint
+    try:
+        r2h = requests.get(f"{ENV_BASE_URL}/project/health", timeout=10)
+        r2h.raise_for_status()
+        print(f"[OK] R2 health: {r2h.json()}", flush=True)
+    except Exception as e:
+        print(f"[ERROR] R2 server not reachable: {e}", flush=True)
+        print(f"        Check ENV_BASE_URL (default: {ENV_BASE_URL!r})", flush=True)
+        sys.exit(1)
+
+    try:
+        r1h = requests.get(f"{ENV_BASE_URL}/health", timeout=10).json()
+        print(f"[OK] R1 health: {r1h}", flush=True)
+    except Exception as e:
+        print(f"[WARN] R1 health not available (optional): {e}", flush=True)
+
+    results: dict[str, Optional[float]] = {}
+
+    # ── R1 (optional — needs train_llm.smart_fallback_r1) ─────────────────────
+    try:
+        from train_llm import smart_fallback_r1  # type: ignore[import-untyped]
+    except ImportError:
+        smart_fallback_r1 = None  # type: ignore[misc, assignment]
+        print("\n[R1] skipped (train_llm not importable)", flush=True)
+
+    if smart_fallback_r1 is not None:
+        for task in ["easy_sprint"]:
+            print(f"\n[R1] {task}...", flush=True)
+            try:
+                r = requests.post(
+                    f"{ENV_BASE_URL}/reset",
+                    json={"task_name": task, "seed": 42},
+                    timeout=30,
+                )
+                r.raise_for_status()
+                obs = r.json()
+                obs = obs.get("observation", obs)
+                total_r = 0.0
+                for i in range(10):
+                    if obs.get("done", False):
+                        break
+                    action = smart_fallback_r1(obs)
+                    result = requests.post(
+                        f"{ENV_BASE_URL}/step",
+                        json={"action": action},
+                        timeout=30,
+                    ).json()
+                    obs = result.get("observation", obs)
+                    total_r += float(result.get("reward", 0.0))
+                    print(
+                        f"  step {i + 1}: action={action['action_type']} "
+                        f"day={obs.get('current_day', '?')} "
+                        f"done_tasks={obs.get('tasks_completed', '?')} "
+                        f"reward={float(result.get('reward', 0)):.3f}",
+                        flush=True,
+                    )
+                    if result.get("done", False):
+                        break
+                results[f"r1/{task}"] = round(total_r, 3)
+            except Exception as e:
+                print(f"  [ERROR] {e}", flush=True)
+                results[f"r1/{task}"] = None
+
+    # ── R2 (this module's rule-based policy) ─────────────────────────────────
+    for task in ["project_easy"]:
+        print(f"\n[R2] {task} (first 8 steps)...", flush=True)
+        try:
+            obs = unwrap_observation(
+                call_env("reset", {"task_name": task, "seed": 42})
+            )
+            assigned: set[str] = set()
+            for i in range(8):
+                if obs.get("done", False):
+                    break
+                action = get_rule_based_action(obs, assigned, None)
+                if action["action_type"] == "assign" and action.get("task_id"):
+                    assigned.add(action["task_id"])
+                result = call_env("step", {"action": action})
+                obs = unwrap_observation(result)
+                print(
+                    f"  step {i + 1}: action={action['action_type']} "
+                    f"task={action.get('task_id')} "
+                    f"day={obs.get('current_day', '?')} "
+                    f"sprint={obs.get('current_sprint', '?')} "
+                    f"reward={float(result.get('reward', 0)):.3f} "
+                    f"inst={float(obs.get('instruction_following_score', 0)):.2f}",
+                    flush=True,
+                )
+                if result.get("done", False):
+                    break
+            results["r2/project_easy"] = round(
+                float(obs.get("cumulative_reward", 0.0)), 3
+            )
+        except Exception as e:
+            print(f"  [ERROR] {e}", flush=True)
+            results["r2/project_easy"] = None
+
+    # ── Dataset pipeline ──────────────────────────────────────────────────────
+    print("\n[DATASET] Testing collection (12 examples)...", flush=True)
+    try:
+        from train_llm import build_grpo_dataset  # type: ignore[import-untyped]
+
+        dataset = build_grpo_dataset(n_examples=12, phase="both")
+        print(f"  [OK] GRPO dataset size: {len(dataset)}", flush=True)
+        print(f"  [OK] Keys: {list(dataset[0].keys())}", flush=True)
+    except Exception as e:
+        print(f"  [WARN] build_grpo_dataset failed: {e}", flush=True)
+        try:
+            rows = collect_r2_sft_examples(
+                n_target=12,
+                min_record_step=1,
+                max_record_step=8,
+            )
+            print(f"  [OK] R2 SFT rows (fallback): {len(rows)}", flush=True)
+            if rows:
+                print(f"  [OK] Keys: {list(rows[0].keys())}", flush=True)
+        except Exception as e2:
+            print(f"  [WARN] collect_r2_sft_examples failed: {e2}", flush=True)
+
+    print("\n=== SMOKE TEST RESULTS ===", flush=True)
+    for k, v in results.items():
+        print(f"  {k}: {v}", flush=True)
+    print("\n[OK] Smoke test complete.", flush=True)
+
+
 def main() -> None:
     print(f"[INFO] model={MODEL_NAME} server={ENV_BASE_URL}", flush=True)
     print(f"[INFO] retry_config=max_retries={MAX_RETRIES} delays={RETRY_DELAYS} "
@@ -953,7 +1089,16 @@ def _cli() -> None:
         default=None,
         help="HF model id for --sft-train (default: MODEL_NAME env / default)",
     )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run R1/R2 + dataset connectivity smoke (no GPU, no LLM)",
+    )
     args = parser.parse_args()
+
+    if args.smoke_test:
+        smoke_test()
+        return
 
     if args.sft_collect or args.sft_train:
         try:
