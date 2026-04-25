@@ -147,10 +147,18 @@ FIXES IN THIS VERSION vs. original train_llm.py:
              config doesn't set a conflicting max_length=32768. This silences
              the "Both max_new_tokens and max_length seem to have been set"
              warning that appeared every training step.
-  [FIX-T12] reward_fn uses per-completion varied seeds (seed + completion_idx)
-             to reduce frac_reward_zero_std. When all completions for a prompt
-             share one seed, trivially-correct actions all get the same reward
-             → zero std → no gradient. Different seeds expose diverse env states.
+  [FIX-T13] ROOT CAUSE FIX for 422 errors + dead gradient (reward stuck ~0.5):
+             • build_grpo_dataset stores meta_task, meta_seed, meta_r2 per
+               example. reward_fn reads these kwargs and resets the env with
+               the SAME task+seed used during collection → same task/dev IDs
+               as the prompt → no 422 "Unprocessable Entity" on R2 /step.
+             • _adapt_action_to_obs() remaps stale mid-episode IDs to valid
+               step-0 equivalents. If no valid adaptation exists, r=0.35
+               (below neutral) rather than 0.5, preserving reward contrast.
+             • Removed per-completion seed variation (old FIX-T12). Varying
+               seed per completion changed task IDs between completions →
+               all 422'd → all r=0.5 → reward_std=0. Diversity now comes
+               from the model's policy, not randomised env states.
 
 ═══════════════════════════════════════════════════════════════
 RECOMMENDED GPU USAGE
@@ -466,6 +474,59 @@ def _parse_action(text: str) -> dict:
             "dev_id": d.get("dev_id"), "new_priority": d.get("new_priority")}
 
 
+def _adapt_action_to_obs(action: dict, obs: dict) -> Optional[dict]:
+    """
+    Map a parsed action to a semantically valid action for *obs*.
+
+    When reward_fn resets the env with the episode seed, the obs task/dev IDs
+    are always the same as when the training prompt was collected.  However, at
+    reward time we reset to step-0 of that episode, not to the exact mid-episode
+    step the prompt came from.  Some task_ids may now be in_progress (already
+    started) rather than backlog, and the model's chosen dev may be unavailable.
+    This helper substitutes stale IDs so the server never sees a 422.
+
+    Returns None when no valid adaptation can be made (caller should penalise
+    with a below-neutral reward of 0.35 rather than the 0.5 neutral fallback,
+    so stale-ID completions produce a learning signal via contrast with
+    completions that parsed clean actions).
+    """
+    tasks    = obs.get("tasks", [])
+    devs     = obs.get("developers", [])
+    task_ids = {t["id"] for t in tasks}
+    dev_ids  = {d["id"] for d in devs}
+
+    atype    = action.get("action_type", "skip")
+    task_id  = action.get("task_id")
+    dev_id   = action.get("dev_id")
+    priority = action.get("new_priority")
+
+    # Fast path: both IDs already valid (or action doesn't need them)
+    if (task_id is None or task_id in task_ids) and (dev_id is None or dev_id in dev_ids):
+        return action
+
+    # Stale task_id → substitute with highest-priority backlog task
+    if task_id is not None and task_id not in task_ids:
+        backlog = sorted(
+            [t for t in tasks if t.get("status") == "backlog"],
+            key=lambda t: (t.get("priority", 9), t.get("deadline", 99))
+        )
+        task_id = backlog[0]["id"] if backlog else None
+
+    # Stale dev_id → substitute with first available developer
+    if dev_id is not None and dev_id not in dev_ids:
+        avail  = [d for d in devs if d.get("is_available", False)]
+        dev_id = avail[0]["id"] if avail else None
+
+    # If we still can't build a valid action, signal failure so caller penalises
+    if atype in ("assign", "reassign") and (not task_id or not dev_id):
+        return None
+    if atype == "unblock" and not task_id:
+        return None
+
+    return {"action_type": atype, "task_id": task_id,
+            "dev_id": dev_id, "new_priority": priority}
+
+
 # ── Prompt builders ───────────────────────────────────────────────────────────
 
 def _build_r1_prompt(obs: dict) -> str:
@@ -547,32 +608,38 @@ def _build_r2_prompt(obs: dict) -> str:
 #   - Neutral fallback = 0.5 (true neutral), not 0.3, so env failures don't
 #     bias learning toward low-reward actions.
 #
-# [FIX-T12] Per-completion varied seeds to reduce frac_reward_zero_std:
-#   Previously all completions in a GRPO group were evaluated against the SAME
-#   environment seed, meaning trivially-correct actions (e.g. assign the only
-#   available task to the only available dev) all get identical rewards → std=0
-#   → no gradient. By offsetting the seed per completion index we expose the
-#   model to slightly different env states within the group, creating reward
-#   diversity. The offset is small (0-3) so tasks/devs don't change drastically.
-
 def make_reward_fn(env_base_url: str, phase: str):
     """
     Returns a GRPO reward function evaluating completions against the live env.
 
-    CRITICAL FIX: All completions for the same prompt (the GRPO group) must be
-    evaluated on IDENTICAL environment state. The episode_counter now advances
-    per-PROMPT not per-completion, and all completions share the same task+seed.
-    Previously each completion incremented the counter → different tasks →
-    incomparable rewards → reward_std=0 → no gradient signal.
+    ROOT-CAUSE FIX FOR 422 ERRORS + HIGH frac_reward_zero_std:
+    ─────────────────────────────────────────────────────────────
+    The old code drove the env with a prompt_counter-derived seed that DIFFERED
+    from the seed used when the training prompt was collected.  The model's
+    completions referenced task/dev IDs from the original prompt state; the
+    freshly-reset env had different IDs → server rejected with 422.  The
+    except-block then returned r=0.5 for ALL completions → reward_std=0 →
+    no GRPO gradient signal.  This is why reward never climbed above 0.52.
 
-    [FIX-T1] Resets env immediately before each completion's /step call so
-    no state leaks between evaluations.
-    [FIX-T12] Uses per-completion seed offset to increase reward variance within
-    a group, reducing frac_reward_zero_std and improving gradient signal.
+    Fix A — Use dataset metadata for consistent resets:
+      build_grpo_dataset now stores meta_task, meta_seed, meta_r2 per example.
+      GRPOTrainer passes these as kwargs, so we reset with the exact same
+      task+seed that was used to build the prompt → same task/dev IDs → no 422.
+
+    Fix B — Adapt stale IDs with _adapt_action_to_obs():
+      The prompt was sampled mid-episode (step 3-8) but the reward reset is
+      step-0, so a handful of tasks may have already started.  The adapter
+      substitutes any stale IDs with the closest valid ones.  If no valid
+      adaptation is possible, r=0.35 (below-neutral penalisation rather than
+      the flat 0.5 that collapsed reward_std to zero).
+
+    Fix C — Same seed for all completions in a group:
+      Per-completion seed variation (old FIX-T12) changed task IDs between
+      completions of the same prompt, causing all completions to 422 again.
+      Removed; reward diversity now comes from the model's policy variation,
+      not from randomised env states.
     """
     import requests
-
-    prompt_counter = [0]
 
     def _post(url: str, payload: dict, retries: int = 3, backoff: float = 1.5) -> dict:
         for attempt in range(retries):
@@ -586,58 +653,69 @@ def make_reward_fn(env_base_url: str, phase: str):
                     raise
                 time.sleep(backoff ** attempt)
 
-    def reward_fn(prompts, completions, **kwargs) -> list[float]:
+    def _scalar(v):
+        """Extract scalar from a possibly-batched list (TRL batches kwargs)."""
+        return v[0] if isinstance(v, list) else v
+
+    def reward_fn(prompts, completions,
+                  meta_task=None, meta_seed=None, meta_r2=None,
+                  **kwargs) -> list[float]:
         rewards = []
 
-        # Advance counter once per reward_fn call (= once per prompt batch)
-        prompt_counter[0] += 1
-        n = prompt_counter[0]
+        # ── Recover task context injected by build_grpo_dataset ───────────────
+        raw_task = _scalar(meta_task)
+        raw_seed = _scalar(meta_seed)
+        raw_r2   = _scalar(meta_r2)
 
-        # Curriculum: alternating R1/R2 (2:2 ratio for "both" phase)
-        if phase == "r1":
-            use_r2 = False
-        elif phase == "r2":
-            use_r2 = True
+        if raw_task is None or raw_seed is None or raw_r2 is None:
+            # Graceful fallback for datasets built before this fix
+            use_r2 = (phase == "r2")
+            task   = R2_TASKS[0] if use_r2 else R1_TASKS[0]
+            seed   = 0
         else:
-            use_r2 = (n % 4 >= 2)
+            use_r2 = bool(int(raw_r2))
+            task   = str(raw_task)
+            seed   = int(raw_seed) % 100
 
-        if not use_r2:
-            task      = R1_TASKS[n % len(R1_TASKS)]
-            reset_url = f"{env_base_url}/reset"
-            step_url  = f"{env_base_url}/step"
-        else:
-            task      = R2_TASKS[n % len(R2_TASKS)]
+        if use_r2:
             reset_url = f"{env_base_url}/project/reset"
             step_url  = f"{env_base_url}/project/step"
+        else:
+            reset_url = f"{env_base_url}/reset"
+            step_url  = f"{env_base_url}/step"
 
-        base_seed = n % 100
-
-        for comp_idx, completion in enumerate(completions):
-            # [FIX-T10] Normalise completion to string — handle all TRL completion formats
+        for completion in completions:
+            # Normalise completion to plain string
             if isinstance(completion, list):
-                if len(completion) > 0 and isinstance(completion[0], str):
+                if completion and isinstance(completion[0], str):
                     completion = completion[0]
-                elif len(completion) > 0 and isinstance(completion[0], dict):
+                elif completion and isinstance(completion[0], dict):
                     completion = completion[0].get("content", "")
                 else:
                     completion = str(completion)
             elif not isinstance(completion, str):
                 completion = str(completion)
 
-            # [FIX-T10] _parse_action now handles list-output LLMs safely
             action = _parse_action(completion)
-            r = 0.5   # true-neutral fallback [FIX-T8]
-
-            # [FIX-T12] Vary seed per completion to create reward diversity
-            seed = (base_seed + comp_idx) % 100
+            r = 0.5  # neutral fallback
 
             try:
-                # [FIX-T1] Reset to CONSISTENT state for this completion
-                _post(reset_url, {"task_name": task, "seed": seed})
-                result = _post(step_url, {"action": action})
+                # Reset to the SAME state as when the prompt was collected.
+                # obs is the reset response (task/dev IDs match the prompt).
+                obs = _post(reset_url, {"task_name": task, "seed": seed})
 
-                step_r = float(result.get("reward", 0.0))
-                # Normalise: env reward range [-3, +2] → [0, 1]
+                # Adapt stale IDs from mid-episode prompt to step-0 obs.
+                adapted = _adapt_action_to_obs(action, obs)
+                if adapted is None:
+                    # Could not build a valid action — penalise below neutral.
+                    # This creates reward contrast vs completions with valid IDs.
+                    r = 0.35
+                    rewards.append(float(r))
+                    continue
+
+                result = _post(step_url, {"action": adapted})
+
+                step_r    = float(result.get("reward", 0.0))
                 step_norm = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
 
                 if not use_r2:
@@ -645,12 +723,11 @@ def make_reward_fn(env_base_url: str, phase: str):
                 else:
                     obs2       = result.get("observation", {})
                     inst_score = float(obs2.get("instruction_following_score", 0.5))
-                    # Combined: step quality (60%) + instruction compliance (40%)
                     r = step_norm * 0.6 + inst_score * 0.4
 
             except Exception as e:
                 print(f"[WARN] reward_fn env call failed: {e}", flush=True)
-                r = 0.5  # [FIX-T8] true neutral
+                r = 0.5
 
             rewards.append(float(r))
         return rewards
@@ -733,6 +810,9 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
                             {"role": "system", "content": R1_SYSTEM_PROMPT},
                             {"role": "user",   "content": prompt},
                         ],
+                        "meta_task": task_name,   # used by reward_fn to reset to same env state
+                        "meta_seed": ep % 100,    # same seed → same task/dev IDs → no 422
+                        "meta_r2":   0,           # 0 = R1 env
                     })
                     action = smart_fallback_r1(obs)
                     result = post(f"{ENV_BASE_URL}/step", {"action": action})
@@ -773,6 +853,9 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
                             {"role": "system", "content": R2_SYSTEM_PROMPT},
                             {"role": "user",   "content": prompt},
                         ],
+                        "meta_task": task_name,   # used by reward_fn to reset to same env state
+                        "meta_seed": ep % 100,    # same seed → same task/dev IDs → no 422
+                        "meta_r2":   1,           # 1 = R2 env
                     })
                     action = smart_fallback_r2(obs, assigned_set)
                     if action["action_type"] == "assign" and action.get("task_id"):
