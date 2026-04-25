@@ -514,6 +514,7 @@ def make_reward_fn(env_base_url: str, phase: str):
             try:
                 resp = requests.post(url, json=payload, timeout=60)
                 resp.raise_for_status()
+                time.sleep(0.2)
                 return resp.json()
             except Exception as e:
                 if attempt == retries - 1:
@@ -614,10 +615,24 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
 
     import requests
 
-    def post(url: str, payload: dict) -> dict:
-        r = requests.post(url, json=payload, timeout=60)
-        r.raise_for_status()
-        return r.json()
+    def post(url: str, payload: dict, retries: int = 5) -> dict:
+        for i in range(retries):
+            try:
+                r = requests.post(url, json=payload, timeout=60)
+
+                if r.status_code == 429:
+                    time.sleep(2 ** i)  # exponential backoff
+                    continue
+
+                r.raise_for_status()
+
+                time.sleep(0.3)  # throttle (CRITICAL)
+                return r.json()
+
+            except Exception as e:
+                if i == retries - 1:
+                    raise
+                time.sleep(2 ** i)
 
     examples = []
     tasks_r1 = R1_TASKS if phase in ("r1", "both") else []
@@ -626,12 +641,13 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
 
     SKIP_STEPS_R1 = 1   # skip first step (trivial full-backlog state)
     SKIP_STEPS_R2 = 2   # skip first 2 steps (instructions not yet released)
-    SAMPLE_PER_EP = 6   # states to sample per episode
+    SAMPLE_PER_EP = 4   # states to sample per episode
 
     # ── Collect R1 snapshots ──────────────────────────────────────────────────
     for task_name in tasks_r1:
         print(f"  [DATASET] R1 {task_name} × {per_task} episodes...", flush=True)
         for ep in range(per_task):
+            time.sleep(1)
             try:
                 obs = post(f"{ENV_BASE_URL}/reset", {"task_name": task_name, "seed": ep})
                 # [FIX-T4] Advance past trivial early steps
@@ -666,6 +682,7 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
     for task_name in tasks_r2:
         print(f"  [DATASET] R2 {task_name} × {per_task} episodes...", flush=True)
         for ep in range(per_task):
+            time.sleep(1)
             try:
                 obs = post(f"{ENV_BASE_URL}/project/reset",
                            {"task_name": task_name, "seed": ep})
@@ -725,10 +742,24 @@ def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
 
     import requests
 
-    def post(url: str, payload: dict) -> dict:
-        r = requests.post(url, json=payload, timeout=60)
-        r.raise_for_status()
-        return r.json()
+    def post(url: str, payload: dict, retries: int = 5) -> dict:
+        for i in range(retries):
+            try:
+                r = requests.post(url, json=payload, timeout=60)
+
+                if r.status_code == 429:
+                    time.sleep(2 ** i)  # exponential backoff
+                    continue
+
+                r.raise_for_status()
+
+                time.sleep(0.3)  # 🔥 throttle (CRITICAL)
+                return r.json()
+
+            except Exception as e:
+                if i == retries - 1:
+                    raise
+                time.sleep(2 ** i)
 
     examples   = []
     tasks_r1   = R1_TASKS if phase in ("r1", "both") else []
