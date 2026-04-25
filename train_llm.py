@@ -162,8 +162,19 @@ import os
 import random
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Optional
+
+# ── Suppress noisy-but-harmless warnings ─────────────────────────────────────
+# These are all deprecation notices in transformers/trl internals, not our code.
+warnings.filterwarnings("ignore", message=".*warmup_ratio is deprecated.*")
+warnings.filterwarnings("ignore", message=".*max_new_tokens.*max_length.*")
+warnings.filterwarnings("ignore", message=".*AttentionMaskConverter.*")
+warnings.filterwarnings("ignore", message=".*attention mask API.*")
+warnings.filterwarnings("ignore", message=".*use_return_dict is deprecated.*")
+warnings.filterwarnings("ignore", message=".*generation_config.*generation-related arguments.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
 # ── Env config ────────────────────────────────────────────────────────────────
 
@@ -186,7 +197,7 @@ GRPO_CONFIG = {
     "beta":                        0.04,  # KL penalty — anti-reward-hacking
     "logging_steps":               5,
     "save_steps":                  50,
-    "warmup_ratio":                0.05,
+    "warmup_steps":                10,  # replaces deprecated warmup_ratio
     "seed":                        42,
 }
 
@@ -196,7 +207,7 @@ SFT_CONFIG = {
     "per_device_train_batch_size": 2,
     "gradient_accumulation_steps": 4,
     "learning_rate":               2e-5,  # higher than GRPO — SFT is supervised
-    "warmup_ratio":                0.05,
+    "warmup_steps":                10,   # replaces deprecated warmup_ratio
     "logging_steps":               5,
     "save_steps":                  100,
 }
@@ -339,15 +350,7 @@ def _parse_action(text: str) -> dict:
     Parse LLM completion → action dict.
     Takes the LAST JSON object in the text (handles chain-of-thought prefix).
     """
-    # FIX: handle list outputs from GRPO / Unsloth
-    if isinstance(text, list):
-        text = text[0] if len(text) > 0 else ""
-
-    if text is None:
-        text = ""
-
-    text = str(text).strip()
-    
+    text = text.strip()
     if "```" in text:
         text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
 
@@ -493,14 +496,18 @@ def make_reward_fn(env_base_url: str, phase: str):
     """
     Returns a GRPO reward function evaluating completions against the live env.
 
-    [FIX-T1] Resets env immediately before stepping — the env MUST be in the
-    correct initial state when we evaluate each action. Previously, the reset
-    was called but the obs was ignored and /step ran on whatever the env's
-    current state was (potentially mid-episode from a previous call).
+    CRITICAL FIX: All completions for the same prompt (the GRPO group) must be
+    evaluated on IDENTICAL environment state. The episode_counter now advances
+    per-PROMPT not per-completion, and all completions share the same task+seed.
+    Previously each completion incremented the counter → different tasks →
+    incomparable rewards → reward_std=0 → no gradient signal.
+
+    [FIX-T1] Resets env immediately before each completion's /step call so
+    no state leaks between evaluations.
     """
     import requests
 
-    episode_counter = [0]
+    prompt_counter = [0]
 
     def _post(url: str, payload: dict) -> dict:
         resp = requests.post(url, json=payload, timeout=60)
@@ -509,49 +516,52 @@ def make_reward_fn(env_base_url: str, phase: str):
 
     def reward_fn(prompts, completions, **kwargs) -> list[float]:
         rewards = []
-        for prompt, completion in zip(prompts, completions):
-            episode_counter[0] += 1
-            n = episode_counter[0]
+        n_prompts = len(set(id(p) for p in prompts))  # usually 1 per GRPO batch
 
-            # Curriculum: alternating R1/R2 (2:2 ratio for "both" phase)
-            if phase == "r1":
-                use_r2 = False
-            elif phase == "r2":
-                use_r2 = True
-            else:
-                use_r2 = (n % 4 >= 2)
+        # Advance counter once per unique prompt group
+        # GRPO calls reward_fn with all completions for a batch of prompts.
+        # We group by prompt index so all generations for the same prompt
+        # share task+seed → rewards are meaningfully comparable.
+        prompt_counter[0] += 1
+        n = prompt_counter[0]
 
+        # Curriculum: alternating R1/R2 (2:2 ratio for "both" phase)
+        if phase == "r1":
+            use_r2 = False
+        elif phase == "r2":
+            use_r2 = True
+        else:
+            use_r2 = (n % 4 >= 2)
+
+        if not use_r2:
+            task = R1_TASKS[n % len(R1_TASKS)]
+            reset_url = f"{env_base_url}/reset"
+            step_url  = f"{env_base_url}/step"
+        else:
+            task = R2_TASKS[n % len(R2_TASKS)]
+            reset_url = f"{env_base_url}/project/reset"
+            step_url  = f"{env_base_url}/project/step"
+
+        seed = n % 100
+
+        for completion in completions:
             action = _parse_action(completion)
             r = 0.5   # true-neutral fallback [FIX-T8]
-
             try:
+                # [FIX-T1] Reset to SAME state for every completion in this group
+                _post(reset_url, {"task_name": task, "seed": seed})
+                result = _post(step_url, {"action": action})
+
+                step_r = float(result.get("reward", 0.0))
+                # Normalise: env reward range [-3, +2] → [0, 1]
+                step_norm = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
+
                 if not use_r2:
-                    # [FIX-T1] Reset, then step
-                    task = R1_TASKS[n % len(R1_TASKS)]
-                    _post(f"{env_base_url}/reset",
-                          {"task_name": task, "seed": n % 100})
-                    result = _post(f"{env_base_url}/step", {"action": action})
-
-                    step_r = float(result.get("reward", 0.0))
-                    # Normalise R1 reward: [-3,+2] → [0,1]
-                    r = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
-
+                    r = step_norm
                 else:
-                    # [FIX-T1] Reset project, then step
-                    task = R2_TASKS[n % len(R2_TASKS)]
-                    _post(f"{env_base_url}/project/reset",
-                          {"task_name": task, "seed": n % 100})
-                    result = _post(f"{env_base_url}/project/step",
-                                   {"action": action})
-
-                    step_r     = float(result.get("reward", 0.0))
                     obs2       = result.get("observation", {})
                     inst_score = float(obs2.get("instruction_following_score", 0.5))
-                    step_norm  = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
-
                     # Combined: step quality (60%) + instruction compliance (40%)
-                    # Anti-hacking: inst_score is server-side computed running avg;
-                    # can't be faked by the model outputting anything in particular.
                     r = step_norm * 0.6 + inst_score * 0.4
 
             except Exception as e:
@@ -937,7 +947,7 @@ def train(
     if _trl_version < (0, 9):
         print(f"[WARN] trl {_trl.__version__} detected — recommend trl>=0.9.0", flush=True)
         # Remove keys that don't exist in older versions
-        for key in ("warmup_ratio",):
+        for key in ("warmup_steps",):
             cfg.pop(key, None)
 
     grpo_config = GRPOConfig(
