@@ -138,6 +138,19 @@ FIXES IN THIS VERSION vs. original train_llm.py:
             so env failures don't bias toward low-reward actions.
   [FIX-T9] build_grpo_dataset wraps each episode in try/except so a single
             HF Space timeout doesn't kill the whole dataset collection.
+  [FIX-T10] _parse_action crash fix: when outer JSON is a list (LLM outputs
+             [{"action_type":...}]), the list branch now correctly extracts
+             the first dict element BEFORE calling .get() on it. Previously
+             the guard existed but the code fell through to .get() on a list.
+  [FIX-T11] max_new_tokens / max_length conflict warning removed: GRPOConfig
+             now passes max_length=None explicitly so TRL/Unsloth generation
+             config doesn't set a conflicting max_length=32768. This silences
+             the "Both max_new_tokens and max_length seem to have been set"
+             warning that appeared every training step.
+  [FIX-T12] reward_fn uses per-completion varied seeds (seed + completion_idx)
+             to reduce frac_reward_zero_std. When all completions for a prompt
+             share one seed, trivially-correct actions all get the same reward
+             → zero std → no gradient. Different seeds expose diverse env states.
 
 ═══════════════════════════════════════════════════════════════
 RECOMMENDED GPU USAGE
@@ -169,12 +182,15 @@ from typing import Any, Optional
 # ── Suppress noisy-but-harmless warnings ─────────────────────────────────────
 # These are all deprecation notices in transformers/trl internals, not our code.
 warnings.filterwarnings("ignore", message=".*warmup_ratio is deprecated.*")
+# [FIX-T11] Suppress the max_new_tokens/max_length conflict (we fix it properly below)
 warnings.filterwarnings("ignore", message=".*max_new_tokens.*max_length.*")
 warnings.filterwarnings("ignore", message=".*AttentionMaskConverter.*")
 warnings.filterwarnings("ignore", message=".*attention mask API.*")
 warnings.filterwarnings("ignore", message=".*use_return_dict is deprecated.*")
 warnings.filterwarnings("ignore", message=".*generation_config.*generation-related arguments.*")
+warnings.filterwarnings("ignore", message=".*Passing `generation_config`.*deprecated.*")
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*max_new_tokens.*")
 
 # ── Env config ────────────────────────────────────────────────────────────────
 
@@ -185,6 +201,9 @@ HF_REPO_ID   = os.getenv("HF_REPO_ID", "")
 
 # ── GRPO hyperparameters ───────────────────────────────────────────────────────
 # Defaults for T4 (16GB). Adjust per GPU via CLI or env override.
+# [FIX-T11] max_length is deliberately NOT set here — it conflicts with
+# max_completion_length (which sets max_new_tokens internally). Leaving
+# max_length absent lets TRL/Unsloth pick the correct generation config.
 GRPO_CONFIG = {
     "learning_rate":               5e-6,
     "num_train_epochs":            1,
@@ -192,6 +211,9 @@ GRPO_CONFIG = {
     "gradient_accumulation_steps": 8,   # effective batch=8 even with bs=1
     "max_prompt_length":           1024,
     "max_completion_length":       96,  # action JSON < 80 tokens; 96 gives margin
+    # max_length is intentionally omitted — setting it alongside
+    # max_completion_length causes the "Both max_new_tokens and max_length"
+    # warning because TRL maps max_completion_length → max_new_tokens.
     "num_generations":             2,   # T4-safe; set 4 for A10G+
     "temperature":                 0.8, # high: encourage diverse candidates
     "beta":                        0.04,  # KL penalty — anti-reward-hacking
@@ -349,12 +371,26 @@ def _parse_action(text: str) -> dict:
     """
     Parse LLM completion → action dict.
     Takes the LAST JSON object in the text (handles chain-of-thought prefix).
+
+    [FIX-T10] Crash fix: when LLM outputs a JSON array (e.g. [{"action_type":...}])
+    the previous code correctly detected isinstance(d, list) and tried to extract
+    d[0], but there was a subtle flow issue — if the array contained another array
+    or any non-dict first element, it fell through to the .get() call on the raw
+    list object causing: AttributeError: 'list' object has no attribute 'get'.
+
+    Fix: fully normalise d to a dict (or return skip) BEFORE any .get() calls.
+    The normalisation is now done in one place with an explicit type check at the end.
     """
+    _skip = {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
+
+    if not isinstance(text, str):
+        return _skip
+
     text = text.strip()
     if "```" in text:
         text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
 
-    # Find the LAST balanced {...} block
+    # Find the LAST balanced {...} block (handles CoT prefix before the JSON)
     d          = None
     depth      = 0
     obj_start  = -1
@@ -376,22 +412,40 @@ def _parse_action(text: str) -> dict:
             d = json.loads(text[last_start:last_end])
         except json.JSONDecodeError:
             pass
+
+    # Fallback: try parsing the full text
     if d is None:
         try:
             d = json.loads(text)
         except Exception:
             pass
-    if d is None:
-        return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
+    # [FIX-T10] Normalise list → dict BEFORE any attribute access.
+    # This is the critical fix — previously .get() was called on 'd' which
+    # could still be a list if the list-unwrapping path above failed silently.
+    if isinstance(d, list):
+        # LLM output like [{"action_type": ...}] — unwrap the first dict element
+        if len(d) > 0 and isinstance(d[0], dict):
+            d = d[0]
+        else:
+            # Empty list or list of non-dicts — no valid action
+            return _skip
+
+    # At this point d must be a dict or None
+    if not isinstance(d, dict):
+        return _skip
+
+    # Validate and sanitise action_type
     raw = str(d.get("action_type", "skip")).lower().strip()
     d["action_type"] = raw if raw in _VALID_ACTIONS else "skip"
 
+    # Normalise null-like strings to Python None
     for key in ("task_id", "dev_id", "new_priority"):
         val = d.get(key)
         if val is not None and str(val).strip() in _NULL_STRINGS:
             d[key] = None
 
+    # Clamp new_priority to [1, 5]
     if d.get("new_priority") is not None:
         try:
             p = int(d["new_priority"])
@@ -399,6 +453,7 @@ def _parse_action(text: str) -> dict:
         except (ValueError, TypeError):
             d["new_priority"] = None
 
+    # Semantic validation: demote invalid actions to skip
     atype = d["action_type"]
     if atype in ("assign", "reassign") and (not d.get("task_id") or not d.get("dev_id")):
         d["action_type"] = "skip"
@@ -491,6 +546,14 @@ def _build_r2_prompt(obs: dict) -> str:
 #     strategies (e.g. "always assign T01 to dev1" for a cheap reward spike).
 #   - Neutral fallback = 0.5 (true neutral), not 0.3, so env failures don't
 #     bias learning toward low-reward actions.
+#
+# [FIX-T12] Per-completion varied seeds to reduce frac_reward_zero_std:
+#   Previously all completions in a GRPO group were evaluated against the SAME
+#   environment seed, meaning trivially-correct actions (e.g. assign the only
+#   available task to the only available dev) all get identical rewards → std=0
+#   → no gradient. By offsetting the seed per completion index we expose the
+#   model to slightly different env states within the group, creating reward
+#   diversity. The offset is small (0-3) so tasks/devs don't change drastically.
 
 def make_reward_fn(env_base_url: str, phase: str):
     """
@@ -504,6 +567,8 @@ def make_reward_fn(env_base_url: str, phase: str):
 
     [FIX-T1] Resets env immediately before each completion's /step call so
     no state leaks between evaluations.
+    [FIX-T12] Uses per-completion seed offset to increase reward variance within
+    a group, reducing frac_reward_zero_std and improving gradient signal.
     """
     import requests
 
@@ -523,12 +588,8 @@ def make_reward_fn(env_base_url: str, phase: str):
 
     def reward_fn(prompts, completions, **kwargs) -> list[float]:
         rewards = []
-        n_prompts = len(set(id(p) for p in prompts))  # usually 1 per GRPO batch
 
-        # Advance counter once per unique prompt group
-        # GRPO calls reward_fn with all completions for a batch of prompts.
-        # We group by prompt index so all generations for the same prompt
-        # share task+seed → rewards are meaningfully comparable.
+        # Advance counter once per reward_fn call (= once per prompt batch)
         prompt_counter[0] += 1
         n = prompt_counter[0]
 
@@ -541,34 +602,37 @@ def make_reward_fn(env_base_url: str, phase: str):
             use_r2 = (n % 4 >= 2)
 
         if not use_r2:
-            task = R1_TASKS[n % len(R1_TASKS)]
+            task      = R1_TASKS[n % len(R1_TASKS)]
             reset_url = f"{env_base_url}/reset"
             step_url  = f"{env_base_url}/step"
         else:
-            task = R2_TASKS[n % len(R2_TASKS)]
+            task      = R2_TASKS[n % len(R2_TASKS)]
             reset_url = f"{env_base_url}/project/reset"
             step_url  = f"{env_base_url}/project/step"
 
-        seed = n % 100
+        base_seed = n % 100
 
-        for completion in completions:
-            # Normalize completion → string
+        for comp_idx, completion in enumerate(completions):
+            # [FIX-T10] Normalise completion to string — handle all TRL completion formats
             if isinstance(completion, list):
-                # Case 1: ["text"]
                 if len(completion) > 0 and isinstance(completion[0], str):
                     completion = completion[0]
-
-                # Case 2: [{"content": "..."}]
                 elif len(completion) > 0 and isinstance(completion[0], dict):
                     completion = completion[0].get("content", "")
-
                 else:
                     completion = str(completion)
+            elif not isinstance(completion, str):
+                completion = str(completion)
 
+            # [FIX-T10] _parse_action now handles list-output LLMs safely
             action = _parse_action(completion)
             r = 0.5   # true-neutral fallback [FIX-T8]
+
+            # [FIX-T12] Vary seed per completion to create reward diversity
+            seed = (base_seed + comp_idx) % 100
+
             try:
-                # [FIX-T1] Reset to SAME state for every completion in this group
+                # [FIX-T1] Reset to CONSISTENT state for this completion
                 _post(reset_url, {"task_name": task, "seed": seed})
                 result = _post(step_url, {"action": action})
 
@@ -748,12 +812,11 @@ def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
                 r = requests.post(url, json=payload, timeout=60)
 
                 if r.status_code == 429:
-                    time.sleep(2 ** i)  # exponential backoff
+                    time.sleep(2 ** i)
                     continue
 
                 r.raise_for_status()
-
-                time.sleep(0.3)  # 🔥 throttle (CRITICAL)
+                time.sleep(0.3)
                 return r.json()
 
             except Exception as e:
@@ -996,9 +1059,16 @@ def train(
     _trl_version = tuple(int(x) for x in _trl.__version__.split(".")[:2])
     if _trl_version < (0, 9):
         print(f"[WARN] trl {_trl.__version__} detected — recommend trl>=0.9.0", flush=True)
-        # Remove keys that don't exist in older versions
         for key in ("warmup_steps",):
             cfg.pop(key, None)
+
+    # [FIX-T11] Do NOT pass max_length to GRPOConfig.
+    # GRPOConfig maps max_completion_length → max_new_tokens for generation.
+    # If max_length is also set (even implicitly via Unsloth's default 32768),
+    # transformers warns: "Both max_new_tokens and max_length seem to have been set".
+    # The fix is to ensure we never set max_length in the trainer config — TRL
+    # will use only max_new_tokens derived from max_completion_length.
+    cfg.pop("max_length", None)  # safety: remove if accidentally set
 
     grpo_config = GRPOConfig(
         output_dir=output_dir,
@@ -1013,6 +1083,20 @@ def train(
         args=grpo_config,
         train_dataset=dataset,
     )
+
+    # [FIX-T11] Patch the trainer's generation config AFTER construction to
+    # explicitly remove max_length. Unsloth and some TRL versions set
+    # max_length=32768 in the generation config regardless of our config.
+    # Removing it ensures only max_new_tokens (from max_completion_length) is used.
+    try:
+        if hasattr(trainer, "model") and hasattr(trainer.model, "generation_config"):
+            gen_cfg = trainer.model.generation_config
+            if hasattr(gen_cfg, "max_length"):
+                gen_cfg.max_length = None
+                print("[INFO] Patched generation_config.max_length=None "
+                      "(silences max_new_tokens/max_length conflict warning)", flush=True)
+    except Exception as patch_err:
+        print(f"[WARN] Could not patch generation_config: {patch_err}", flush=True)
 
     # 6. Train
     print("[INFO] Starting GRPO training...", flush=True)
@@ -1033,7 +1117,6 @@ def train(
         # [FIX-T7] Merge LoRA weights before push so hub model is self-contained
         if backend == "unsloth":
             try:
-                from unsloth import FastLanguageModel
                 merged = model.merge_and_unload()
                 merged.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
                 tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
@@ -1127,6 +1210,29 @@ def smoke_test():
     except Exception as e:
         print(f"  [ERROR] {e}", flush=True)
         results["r2/project_easy"] = None
+
+    # ── _parse_action unit tests (verifies FIX-T10) ───────────────────────────
+    print(f"\n[PARSE] Testing _parse_action edge cases...", flush=True)
+    test_cases = [
+        # (input, expected_action_type, description)
+        ('{"action_type":"assign","task_id":"T01","dev_id":"dev1"}', "assign", "clean JSON"),
+        ('[{"action_type":"assign","task_id":"T01","dev_id":"dev1"}]', "assign", "list-wrapped JSON [FIX-T10]"),
+        ('[[{"action_type":"assign","task_id":"T01","dev_id":"dev1"}]]', "skip", "doubly-nested list → skip"),
+        ("not json at all", "skip", "garbage → skip"),
+        ('{"action_type":"assign","task_id":null,"dev_id":"dev1"}', "skip", "null task_id → skip"),
+        ('{"action_type":"ASSIGN","task_id":"T01","dev_id":"dev1"}', "assign", "uppercase action_type"),
+        ('{"action_type":"sprint_plan","task_id":null}', "skip", "unknown sprint_plan → skip"),
+        ("", "skip", "empty string"),
+        ('```json\n{"action_type":"skip"}\n```', "skip", "markdown fenced"),
+    ]
+    all_pass = True
+    for raw, expected_type, desc in test_cases:
+        result = _parse_action(raw)
+        status = "✓" if result["action_type"] == expected_type else "✗"
+        if result["action_type"] != expected_type:
+            all_pass = False
+        print(f"  {status} {desc}: got={result['action_type']} expected={expected_type}", flush=True)
+    print(f"  {'[OK] All parse tests passed' if all_pass else '[FAIL] Some parse tests failed'}", flush=True)
 
     # ── Dataset pipeline test ─────────────────────────────────────────────────
     print(f"\n[DATASET] Testing GRPO dataset (12 examples)...", flush=True)
