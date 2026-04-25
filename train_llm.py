@@ -7,11 +7,11 @@ TRAINING APPROACH: SFT warm-up → GRPO fine-tuning (curriculum)
 WHY THIS COMBINATION?
 ═══════════════════════════════════════════════════════════════
 
-1. SFT WARM-UP (Phase 0, mandatory — NOT optional)
+1. SFT WARM-UP (Phase 0, optional but recommended)
    ─────────────────────────────────────────────────
-   Why: Cold-start GRPO on Qwen2.5-1.5B with a random policy collapses
-   early because all N generations get similar rewards → GRPO gradient is
-   zero → no learning signal. A brief SFT warm-up (2 epochs on rule-based
+   Why: Cold-start GRPO on Llama-3.1-8B with a random policy can collapse
+   early because all 4 generations get similar rewards → GRPO gradient is
+   zero → no learning signal. A brief SFT warm-up (1–2 epochs on rule-based
    trajectories) teaches the model the output FORMAT (JSON schema) before
    reward-driven exploration begins.
 
@@ -97,11 +97,9 @@ R2 REWARD (multi-sprint, 60 days):
     - Adding it as 0.4 weight makes every step instruction-aware.
 
   ANTI-HACKING MEASURES:
-    1. KL penalty (beta=0.02): penalises policy that diverges too far from
+    1. KL penalty (beta=0.04): penalises policy that diverges too far from
        base model — prevents the model from finding degenerate strategies
-       like outputting skip forever. Lowered from 0.04 because KL never
-       exceeded 0.012 in original training, meaning the penalty was
-       blocking exploration without ever being needed as a safety net.
+       like outputting skip forever.
     2. Reward normalisation per GRPO group: absolute magnitudes don't matter,
        only relative ordering within each batch → can't inflate reward by
        gaming normalisation scale.
@@ -121,113 +119,39 @@ R2 REWARD (multi-sprint, 60 days):
        a developer's productivity by 2%. This makes short-horizon hacking
        (rush tasks to get early reward) self-defeating over 60 days.
 
-═══════════════════════════════════════════════════════════════
-FIXES IN THIS VERSION vs. previous train_llm.py
-═══════════════════════════════════════════════════════════════
-
+FIXES IN THIS VERSION vs. original train_llm.py:
   [FIX-T1] reward_fn now resets env BEFORE calling /step (was calling /step
             on stale state from a previous episode — reward was meaningless).
-
   [FIX-T2] Observation extracted from reset response, not from step (reset
             returns obs directly, not wrapped in observation key).
-
   [FIX-T3] SFT warmup phase added (--phase sft or --sft-epochs > 0).
-
   [FIX-T4] Dataset now samples from MIDDLE of episodes (steps 3-8) not just
             from step 0 — gives the model harder, more diverse states to learn
             from. Step-0 prompts are trivially easy and over-represented.
-
-  [FIX-T5] Tokenizer pad_token fix: Llama/Qwen has no pad_token by default →
+  [FIX-T5] Tokenizer pad_token fix: Llama has no pad_token by default →
             setting to eos_token (standard practice).
-
   [FIX-T6] GRPOConfig: removed unsupported fields for older trl versions;
             added graceful version detection.
-
   [FIX-T7] Push uses model.merge_and_unload() before push if Unsloth so
             the pushed model is a full weight checkpoint, not just LoRA diff.
-
   [FIX-T8] Neutral fallback reward changed from 0.3 to 0.5 (true neutral)
             so env failures don't bias toward low-reward actions.
-
   [FIX-T9] build_grpo_dataset wraps each episode in try/except so a single
             HF Space timeout doesn't kill the whole dataset collection.
-
-  ── NEW FIXES BASED ON TRAINING LOG ANALYSIS ──────────────────────────────
-
-  [FIX-T10] num_generations raised from 2 → 4 on T4 (was the primary cause
-            of training failure). With only 2 completions per GRPO group the
-            within-group reward variance was near zero on 88% of batches
-            (frac_reward_zero_std=0.88), making the group-relative advantage
-            effectively zero and producing zero gradient throughout. clip_ratio
-            was 0 for all 219 steps — GRPO never updated the weights. With 4
-            generations there is sufficient diversity for meaningful advantage
-            normalisation. Memory is managed by reducing max_completion_length
-            from 96 → 64 (action JSONs are ≤50 tokens so 64 is safe) and
-            keeping per_device_train_batch_size=1 with gradient_accumulation=8.
-
-  [FIX-T11] temperature raised from 0.8 → 1.0 during GRPO generation. At
-            temperature=0.8 with only 2 completions the outputs were too
-            similar (near-greedy). At 1.0 with 4 completions we get the
-            within-group diversity that GRPO's advantage normalisation needs
-            to produce non-zero gradients. Inference still uses 0.3.
-
-  [FIX-T12] num_train_epochs raised from 1 → 3. The only genuine learning
-            signal in the previous run appeared at epochs 0.22–0.30 (reward
-            briefly spiked to 0.659) but was not retained because training
-            ended before the policy could consolidate. Three epochs give
-            enough passes for the reward signal to accumulate into stable
-            weight changes.
-
-  [FIX-T13] beta (KL penalty) lowered from 0.04 → 0.02. In the original run
-            KL never exceeded 0.012 — well within the 0.04 budget — meaning
-            the penalty was not protecting against anything but was still
-            penalising exploration. At 0.02 the model has more room to move
-            before being pushed back, while still preventing degenerate
-            divergence. Do not go below 0.01.
-
-  [FIX-T14] Default phase changed from "r1" → "both". The previous run only
-            collected R1 data (easy_sprint/medium_sprint/hard_sprint) despite
-            being evaluated entirely on R2 tasks (project_easy/medium/hard).
-            The model never saw instruction_queue, sprint boundaries, or
-            multi-sprint observations during training — every R2 concept was
-            completely OOD at inference. Phase "both" gives a 50/50 R1/R2
-            curriculum from the start.
-
-  [FIX-T15] Default sft_epochs changed from 0 → 2. SFT warm-up was skipped
-            entirely in the previous run. Without it, GRPO cold-starts on a
-            model with no JSON format discipline, all 4 (or 2) completions
-            land at similar reward levels in the first few batches, and the
-            advantage-normalised gradient is near zero before any useful
-            learning has begun. Two SFT epochs on rule-based (obs, action)
-            pairs is sufficient to seed format compliance.
-
-  [FIX-T16] SFT warm-up dataset size increased from n//3 → n//2 when
-            sft_epochs>0. With a larger GRPO dataset (300+ episodes) the
-            previous formula produced an SFT set that was too small to cover
-            all task types in both R1 and R2.
-
-  [FIX-T17] GPU table in docs updated to reflect the new num_generations=4
-            baseline even on T4, and realistic time estimates revised.
 
 ═══════════════════════════════════════════════════════════════
 RECOMMENDED GPU USAGE
 ═══════════════════════════════════════════════════════════════
 Model: Qwen2.5-1.5B for TRAINING (loaded locally — no HF router needed).
-       Qwen2.5-1.5B adapter for INFERENCE (loaded via Unsloth locally).
+       Llama-3.1-8B for INFERENCE via HF router.
 
-| GPU  | VRAM | Batch | Gen | Epochs | Approx time (300ep, both phases) |
-|------|------|-------|-----|--------|----------------------------------|
-| T4   | 16GB |  1    |  4  |   3    | ~10-12 hours                     |
-| A10G | 24GB |  2    |  4  |   3    | ~5-6 hours                       |
-| A100 | 40GB |  4    |  4  |   3    | ~2-3 hours                       |
+| GPU  | VRAM | Batch | Generations | Approx time (300ep) |
+|------|------|-------|-------------|---------------------|
+| T4   | 16GB | 1     | 2           | ~4-5 hours          |
+| A10G | 24GB | 2     | 4           | ~2-3 hours          |
+| A100 | 40GB | 4     | 4           | ~60-90 min          |
 
-RECOMMENDED COMMAND (T4, minimum viable):
-  python train_llm.py --phase both --episodes 300 --sft-epochs 2 --gpu-tier t4 \\
-                      --output results/trained_model --push
-
-RECOMMENDED COMMAND (A100, best quality):
-  python train_llm.py --phase both --episodes 500 --sft-epochs 2 --gpu-tier a100 \\
-                      --output results/trained_model --push
+Colab setup (9 cells) — see PROJECT_HANDOFF.md for details.
 """
 
 from __future__ import annotations
@@ -249,22 +173,17 @@ MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")  # for LOCA
 HF_REPO_ID   = os.getenv("HF_REPO_ID", "")
 
 # ── GRPO hyperparameters ───────────────────────────────────────────────────────
-# Defaults tuned for T4 (16GB) after analysis of the previous training run.
-# Key changes from the original config are annotated with their FIX tag.
+# Defaults for T4 (16GB). Adjust per GPU via CLI or env override.
 GRPO_CONFIG = {
     "learning_rate":               5e-6,
-    "num_train_epochs":            3,        # [FIX-T12] was 1 — not enough to consolidate
-    "per_device_train_batch_size": 1,        # T4-safe; double for A10G+
-    "gradient_accumulation_steps": 8,        # effective batch=8 even with bs=1
+    "num_train_epochs":            1,
+    "per_device_train_batch_size": 1,   # T4-safe default; double for A10G+
+    "gradient_accumulation_steps": 8,   # effective batch=8 even with bs=1
     "max_prompt_length":           1024,
-    "max_completion_length":       64,       # [FIX-T10] was 96; JSON actions ≤50 tokens,
-                                             # reducing frees VRAM for 4 generations on T4
-    "num_generations":             4,        # [FIX-T10] was 2 — ROOT CAUSE of zero gradient.
-                                             # GRPO needs ≥4 to get non-zero within-group variance.
-    "temperature":                 1.0,      # [FIX-T11] was 0.8 — higher diversity between
-                                             # generations gives GRPO a real advantage signal.
-    "beta":                        0.02,     # [FIX-T13] was 0.04 — KL never exceeded 0.012
-                                             # in original run; lower value allows more exploration.
+    "max_completion_length":       96,  # action JSON < 80 tokens; 96 gives margin
+    "num_generations":             2,   # T4-safe; set 4 for A10G+
+    "temperature":                 0.8, # high: encourage diverse candidates
+    "beta":                        0.04,  # KL penalty — anti-reward-hacking
     "logging_steps":               5,
     "save_steps":                  50,
     "warmup_ratio":                0.05,
@@ -273,10 +192,10 @@ GRPO_CONFIG = {
 
 # SFT warm-up config
 SFT_CONFIG = {
-    "num_train_epochs":            2,        # 2 epochs sufficient for format seeding
+    "num_train_epochs":            2,
     "per_device_train_batch_size": 2,
     "gradient_accumulation_steps": 4,
-    "learning_rate":               2e-5,     # higher than GRPO — SFT is supervised
+    "learning_rate":               2e-5,  # higher than GRPO — SFT is supervised
     "warmup_ratio":                0.05,
     "logging_steps":               5,
     "save_steps":                  100,
@@ -367,8 +286,7 @@ def smart_fallback_r2(obs: dict, assigned_set: Optional[set] = None) -> dict:
             return False
         if task["id"] in assigned_set:
             return False
-        # Check both top-level and metadata depends_on [FIX-T4 dependency]
-        deps = task.get("depends_on", []) or task.get("metadata", {}).get("depends_on", [])
+        deps = task.get("metadata", {}).get("depends_on", [])
         return all(d in done_ids for d in deps)
 
     skip = {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
@@ -402,7 +320,7 @@ def smart_fallback_r2(obs: dict, assigned_set: Optional[set] = None) -> dict:
     # 3. Unblock
     for task in tasks:
         if task.get("status") == "blocked":
-            deps = task.get("depends_on", []) or task.get("metadata", {}).get("depends_on", [])
+            deps = task.get("metadata", {}).get("depends_on", [])
             if all(d in done_ids for d in deps):
                 return {"action_type": "unblock", "task_id": task["id"],
                         "dev_id": None, "new_priority": None}
@@ -506,7 +424,7 @@ def _build_r1_prompt(obs: dict) -> str:
 
 
 def _build_r2_prompt(obs: dict) -> str:
-    """Compact R2 prompt matching inference_r2.py format exactly."""
+    """Compact R2 prompt matching inference_r2.py format."""
     current_sprint = obs.get("current_sprint", 1)
     current_day    = obs.get("current_day", 1)
     days_left      = max(0, current_sprint * 10 - current_day + 1)
@@ -518,21 +436,15 @@ def _build_r2_prompt(obs: dict) -> str:
         "⚡FOLLOW: " + " | ".join(f"[{i['id']}] {i['text'][:50]}" for i in active_insts[:2])
     ) if active_insts else "No instructions."
 
-    debt_raw   = obs.get("tech_debt", [])
-    debt_count = len(debt_raw) if isinstance(debt_raw, list) else int(debt_raw or 0)
-
+    debt_count = len(obs.get("tech_debt", []))
     backlog = sorted([t for t in tasks if t.get("status") == "backlog"],
                      key=lambda t: (t.get("priority", 9), t.get("deadline", 99)))
     in_prog = [t for t in tasks if t.get("status") == "in_progress"]
 
     def fmt(t: dict) -> str:
-        # Check both top-level and metadata depends_on for robustness
-        meta   = t.get("metadata", {}) or {}
-        deps   = t.get("depends_on", []) or meta.get("depends_on", [])
+        deps = t.get("metadata", {}).get("depends_on", [])
         dep_ok = "✓" if all(d in done_ids for d in deps) else "✗"
-        return (f"[{t['id']}]P{t.get('priority','?')} "
-                f"{str(t.get('required_skill','?'))[:4]} {dep_ok} "
-                f"D{t.get('deadline', t.get('deadline_day','?'))}")
+        return f"[{t['id']}]P{t.get('priority','?')} {str(t.get('required_skill','?'))[:4]} {dep_ok} D{t.get('deadline','?')}"
 
     backlog_str = " ".join(fmt(t) for t in backlog[:6])
     if len(backlog) > 6:
@@ -564,7 +476,7 @@ def _build_r2_prompt(obs: dict) -> str:
 #     The model cannot exploit carry-over state between generations.
 #   - Reward is normalised within the GRPO group (not absolute), so inflating
 #     one generation's reward doesn't help unless it's relatively better.
-#   - KL penalty (beta=0.02) prevents the policy from drifting to degenerate
+#   - KL penalty (beta=0.04) prevents the policy from drifting to degenerate
 #     strategies (e.g. "always assign T01 to dev1" for a cheap reward spike).
 #   - Neutral fallback = 0.5 (true neutral), not 0.3, so env failures don't
 #     bias learning toward low-reward actions.
@@ -577,10 +489,6 @@ def make_reward_fn(env_base_url: str, phase: str):
     correct initial state when we evaluate each action. Previously, the reset
     was called but the obs was ignored and /step ran on whatever the env's
     current state was (potentially mid-episode from a previous call).
-
-    [FIX-T14] phase="both" now correctly interleaves R1 and R2 evaluations in
-    a 1:1 ratio (alternating per-completion). The previous 2:2 block alternation
-    was unchanged, but the default phase is now "both" so R2 tasks always appear.
     """
     import requests
 
@@ -597,17 +505,13 @@ def make_reward_fn(env_base_url: str, phase: str):
             episode_counter[0] += 1
             n = episode_counter[0]
 
-            # Curriculum: alternating R1/R2 (1:1 ratio for "both" phase).
-            # [FIX-T14] With phase="both" (new default), every other completion
-            # is evaluated on an R2 task — ensures the model gets R2 reward
-            # signal from the very first batch rather than after N//2 steps.
+            # Curriculum: alternating R1/R2 (2:2 ratio for "both" phase)
             if phase == "r1":
                 use_r2 = False
             elif phase == "r2":
                 use_r2 = True
             else:
-                # Strict alternation: even n → R1, odd n → R2
-                use_r2 = (n % 2 == 1)
+                use_r2 = (n % 4 >= 2)
 
             action = _parse_action(completion)
             r = 0.5   # true-neutral fallback [FIX-T8]
@@ -658,17 +562,12 @@ def make_reward_fn(env_base_url: str, phase: str):
 # The first 1-2 steps are trivially easy (full backlog, no instructions yet).
 # Sampling from steps 3+ gives the model harder, more diverse training states.
 # [FIX-T9] Each episode wrapped in try/except — HF Space timeouts don't kill collection.
-# [FIX-T14] Phase "both" is now the default, ensuring R2 observations always appear.
 
-def build_grpo_dataset(n_examples: int = 300, phase: str = "both"):
+def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
     """
     Build a HuggingFace Dataset of (prompt) examples.
     Each prompt is a serialised chat message list.
     The LLM is NOT called — only rule-based policy advances the game.
-
-    With phase="both" (recommended), examples are split evenly between
-    R1 and R2 tasks, giving the model both short-sprint and multi-sprint
-    observations across all difficulty levels.
     """
     try:
         from datasets import Dataset
@@ -727,9 +626,6 @@ def build_grpo_dataset(n_examples: int = 300, phase: str = "both"):
                 print(f"  [WARN] R1 ep{ep} failed: {e}", flush=True)  # [FIX-T9]
 
     # ── Collect R2 snapshots ──────────────────────────────────────────────────
-    # [FIX-T14] This block now always runs when phase="both" (the new default).
-    # Previously the default was phase="r1" so this block was never reached,
-    # and the model never saw R2 observations during training.
     for task_name in tasks_r2:
         print(f"  [DATASET] R2 {task_name} × {per_task} episodes...", flush=True)
         for ep in range(per_task):
@@ -779,15 +675,11 @@ def build_grpo_dataset(n_examples: int = 300, phase: str = "both"):
 
 # ── SFT dataset builder ────────────────────────────────────────────────────────
 # [FIX-T3] Used for SFT warm-up phase. Adds 'completion' field (the rule-based action).
-# [FIX-T14] Now also collects R2 examples by default (phase="both").
 
-def build_sft_dataset(n_examples: int = 150, phase: str = "both"):
+def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
     """
     Build a supervised fine-tuning dataset with (prompt, completion) pairs.
     The completion is the rule-based action — good enough to teach JSON format.
-
-    With phase="both", covers both R1 and R2 observation formats so the model
-    learns to output valid JSON for both sprint and multi-sprint contexts.
     """
     try:
         from datasets import Dataset
@@ -831,7 +723,6 @@ def build_sft_dataset(n_examples: int = 150, phase: str = "both"):
             except Exception as e:
                 print(f"  [WARN] SFT R1 ep{ep} failed: {e}", flush=True)
 
-    # [FIX-T14] R2 SFT examples — always collected when phase="both"
     for task_name in tasks_r2:
         for ep in range(per_task):
             try:
@@ -943,16 +834,8 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
     """
     [FIX-T3] SFT warm-up: teach the model JSON format before GRPO exploration.
     Uses TRL SFTTrainer with the rule-based (obs, action) pairs.
-
-    [FIX-T15] This is now called with sft_epochs=2 by default (was 0, i.e. skipped).
-    Without this warm-up, GRPO cold-starts into near-zero gradient because the
-    base model outputs structurally similar JSONs for all generations, collapsing
-    within-group reward variance from the very first batch.
-
-    [FIX-T14] phase="both" ensures R2 format is covered in SFT (instruction_queue,
-    sprint headers, dep markers) not just R1 format.
     """
-    print(f"\n[SFT] Warm-up phase ({n_examples} examples, phase={phase})...", flush=True)
+    print(f"\n[SFT] Warm-up phase ({n_examples} examples)...", flush=True)
     try:
         from trl import SFTTrainer, SFTConfig
     except ImportError:
@@ -970,6 +853,15 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
         return {"text": "\n".join(parts)}
 
     sft_data = sft_data.map(format_fn)
+
+    # [FIX] Unsloth's SFTTrainer detects "prompt" + "completion" columns and
+    # routes to _tokenize_pc, which does example["prompt"] + example["completion"].
+    # Since "prompt" is a list of message dicts (not a string), this crashes with
+    # TypeError: can only concatenate list (not "str") to list.
+    # Dropping both columns forces Unsloth to use dataset_text_field="text" instead.
+    cols_to_drop = [c for c in ["prompt", "completion"] if c in sft_data.column_names]
+    if cols_to_drop:
+        sft_data = sft_data.remove_columns(cols_to_drop)
 
     sft_dir  = str(Path(output_dir) / "sft_warmup")
     sft_conf = SFTConfig(
@@ -993,31 +885,25 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
 # ── GRPO trainer ───────────────────────────────────────────────────────────────
 
 def train(
-    phase: str          = "both",    # [FIX-T14] was "r1" — must be "both" for R2 coverage
-    n_dataset_examples: int = 300,   # increased from 200 for better coverage
-    output_dir: str     = "results/trained_model",
-    push_to_hub: bool   = False,
-    sft_epochs: int     = 2,         # [FIX-T15] was 0 (skipped) — now mandatory default
-    gpu_tier: str       = "t4",      # "t4", "a10g", or "a100"
+    phase: str         = "both",
+    n_dataset_examples: int = 200,
+    output_dir: str    = "results/trained_model",
+    push_to_hub: bool  = False,
+    sft_epochs: int    = 0,     # 0 = skip SFT warm-up
+    gpu_tier: str      = "t4",  # "t4", "a10g", or "a100"
 ):
     print(f"\n{'='*60}", flush=True)
     print(f" GRPO TRAINING — Phase: {phase.upper()} | GPU: {gpu_tier.upper()}", flush=True)
     print(f" Model:  {MODEL_NAME}", flush=True)
     print(f" Server: {ENV_BASE_URL}", flush=True)
     print(f" SFT warm-up epochs: {sft_epochs}", flush=True)
-    print(f" num_generations: {GRPO_CONFIG['num_generations']} | "
-          f"temperature: {GRPO_CONFIG['temperature']} | "
-          f"beta: {GRPO_CONFIG['beta']} | "
-          f"epochs: {GRPO_CONFIG['num_train_epochs']}", flush=True)
     print(f"{'='*60}\n", flush=True)
 
     # Adjust config for GPU tier
-    # [FIX-T10] T4 now runs 4 generations (not 2) by holding batch=1 and
-    # reducing max_completion_length to 64 to stay within 16GB VRAM budget.
     cfg = dict(GRPO_CONFIG)
     if gpu_tier == "a10g":
         cfg["per_device_train_batch_size"] = 2
-        cfg["num_generations"]             = 4   # already 4, but explicit
+        cfg["num_generations"]             = 4
     elif gpu_tier == "a100":
         cfg["per_device_train_batch_size"] = 4
         cfg["num_generations"]             = 4
@@ -1026,14 +912,13 @@ def train(
     # 1. Load model
     model, tokenizer, backend = load_model_and_tokenizer(MODEL_NAME)
 
-    # 2. SFT warm-up — [FIX-T15] default is now sft_epochs=2, not 0
+    # 2. SFT warm-up (optional)
     if sft_epochs > 0:
-        # [FIX-T16] Use n//2 for SFT size (was n//3 — too small for both phases)
-        sft_n = max(100, n_dataset_examples // 2)
+        sft_n = max(50, n_dataset_examples // 3)
         SFT_CONFIG["num_train_epochs"] = sft_epochs
         model = run_sft(model, tokenizer, phase, sft_n, output_dir)
 
-    # 3. Build GRPO dataset — [FIX-T14] phase="both" ensures R2 examples are included
+    # 3. Build GRPO dataset
     print("[INFO] Building GRPO training dataset...", flush=True)
     dataset = build_grpo_dataset(n_examples=n_dataset_examples, phase=phase)
 
@@ -1089,6 +974,7 @@ def train(
         # [FIX-T7] Merge LoRA weights before push so hub model is self-contained
         if backend == "unsloth":
             try:
+                from unsloth import FastLanguageModel
                 merged = model.merge_and_unload()
                 merged.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
                 tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
@@ -1184,28 +1070,19 @@ def smoke_test():
         results["r2/project_easy"] = None
 
     # ── Dataset pipeline test ─────────────────────────────────────────────────
-    print(f"\n[DATASET] Testing GRPO dataset (12 examples, phase=both)...", flush=True)
+    print(f"\n[DATASET] Testing GRPO dataset (12 examples)...", flush=True)
     try:
         ds = build_grpo_dataset(n_examples=12, phase="both")
         print(f"  [OK] GRPO dataset size: {len(ds)}", flush=True)
         print(f"  [OK] Keys: {list(ds[0].keys())}", flush=True)
-        # Verify both R1 and R2 system prompts appear
-        r1_count = sum(1 for ex in ds if ex["prompt"][0]["content"] == R1_SYSTEM_PROMPT)
-        r2_count = sum(1 for ex in ds if ex["prompt"][0]["content"] == R2_SYSTEM_PROMPT)
-        print(f"  [OK] R1 examples: {r1_count} | R2 examples: {r2_count}", flush=True)
-        if r2_count == 0:
-            print(f"  [WARN] No R2 examples collected — check /project/* endpoints", flush=True)
     except Exception as e:
         print(f"  [WARN] GRPO dataset failed: {e}", flush=True)
 
-    print(f"\n[DATASET] Testing SFT dataset (12 examples, phase=both)...", flush=True)
+    print(f"\n[DATASET] Testing SFT dataset (12 examples)...", flush=True)
     try:
         sft_ds = build_sft_dataset(n_examples=12, phase="both")
         print(f"  [OK] SFT dataset size: {len(sft_ds)}", flush=True)
         print(f"  [OK] Keys: {list(sft_ds[0].keys())}", flush=True)
-        r1_count = sum(1 for ex in sft_ds if ex["prompt"][0]["content"] == R1_SYSTEM_PROMPT)
-        r2_count = sum(1 for ex in sft_ds if ex["prompt"][0]["content"] == R2_SYSTEM_PROMPT)
-        print(f"  [OK] R1 examples: {r1_count} | R2 examples: {r2_count}", flush=True)
     except Exception as e:
         print(f"  [WARN] SFT dataset failed: {e}", flush=True)
 
@@ -1214,11 +1091,8 @@ def smoke_test():
         status = "[OK]" if v is not None else "[FAIL]"
         print(f"  {status} {k}: {v}", flush=True)
     print(f"\n✅ Smoke test complete. Server is ready for GPU training.", flush=True)
-    print(f"\nRecommended training command (T4):", flush=True)
-    print(f"  python train_llm.py --phase both --episodes 300 "
-          f"--sft-epochs 2 --gpu-tier t4 --output results/trained_model --push", flush=True)
-    print(f"\nRecommended training command (A100, best quality):", flush=True)
-    print(f"  python train_llm.py --phase both --episodes 500 "
+    print(f"\n Recommended training command (A100):", flush=True)
+    print(f"   python train_llm.py --phase both --episodes 300 "
           f"--sft-epochs 2 --gpu-tier a100 --output results/trained_model --push", flush=True)
 
 
@@ -1227,18 +1101,18 @@ def smoke_test():
 def main():
     parser = argparse.ArgumentParser(description="SFT+GRPO training for AI Sprint Manager")
     parser.add_argument("--smoke-test",  action="store_true",
-                        help="Run smoke test (no GPU). Always do this before GPU training.")
+                        help="Run smoke test (no GPU). Do this locally first.")
     parser.add_argument("--phase",       choices=["r1", "r2", "both", "sft"], default="both",
-                        help="Training phase. 'both' (default) trains on R1+R2 curriculum.")
-    parser.add_argument("--episodes",    type=int, default=300,
-                        help="GRPO dataset examples to collect (default: 300)")
-    parser.add_argument("--sft-epochs",  type=int, default=2,
-                        help="SFT warm-up epochs before GRPO (default: 2, do not set to 0)")
+                        help="Training phase. 'sft' runs SFT only.")
+    parser.add_argument("--episodes",    type=int, default=200,
+                        help="GRPO dataset examples to collect (default: 200)")
+    parser.add_argument("--sft-epochs",  type=int, default=0,
+                        help="SFT warm-up epochs before GRPO (default: 0 = skip)")
     parser.add_argument("--gpu-tier",    choices=["t4", "a10g", "a100"], default="t4",
                         help="GPU tier for batch size scaling (default: t4)")
     parser.add_argument("--output",      type=str, default="results/trained_model")
     parser.add_argument("--push",        action="store_true",
-                        help="Push trained model to HF Hub (requires HF_REPO_ID env var)")
+                        help="Push trained model to HF Hub (requires HF_REPO_ID)")
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -1246,7 +1120,7 @@ def main():
         return
 
     if args.phase == "sft":
-        # SFT only — useful to verify format learning before GRPO
+        # SFT only — useful to check format learning before GRPO
         model, tokenizer, _ = load_model_and_tokenizer(MODEL_NAME)
         run_sft(model, tokenizer, "both", 200, args.output)
         tokenizer.save_pretrained(args.output)
