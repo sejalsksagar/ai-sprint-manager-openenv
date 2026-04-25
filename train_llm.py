@@ -1,39 +1,90 @@
 """
-Inference Script — AI Sprint Manager Round 2 (Multi-Sprint Project Manager)
-============================================================================
-Key improvements over previous version:
-  - 3-retry backoff before rule-based fallback (was 1 try → immediate fallback)
-  - Batched LLM calls: only call LLM every N steps, reuse for simple repeats
-  - No repeated assignments: episode-level memory tracks assigned/in-progress tasks
-  - Smart fallback: instruction-aware, dep-aware, never repeats same failing action
-  - Rate-limit-aware: exponential back-off (1s, 2s, 4s) between retries
-  - Compact prompt: ~250 tokens (was ~350+), avoids hitting HF free-tier quota
+train_llm.py — Round 2 LLM Training with GRPO
+===============================================
+Trains Llama-3.1-8B (or Qwen2.5-1.5B) using GRPO on the sprint management
+environment. Uses curriculum learning:
+  Phase r1  : Single-sprint R1 tasks (10 steps each)    — warm up
+  Phase r2  : Multi-sprint R2 tasks (60 steps each)     — full project horizon
+  Phase both: Curriculum — alternates R1 and R2, 2:2 ratio (default)
 
-MANDATORY ENV VARS:
-    API_BASE_URL  : LLM endpoint  (e.g. https://router.huggingface.co/v1)
-    MODEL_NAME    : Model identifier
-    HF_TOKEN      : HuggingFace / API key
-    ENV_BASE_URL  : Running environment server
+Training method: GRPO (Group Relative Policy Optimisation) — NOT SFT.
+  - We do NOT use supervised fine-tuning (SFT) at all.
+  - GRPO directly optimises the policy using environment reward signals.
+  - The model generates action candidates, the environment scores them,
+    GRPO updates weights to prefer higher-reward completions.
+  - This is the same family as PPO but simpler: no value network needed.
+  - Reference: DeepSeek-R1 uses GRPO for RL training, which is why the
+    competition framing calls it "R1 inference".
 
-OUTPUT FORMAT (required by OpenEnv validator):
-    [START] printed once at episode start      — flush=True
-    [STEP]  printed after every step           — flush=True
-    [END]   printed once at episode end        — flush=True
+Reward design — see REWARD DESIGN section below.
 
-Run locally (no LLM — rule-based fallback):
-    python inference_r2.py
+Environment:
+  ENV_BASE_URL must point to a running server with BOTH R1 and R2 endpoints.
 
-Run with LLM:
-    HF_TOKEN=hf_... python inference_r2.py
+Run locally to verify (no GPU):
+    python train_llm.py --smoke-test
 
-SFT (supervised fine-tuning) — collect rule-based (prompt → JSON action) pairs:
-    python inference_r2.py --sft-collect --sft-out data/r2_sft.jsonl --sft-n 200
+Run on GPU (full training):
+    python train_llm.py --phase both --episodes 300 --output results/trained_model --push
 
-Optional in-process SFT warm-up (GPU + trl + unsloth/transformers required):
-    python inference_r2.py --sft-train --sft-out-dir results/sft_warmup --sft-n 200
+Required env vars:
+    HF_TOKEN       : HuggingFace token (read + write for push)
+    ENV_BASE_URL   : Running environment server
+    MODEL_NAME     : Base model (default: meta-llama/Llama-3.1-8B-Instruct)
+    HF_REPO_ID     : (optional) push trained model here after training
 
-Smoke test (no GPU / no LLM; needs live ENV_BASE_URL):
-    python inference_r2.py --smoke-test
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ REWARD DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+We use TWO complementary reward signals, both returned from the environment:
+
+1. STEP REWARD (dense, every step)
+   Returned directly from /step → result["reward"].
+   Defined in project_grader.py. Values typically in [-3, +2] range.
+   Examples:
+     +1.7  : assign a high-priority task correctly on first try
+     +1.1  : complete a task (task moves to done)
+     -0.05 : skip (opportunity cost)
+     -0.1  : redundant assign (task already in_progress)
+     -2.1  : end of sprint with task still incomplete (sprint miss penalty)
+     -2.45 : sprint boundary with tech debt accumulation
+
+   For GRPO we normalise this to [0, 1]:
+     normalised = clip((step_reward + 3.0) / 5.0, 0, 1)
+   The +3 shift centres the zero-reward case at 0.6 so GRPO doesn't
+   always see near-zero rewards (which causes training collapse).
+
+2. EPISODE REWARD (sparse, final step only)
+   Computed from final observation when done=True.
+   Formula (matches project_grader.py medium weights):
+     delivery_rate = tasks_completed / total_tasks
+     team_health   = max(0.01, 1.0 - tech_debt_count * 0.02)
+     final_score   = delivery_rate * 0.55
+                   + instruction_following_score * 0.30
+                   + team_health * 0.15
+   Clamped to [0.01, 0.99].
+
+3. INSTRUCTION FOLLOWING BONUS (injected into R2 reward)
+   obs["instruction_following_score"] is a running average of how often
+   the agent acted on active instructions when they became available.
+   We add this as an auxiliary reward component:
+     combined_r2 = step_norm * 0.6 + inst_score * 0.4
+   This gives the model a denser signal on instruction compliance
+   rather than waiting for the sparse end-of-sprint penalty.
+
+Why GRPO, not SFT?
+  - SFT would require labelled (observation, optimal_action) pairs.
+    We don't have those — there's no single "correct" action per step.
+  - GRPO generates multiple action candidates per prompt (num_generations=4),
+    evaluates each with the environment, and trains toward higher-reward ones.
+  - This is fundamentally RL, not imitation learning.
+
+Why NOT call the LLM during the reward function?
+  - The HF router rate-limits at ~10k tokens/minute on the free tier.
+  - Training with 4 generations × 200 examples = 800 completions × ~300 tokens
+    each = 240k tokens. This takes ~24 minutes at the free-tier rate.
+  - We use the environment's own reward signal — no external LLM calls needed.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 from __future__ import annotations
@@ -46,257 +97,121 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-import requests
-from dotenv import load_dotenv
+# ── Env config ────────────────────────────────────────────────────────────────
 
-load_dotenv()
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "dummy")
-MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
+HF_TOKEN     = os.getenv("HF_TOKEN", "")
+MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+HF_REPO_ID   = os.getenv("HF_REPO_ID", "")
 
-MAX_STEPS    = 60        # full 60-day project
-TEMPERATURE  = 0.15     # low: we want deterministic JSON not creative writing
-MAX_TOKENS   = 80       # action JSON is tiny — 80 tokens is plenty
-
-# Retry / rate-limit config
-MAX_RETRIES  = 3        # attempts before falling back to rule-based
-RETRY_DELAYS = [1, 2, 4]  # seconds between retries (exponential-ish)
-
-# LLM call batching: only call LLM every LLM_CALL_EVERY steps.
-# Between calls, repeat the last valid action if it worked, else fallback.
-# Set to 1 to call every step (best quality, most tokens).
-# Set to 2-3 to halve/third token usage (helps stay under HF free-tier quota).
-LLM_CALL_EVERY = 1  # call every step — adjust to 2 if rate limits are severe
-
-# Episode-level score shaping (client-side): strongly discourage skip / overload patterns
-SKIP_SCORE_PENALTY_PER_STEP   = 0.022   # subtract from blended raw per skip
-SKIP_SCORE_PENALTY_CAP        = 0.38
-OVERLOAD_SCORE_PENALTY_ASSIGN = 0.028  # per assign to a dev already ≥ OVERLOAD_LOAD_RATIO of capacity
-OVERLOAD_SCORE_PENALTY_CAP    = 0.32
-OVERLOAD_LOAD_RATIO           = 0.78   # load/capacity at or above this counts as overloaded partner
-
-TASKS = ["project_easy", "project_medium", "project_hard"]
-
-# SFT warm-up defaults (same spirit as train_llm.py SFT_CONFIG; LR tuned for small JSON completions)
-SFT_TRAIN_CONFIG: dict[str, Any] = {
-    "num_train_epochs": 2,
-    "per_device_train_batch_size": 1,
-    "gradient_accumulation_steps": 4,
-    "learning_rate": 2e-5,
-    "warmup_ratio": 0.05,
-    "logging_steps": 5,
-    "save_steps": 100,
+# ── GRPO hyperparameters ───────────────────────────────────────────────────────
+# Tuned for T4 (16GB). For A100, double batch sizes and num_generations.
+GRPO_CONFIG = {
+    "learning_rate":               5e-6,
+    "num_train_epochs":            1,
+    "per_device_train_batch_size": 2,   # → 1 if OOM on T4
+    "gradient_accumulation_steps": 4,   # effective batch = 8
+    "max_prompt_length":           1024,
+    "max_completion_length":       128,
+    "num_generations":             2,   # → 2 if OOM; must be ≥ 2
+    "temperature":                 0.8,
+    "beta":                        0.04,  # KL penalty (lower = more exploration)
+    "logging_steps":               5,
+    "save_steps":                  50,
+    "warmup_ratio":                0.08,
+    "seed":                        42,
 }
 
-_openai_client = None
+R1_TASKS = ["easy_sprint", "medium_sprint", "hard_sprint"]
+R2_TASKS = ["project_easy", "project_medium", "project_hard"]
+
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
 
 
-def _get_openai_client():
-    """Lazy import so --sft-collect / --help work without openai installed."""
-    global _openai_client
-    if _openai_client is None:
-        from openai import OpenAI
+# ── System prompts ────────────────────────────────────────────────────────────
+# Must match inference_r2.py exactly so training and inference use same format.
 
-        _openai_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    return _openai_client
-
-# ── System prompt ─────────────────────────────────────────────────────────────
-# Kept deliberately short. Every token in the system prompt burns quota.
-# Rules that matter: follow instructions, check deps, don't re-assign in_progress.
+R1_SYSTEM_PROMPT = """You are an expert Tech Lead managing an agile sprint.
+Each step output a JSON action with this exact schema:
+{"action_type":"<assign|reassign|reprioritize|unblock|skip>","task_id":"<id or null>","dev_id":"<id or null>","new_priority":<1-5 or null>}
+Rules:
+- assign: backlog task onto available developer (prefer skill match)
+- reassign: move in-progress task to different developer
+- reprioritize: change priority (1=highest)
+- unblock: only for BLOCKED tasks (not backlog)
+- skip: do nothing
+Output ONLY the JSON. No explanation."""
 
 R2_SYSTEM_PROMPT = """You are an Engineering Manager. Output ONLY a JSON action each step.
-
 Schema: {"action_type":"<assign|reassign|reprioritize|unblock|skip>","task_id":"<id or null>","dev_id":"<id or null>","new_priority":<1-5 or null>}
-
 Rules:
 - Follow ACTIVE INSTRUCTIONS first — assign their tasks immediately
 - Only assign BACKLOG tasks (not in_progress or done)
-- Only assign if deps marked ✓ and developer is available (✓)
-- NEVER overload one developer: pick whoever has the most headroom under capacity; do not assign if their load is already near capacity
+- Only assign if deps marked ✓ and developer is available
 - unblock: only for blocked tasks
-- skip is catastrophic for delivery and scores — use ONLY when literally no assign/unblock/reprioritize is legal
-
+- skip: last resort
 Output ONLY the JSON. No explanation."""
 
 
-# ── Prompt builder ─────────────────────────────────────────────────────────────
+# ── Smart rule-based fallback ─────────────────────────────────────────────────
 
-def build_user_prompt(obs: dict, assigned_this_episode: set) -> str:
-    """
-    Compact per-step prompt. Target: under 250 tokens.
-    Shows only actionable backlog tasks (deps met, not already assigned this episode).
-    """
-    current_day    = obs["current_day"]
-    current_sprint = obs.get("current_sprint", 1)
-    days_left      = max(0, current_sprint * 10 - current_day + 1)
-
-    tasks    = obs["tasks"]
-    done_ids = {t["id"] for t in tasks if t["status"] == "done"}
-
-    # Active unfollowed instructions — top 2 only to save tokens
-    active_insts = [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)]
-    if active_insts:
-        inst_lines = " | ".join(
-            f"[{i['id']}] {i['text'][:45]}" for i in active_insts[:2]
-        )
-        inst_section = f"⚡FOLLOW: {inst_lines}"
-    else:
-        inst_section = "No instructions."
-
-    # Tech debt — just count
-    debt_count = len(obs.get("tech_debt", []))
-    debt_str   = f"debt={debt_count}" if debt_count else "debt=0"
-
-    # Backlog tasks — only actionable ones (deps met), exclude already-assigned
+def smart_fallback_r1(obs: dict) -> dict:
+    """R1 rule-based policy: assign highest-priority backlog task with skill match."""
+    tasks  = obs.get("tasks", [])
+    devs   = obs.get("developers", [])
+    avail  = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"]]
     backlog = sorted(
         [t for t in tasks if t["status"] == "backlog"],
-        key=lambda t: (t["priority"], t["deadline"])
+        key=lambda t: (t["priority"], t.get("deadline", 99))
     )
-
-    def fmt(t: dict) -> str:
-        deps = t.get("metadata", {}).get("depends_on", [])
-        dep_ok = "✓" if all(d in done_ids for d in deps) else "✗"
-        already = "★" if t["id"] in assigned_this_episode else ""
-        return f"[{t['id']}]P{t['priority']} {t['required_skill'][:4]} {dep_ok}{already} D{t['deadline']}"
-
-    # Prioritise: actionable (✓ deps, not already assigned), then rest
-    actionable = [t for t in backlog
-                  if all(d in done_ids for d in t.get("metadata", {}).get("depends_on", []))
-                  and t["id"] not in assigned_this_episode]
-    blocked_deps = [t for t in backlog if t not in actionable]
-
-    shown = actionable[:5] + blocked_deps[:2]
-    backlog_str = " ".join(fmt(t) for t in shown)
-    if len(backlog) > len(shown):
-        backlog_str += f" +{len(backlog)-len(shown)}"
-
-    in_prog = [t for t in tasks if t["status"] == "in_progress"]
-    inprog_str = " ".join(f"[{t['id']}]→{t['assigned_to']}" for t in in_prog) or "none"
-
-    # Developers — available ones first
-    avail_devs = [d for d in obs["developers"] if d["is_available"]]
-    busy_devs  = [d for d in obs["developers"] if not d["is_available"]]
-    def fmt_dev(d):
-        return f"[{d['id']}]{d['name'][:4]}({d['skill'][:3]}) {d['current_load']}/{d['capacity']}"
-    devs_str = " ".join(fmt_dev(d) for d in avail_devs)
-    if busy_devs:
-        devs_str += " BUSY:" + " ".join(fmt_dev(d) for d in busy_devs)
-
-    return (
-        f"D{current_day}/60 S{current_sprint}/6 {days_left}d "
-        f"done={obs['tasks_completed']} miss={obs['tasks_missed']} "
-        f"inst={obs.get('instruction_following_score',0):.2f} {debt_str}\n"
-        f"{inst_section}\n"
-        f"BACKLOG(✓=ok ★=assigned): {backlog_str}\n"
-        f"IN_PROG: {inprog_str}\n"
-        f"DEVS(avail): {devs_str}\n"
-        f"PENALTY_HINT: skip and overload(assign to nearly-full dev) tank score heavily.\n"
-        f"JSON:"
-    )
+    for task in backlog:
+        skill = task.get("required_skill", "")
+        match = [d for d in avail if d["skill"] == skill or d["skill"] == "fullstack"]
+        dev   = match[0] if match else (avail[0] if avail else None)
+        if dev:
+            return {"action_type": "assign", "task_id": task["id"],
+                    "dev_id": dev["id"], "new_priority": None}
+    return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
 
-# ── Environment HTTP helpers ───────────────────────────────────────────────────
-
-def call_env(endpoint: str, payload: Optional[dict] = None, method: str = "POST") -> dict:
-    url = f"{ENV_BASE_URL}/project/{endpoint}"
-    if method == "GET":
-        resp = requests.get(url, timeout=60)
-    else:
-        resp = requests.post(url, json=payload or {}, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def unwrap_observation(data: dict) -> dict:
-    """Reset/step payloads may nest state under 'observation'."""
-    obs = data.get("observation")
-    if isinstance(obs, dict):
-        return obs
-    return data
-
-
-def dev_headroom(d: dict) -> int:
-    """Integer slots left before hard capacity (uses remaining_capacity when present)."""
-    cap = int(d.get("capacity", 5) or 5)
-    load = int(d.get("current_load", 0) or 0)
-    rem = d.get("remaining_capacity")
-    if rem is not None:
-        try:
-            return max(0, int(rem))
-        except (TypeError, ValueError):
-            pass
-    return max(0, cap - load)
-
-
-def dev_is_overloaded(d: dict, ratio: float = OVERLOAD_LOAD_RATIO) -> bool:
-    """True when current_load already consumes ≥ ratio of nominal capacity."""
-    cap = int(d.get("capacity", 5) or 5)
-    if cap <= 0:
-        return False
-    load = int(d.get("current_load", 0) or 0)
-    return (load / cap) >= ratio
-
-
-def pick_least_loaded_dev(candidates: list) -> Optional[dict]:
-    """Prefer max headroom, then min current_load (spread work; avoid overload)."""
-    if not candidates:
-        return None
-    return max(
-        candidates,
-        key=lambda d: (dev_headroom(d), -int(d.get("current_load", 0) or 0)),
-    )
-
-
-# ── Rule-based fallback ────────────────────────────────────────────────────────
-
-def get_rule_based_action(obs: dict, assigned_this_episode: set,
-                          last_failed_task: Optional[str] = None) -> dict:
+def smart_fallback_r2(obs: dict, assigned_set: Optional[set] = None) -> dict:
     """
-    Deterministic fallback. Priority:
-    1. Active instruction's tasks (if deps met, not already assigned)
-    2. Highest-priority backlog (deps met, not already assigned, not last failed)
-    3. Unblock genuinely blocked tasks
-    4. Skip
+    R2 rule-based policy. Respects:
+    - Active instructions (assign their tasks first, by target_sprint order)
+    - Dependency chains (only assign when deps are done)
+    - Skill matching
+    - assigned_set: don't re-assign tasks already assigned this episode
     """
+    if assigned_set is None:
+        assigned_set = set()
+
     tasks     = obs.get("tasks", [])
     devs      = obs.get("developers", [])
     done_ids  = {t["id"] for t in tasks if t["status"] == "done"}
-    # Strict capacity: never treat 2× capacity as "available" (that caused overload).
-    available = [
-        d for d in devs
-        if d.get("is_available", False) and dev_headroom(d) > 0
-    ]
+    available = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"] * 2]
 
     def best_dev(task: dict):
-        skill_match = [
-            d for d in available
-            if d["skill"] == task["required_skill"] or d["skill"] == "fullstack"
-        ]
-        pool = skill_match if skill_match else available
-        return pick_least_loaded_dev(pool)
+        skill = task.get("required_skill", "")
+        match = [d for d in available if d["skill"] == skill or d["skill"] == "fullstack"]
+        return match[0] if match else (available[0] if available else None)
 
     def can_assign(task: dict) -> bool:
         if task["status"] != "backlog":
             return False
-        if task["id"] in assigned_this_episode:
-            return False
-        if task["id"] == last_failed_task:
+        if task["id"] in assigned_set:
             return False
         deps = task.get("metadata", {}).get("depends_on", [])
         return all(d in done_ids for d in deps)
 
     skip = {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
-    # 1. Instructions first
-    active_insts = sorted(
+    # 1. Follow active instructions
+    active = sorted(
         [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)],
         key=lambda i: i.get("target_sprint", 99)
     )
-    for inst in active_insts:
+    for inst in active:
         for tid in inst.get("affects_tasks", []):
             task = next((t for t in tasks if t["id"] == tid), None)
             if task and can_assign(task):
@@ -305,10 +220,10 @@ def get_rule_based_action(obs: dict, assigned_this_episode: set,
                     return {"action_type": "assign", "task_id": task["id"],
                             "dev_id": dev["id"], "new_priority": None}
 
-    # 2. Highest-priority backlog (deps met)
+    # 2. Highest-priority backlog with deps met
     backlog = sorted(
         [t for t in tasks if t["status"] == "backlog"],
-        key=lambda t: (t["priority"], t["deadline"])
+        key=lambda t: (t["priority"], t.get("deadline", 99))
     )
     for task in backlog:
         if can_assign(task):
@@ -328,83 +243,34 @@ def get_rule_based_action(obs: dict, assigned_this_episode: set,
     return skip
 
 
-def rule_based_would_skip(obs: dict, assigned_this_episode: set,
-                          last_failed_task: Optional[str]) -> bool:
-    """True only when deterministic policy would also skip (no productive work)."""
-    a = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
-    return a.get("action_type") == "skip"
-
-
-def resolve_action_avoid_skip_and_overload(
-    obs: dict,
-    action: dict,
-    assigned_this_episode: set,
-    last_failed_task: Optional[str],
-) -> dict:
-    """
-    If the model skips while work exists, or assigns onto an overloaded dev,
-    replace with rule-based action (same policy as fallback).
-    """
-    devs = obs.get("developers", [])
-
-    if action.get("action_type") == "skip":
-        if not rule_based_would_skip(obs, assigned_this_episode, last_failed_task):
-            return get_rule_based_action(obs, assigned_this_episode, last_failed_task)
-        return action
-
-    if action.get("action_type") in ("assign", "reassign") and action.get("dev_id"):
-        dev = next((d for d in devs if d.get("id") == action.get("dev_id")), None)
-        if dev is None or dev_headroom(dev) <= 0 or dev_is_overloaded(dev):
-            return get_rule_based_action(obs, assigned_this_episode, last_failed_task)
-
-    return action
-
-
-# ── JSON parser ────────────────────────────────────────────────────────────────
+# ── Action parser ─────────────────────────────────────────────────────────────
 
 _VALID_ACTIONS = {"assign", "reassign", "reprioritize", "skip", "unblock"}
-_NULL_STRINGS  = {"null", "none", "None", "Null", "", "undefined", "N/A", "n/a"}
+_NULL_STRINGS  = {"null", "none", "None", "Null", "", "undefined", "N/A"}
 
 
-def parse_action(text: str) -> dict:
-    """
-    Parse LLM output into a clean action dict.
-    Handles: markdown fences, "null" strings, sprint_plan, missing fields.
-    """
+def _parse_action(text: str) -> dict:
     text = text.strip()
-
-    # Strip markdown code fences
     if "```" in text:
-        lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
-        text  = "\n".join(lines).strip()
-
+        text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
     d = None
     try:
         d = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end   = text.rfind("}") + 1
-        if start >= 0 and end > start:
+    except Exception:
+        s, e = text.find("{"), text.rfind("}") + 1
+        if s >= 0 and e > s:
             try:
-                d = json.loads(text[start:end])
-            except json.JSONDecodeError:
+                d = json.loads(text[s:e])
+            except Exception:
                 pass
-
     if d is None:
         return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
-    # Normalise action_type
     raw = str(d.get("action_type", "skip")).lower().strip()
-    if raw not in _VALID_ACTIONS:
-        raw = "skip"
-    d["action_type"] = raw
-
-    # Convert "null" strings → None
+    d["action_type"] = raw if raw in _VALID_ACTIONS else "skip"
     for key in ("task_id", "dev_id", "new_priority"):
         if str(d.get(key, "")).strip() in _NULL_STRINGS:
             d[key] = None
-
-    # new_priority → int
     if d.get("new_priority") is not None:
         try:
             d["new_priority"] = int(d["new_priority"])
@@ -413,7 +279,6 @@ def parse_action(text: str) -> dict:
         except (ValueError, TypeError):
             d["new_priority"] = None
 
-    # Demote invalid actions → skip
     atype = d["action_type"]
     if atype in ("assign", "reassign") and (not d.get("task_id") or not d.get("dev_id")):
         d["action_type"] = "skip"
@@ -422,134 +287,281 @@ def parse_action(text: str) -> dict:
     if atype == "unblock" and not d.get("task_id"):
         d["action_type"] = "skip"
 
-    return {
-        "action_type":  d["action_type"],
-        "task_id":      d.get("task_id"),
-        "dev_id":       d.get("dev_id"),
-        "new_priority": d.get("new_priority"),
-    }
+    return {"action_type": d["action_type"], "task_id": d.get("task_id"),
+            "dev_id": d.get("dev_id"), "new_priority": d.get("new_priority")}
 
 
-# ── SFT: supervised dataset + optional TRL warm-up ───────────────────────────
-# Pairs (R2_SYSTEM_PROMPT + build_user_prompt, rule-based JSON) teach format +
-# reasonable policy before RL-style methods (see train_llm.py).
+# ── Prompt builders ───────────────────────────────────────────────────────────
 
-
-def action_to_sft_completion(action: dict) -> str:
-    """Target string for SFT: one compact JSON object per line."""
-    return json.dumps(
-        {
-            "action_type": action.get("action_type", "skip"),
-            "task_id": action.get("task_id"),
-            "dev_id": action.get("dev_id"),
-            "new_priority": action.get("new_priority"),
-        },
-        separators=(",", ":"),
+def _build_r1_prompt(obs: dict) -> str:
+    tasks_summary = "\n".join(
+        f"  [{t['id']}] {t['name']} | P{t['priority']} | effort={t['effort']} "
+        f"| due=Day{t['deadline']} | status={t['status']} | dev={t['assigned_to']}"
+        for t in obs["tasks"]
+    )
+    devs_summary = "\n".join(
+        f"  [{d['id']}] {d['name']} | skill={d['skill']} "
+        f"| load={d['current_load']}/{d['capacity']} | avail={d['is_available']}"
+        for d in obs["developers"]
+    )
+    return (
+        f"Day: {obs['current_day']}/{obs['sprint_length']}\n"
+        f"Done:{obs['tasks_completed']} Missed:{obs['tasks_missed']} "
+        f"InProgress:{obs['tasks_in_progress']} Backlog:{obs['tasks_backlog']}\n"
+        f"Cumulative Reward: {obs['cumulative_reward']:.2f}\n\n"
+        f"TASKS:\n{tasks_summary}\n\nDEVELOPERS:\n{devs_summary}\n\n"
+        f"Output your JSON action:"
     )
 
 
-def build_sft_chat_example(user_text: str, completion_json: str) -> dict:
-    """TRL-compatible row: chat messages + assistant completion."""
-    return {
-        "prompt": [
-            {"role": "system", "content": R2_SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
-        ],
-        "completion": completion_json,
-    }
+def _build_r2_prompt(obs: dict) -> str:
+    """Compact R2 prompt matching inference_r2.py format."""
+    current_sprint = obs.get("current_sprint", 1)
+    current_day    = obs.get("current_day", 1)
+    days_left      = max(0, current_sprint * 10 - current_day + 1)
+    tasks     = obs.get("tasks", [])
+    done_ids  = {t["id"] for t in tasks if t["status"] == "done"}
+
+    active_insts = [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)]
+    inst_section = (
+        "⚡FOLLOW: " + " | ".join(f"[{i['id']}] {i['text'][:45]}" for i in active_insts[:2])
+    ) if active_insts else "No instructions."
+
+    debt_count = len(obs.get("tech_debt", []))
+    backlog = sorted([t for t in tasks if t["status"] == "backlog"],
+                     key=lambda t: (t["priority"], t.get("deadline", 99)))
+    in_prog = [t for t in tasks if t["status"] == "in_progress"]
+
+    def fmt(t):
+        deps = t.get("metadata", {}).get("depends_on", [])
+        dep_ok = "✓" if all(d in done_ids for d in deps) else "✗"
+        return f"[{t['id']}]P{t['priority']} {t['required_skill'][:4]} {dep_ok} D{t.get('deadline','?')}"
+
+    backlog_str = " ".join(fmt(t) for t in backlog[:6])
+    if len(backlog) > 6:
+        backlog_str += f" +{len(backlog)-6}"
+    inprog_str  = " ".join(f"[{t['id']}]→{t['assigned_to']}" for t in in_prog) or "none"
+    avail_devs  = [d for d in obs["developers"] if d["is_available"]]
+    devs_str    = " ".join(
+        f"[{d['id']}]{d['name'][:4]}({d['skill'][:3]}) {d['current_load']}/{d['capacity']}"
+        for d in avail_devs
+    )
+
+    return (
+        f"D{current_day}/60 S{current_sprint}/6 {days_left}d "
+        f"done={obs['tasks_completed']} miss={obs['tasks_missed']} "
+        f"inst={obs.get('instruction_following_score',0):.2f} debt={debt_count}\n"
+        f"{inst_section}\n"
+        f"BACKLOG(✓=deps_ok): {backlog_str}\n"
+        f"IN_PROG: {inprog_str}\n"
+        f"DEVS(avail): {devs_str}\n"
+        f"JSON:"
+    )
 
 
-def collect_r2_sft_examples(
-    n_target: int = 200,
-    *,
-    min_record_step: int = 3,
-    max_record_step: int = 12,
-    max_steps_per_episode: int = 60,
-    seed_base: int = 1000,
-    scenarios: Optional[list[str]] = None,
-) -> list[dict]:
+# ── GRPO reward functions ─────────────────────────────────────────────────────
+#
+# IMPORTANT: We do NOT call any LLM inside these reward functions.
+# We use the environment's own reward signal exclusively.
+# This avoids the HF router rate-limit problem entirely.
+#
+# How GRPO works:
+#   1. Trainer samples `num_generations` completions from the model for each prompt.
+#   2. Each completion is an action JSON string.
+#   3. We parse the action, call /step on the environment, get a reward.
+#   4. GRPO normalises rewards within the group and computes a policy gradient loss.
+#   5. Model weights update to prefer completions with above-average reward.
+#
+# The reward functions below are called by GRPOTrainer for each (prompt, completion) pair.
+
+def make_reward_fn(env_base_url: str, phase: str):
     """
-    Roll the live R2 env using only get_rule_based_action; record (prompt, completion).
+    Returns a GRPO reward function that evaluates completions against the live env.
 
-    Only steps in [min_record_step, max_record_step] are written (per-episode window)
-    so the set is not dominated by trivial early states (same motivation as train_llm
-    sampling mid-episode).
+    Reward normalisation:
+      R1: normalised = clip((step_reward + 3.0) / 5.0, 0, 1)
+          step_reward range is roughly [-3, +2]. Shift by +3, divide by 5.
+          This maps: -3→0, 0→0.6, 2→1.0
+
+      R2: combined = step_norm * 0.6 + inst_score * 0.4
+          Blends step reward with instruction-following signal.
+          This makes instruction compliance a first-class training objective.
     """
-    scenarios = scenarios or list(TASKS)
-    examples: list[dict] = []
-    per_task = max(1, (n_target + len(scenarios) - 1) // len(scenarios))
+    import requests
+    episode_counter = [0]
 
-    for task_name in scenarios:
-        for ep in range(per_task):
-            if len(examples) >= n_target:
-                print(f"  [SFT] Collected {len(examples)} examples (target {n_target})", flush=True)
-                return examples
+    def call(endpoint: str, payload: dict, base: str = env_base_url) -> dict:
+        resp = requests.post(f"{base}/{endpoint}", json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    def reward_fn(prompts, completions, **kwargs) -> list[float]:
+        rewards = []
+        for prompt, completion in zip(prompts, completions):
+            episode_counter[0] += 1
+            n = episode_counter[0]
+
+            # Curriculum: R1 for first 2 of every 4 steps, R2 for last 2
+            if phase == "r1":
+                use_r2 = False
+            elif phase == "r2":
+                use_r2 = True
+            else:  # both
+                use_r2 = (n % 4 >= 2)
+
+            action = _parse_action(completion)
+
             try:
-                raw = call_env("reset", {"task_name": task_name, "seed": seed_base + ep})
-                obs = unwrap_observation(raw)
-                assigned: set[str] = set()
-                last_failed: Optional[str] = None
-                for step_i in range(1, max_steps_per_episode + 1):
+                if not use_r2:
+                    task = R1_TASKS[n % len(R1_TASKS)]
+                    obs  = call("reset", {"task_name": task, "seed": n})
+                    result = requests.post(
+                        f"{env_base_url}/step",
+                        json={"action": action}, timeout=30
+                    ).json()
+                    step_r = float(result.get("reward", 0.0))
+                    # Normalise R1 reward to [0,1]
+                    r = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
+                else:
+                    task = R2_TASKS[n % len(R2_TASKS)]
+                    obs  = call("project/reset", {"task_name": task, "seed": n})
+                    result = requests.post(
+                        f"{env_base_url}/project/step",
+                        json={"action": action}, timeout=30
+                    ).json()
+                    step_r     = float(result.get("reward", 0.0))
+                    obs2       = result.get("observation", {})
+                    inst_score = float(obs2.get("instruction_following_score", 0.5))
+                    step_norm  = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
+                    # Blend: step quality + instruction compliance
+                    r = step_norm * 0.6 + inst_score * 0.4
+            except Exception as e:
+                # Env call failed — give a neutral reward, don't crash training
+                print(f"[WARN] reward_fn env call failed: {e}", flush=True)
+                r = 0.3  # slightly below average so bad actions don't get free pass
+
+            rewards.append(float(r))
+        return rewards
+
+    return reward_fn
+
+
+# ── Dataset builder ───────────────────────────────────────────────────────────
+#
+# We collect observation snapshots using our smart rule-based policy.
+# This gives us diverse, realistic game states for GRPO to train on.
+# The LLM is NOT called here — only the rule-based policy advances the game.
+#
+# Why not call LLM here?
+#   - Each LLM call costs tokens against the HF rate limit.
+#   - Dataset collection for 300 examples × 6 steps = 1800 rule-based steps.
+#   - Rule-based is deterministic, fast, and free of rate limits.
+
+def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
+    """
+    Build a HuggingFace Dataset of (system, user) chat prompt pairs.
+    Each example is an observation snapshot from a rule-based episode.
+    """
+    try:
+        from datasets import Dataset
+    except ImportError:
+        print("[ERROR] datasets not installed. Run: pip install datasets", flush=True)
+        sys.exit(1)
+
+    import requests
+
+    def call_r1(endpoint: str, payload: dict) -> dict:
+        r = requests.post(f"{ENV_BASE_URL}/{endpoint}", json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def call_r2(endpoint: str, payload: dict) -> dict:
+        r = requests.post(f"{ENV_BASE_URL}/project/{endpoint}", json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    examples = []
+    tasks_r1 = R1_TASKS if phase in ("r1", "both") else []
+    tasks_r2 = R2_TASKS if phase in ("r2", "both") else []
+    per_task = max(1, n_examples // max(1, len(tasks_r1) + len(tasks_r2)))
+
+    # ── Collect R1 snapshots ──────────────────────────────────────────────────
+    for task_name in tasks_r1:
+        print(f"  [DATASET] Collecting R1 {task_name} × {per_task} episodes...", flush=True)
+        for ep in range(per_task):
+            try:
+                obs = call_r1("reset", {"task_name": task_name, "seed": ep})
+                for step in range(6):   # sample 6 states per episode
                     if obs.get("done", False):
                         break
-                    user_text    = build_user_prompt(obs, assigned)
-                    action       = get_rule_based_action(obs, assigned, last_failed)
-                    completion   = action_to_sft_completion(action)
-                    if min_record_step <= step_i <= max_record_step:
-                        examples.append(build_sft_chat_example(user_text, completion))
-                        if len(examples) >= n_target:
-                            print(
-                                f"  [SFT] Collected {len(examples)} examples (target {n_target})",
-                                flush=True,
-                            )
-                            return examples
-                    if action["action_type"] == "assign" and action.get("task_id"):
-                        assigned.add(action["task_id"])
-                    result = call_env("step", {"action": action})
-                    obs    = unwrap_observation(result)
-                    reward = float(result.get("reward", 0.0))
-                    if reward < -0.5 and action.get("task_id"):
-                        last_failed = action["task_id"]
-                    elif reward > 0:
-                        last_failed = None
+                    prompt = _build_r1_prompt(obs)
+                    examples.append({
+                        "prompt": [
+                            {"role": "system", "content": R1_SYSTEM_PROMPT},
+                            {"role": "user",   "content": prompt},
+                        ],
+                    })
+                    action = smart_fallback_r1(obs)
+                    result = requests.post(
+                        f"{ENV_BASE_URL}/step", json={"action": action}, timeout=30
+                    ).json()
+                    obs = result["observation"]
                     if result.get("done", False):
                         break
             except Exception as e:
-                print(f"  [WARN] SFT collect task={task_name} ep={ep}: {e}", flush=True)
+                print(f"  [WARN] R1 episode {ep} failed: {e}", flush=True)
 
-    print(f"  [SFT] Collected {len(examples)} examples (target {n_target})", flush=True)
-    return examples
+    # ── Collect R2 snapshots ──────────────────────────────────────────────────
+    for task_name in tasks_r2:
+        print(f"  [DATASET] Collecting R2 {task_name} × {per_task} episodes...", flush=True)
+        assigned_set: set[str] = set()
+        for ep in range(per_task):
+            try:
+                obs = call_r2("reset", {"task_name": task_name, "seed": ep})
+                assigned_set.clear()
+                for step in range(8):   # 8 states: covers first instruction release (usually day 3-5)
+                    if obs.get("done", False):
+                        break
+                    prompt = _build_r2_prompt(obs)
+                    examples.append({
+                        "prompt": [
+                            {"role": "system", "content": R2_SYSTEM_PROMPT},
+                            {"role": "user",   "content": prompt},
+                        ],
+                    })
+                    action = smart_fallback_r2(obs, assigned_set)
+                    if action["action_type"] == "assign" and action.get("task_id"):
+                        assigned_set.add(action["task_id"])
+                    result = requests.post(
+                        f"{ENV_BASE_URL}/project/step",
+                        json={"action": action}, timeout=30
+                    ).json()
+                    obs = result["observation"]
+                    if result.get("done", False):
+                        break
+            except Exception as e:
+                print(f"  [WARN] R2 episode {ep} failed: {e}", flush=True)
+
+    print(f"  [DATASET] Total examples: {len(examples)}", flush=True)
+    return Dataset.from_list(examples)
 
 
-def save_sft_jsonl(path: str | Path, rows: list[dict]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"  [SFT] Wrote {len(rows)} rows → {path}", flush=True)
+# ── Model loader ───────────────────────────────────────────────────────────────
 
-
-def _sft_row_to_text(row: dict) -> dict:
-    parts = []
-    for msg in row["prompt"]:
-        parts.append(f"<|{msg['role']}|>\n{msg['content']}")
-    parts.append(f"<|assistant|>\n{row['completion']}")
-    return {"text": "\n".join(parts)}
-
-
-def _load_model_for_sft(model_name: str):
-    """Prefer Unsloth 4-bit + LoRA; fall back to transformers + PEFT."""
-    token = os.getenv("HF_TOKEN") or None
+def load_model_and_tokenizer(model_name: str):
+    """
+    Load model with Unsloth 4-bit QLoRA. Falls back to HF+PEFT if Unsloth unavailable.
+    LoRA targets all attention + FFN projection layers for maximum coverage.
+    """
     try:
         from unsloth import FastLanguageModel
-
+        print(f"[INFO] Loading {model_name} with Unsloth 4-bit QLoRA...", flush=True)
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
-            token=token,
+            token=HF_TOKEN or None,
         )
         model = FastLanguageModel.get_peft_model(
             model,
@@ -562,578 +574,231 @@ def _load_model_for_sft(model_name: str):
             use_gradient_checkpointing="unsloth",
             random_state=42,
         )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[INFO] Unsloth model loaded. Trainable params: {n_trainable:,}", flush=True)
         return model, tokenizer, "unsloth"
     except ImportError:
-        pass
-
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from peft import LoraConfig, TaskType, get_peft_model
-
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb,
-        device_map="auto",
-        token=token,
-    )
-    peft_cfg = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        task_type=TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, peft_cfg)
-    return model, tokenizer, "hf_peft"
+        print("[WARN] Unsloth not available. Falling back to HF + PEFT.", flush=True)
+        return _load_hf_model(model_name)
 
 
-def run_sft_trainer(
-    output_dir: str | Path,
-    n_examples: int = 200,
-    *,
-    min_step: int = 3,
-    max_step: int = 12,
-    model_name: Optional[str] = None,
-) -> None:
-    """
-    Collect trajectories from ENV_BASE_URL, then run TRL SFTTrainer when installed.
-    On missing GPU stack, still writes JSONL for offline training (e.g. train_llm.py).
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dataset_path = output_dir / "sft_dataset.jsonl"
-
-    rows = collect_r2_sft_examples(
-        n_target=n_examples,
-        min_record_step=min_step,
-        max_record_step=max_step,
-    )
-    if not rows:
-        print("[SFT] No examples collected — aborting.", flush=True)
-        return
-    save_sft_jsonl(dataset_path, rows)
-
+def _load_hf_model(model_name: str):
     try:
-        from datasets import Dataset
-        from trl import SFTConfig, SFTTrainer
-    except ImportError as e:
-        print(
-            f"[SFT] Saved dataset only. For in-process training install datasets+trl: {e}",
-            flush=True,
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from peft import get_peft_model, LoraConfig, TaskType
+        import torch
+
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
         )
-        return
-
-    mname = model_name or MODEL_NAME
-    try:
-        model, tokenizer, backend = _load_model_for_sft(mname)
-        print(f"[SFT] Loaded {mname} via {backend}", flush=True)
-    except Exception as e:
-        print(f"[SFT] Model load failed ({e}). Dataset: {dataset_path}", flush=True)
-        return
-
-    ds     = Dataset.from_list(rows).map(_sft_row_to_text)
-    sft_hf = str(output_dir / "sft_warmup_hf")
-    cfg    = SFTConfig(
-        output_dir=sft_hf,
-        dataset_text_field="text",
-        max_seq_length=1024,
-        report_to="none",
-        **SFT_TRAIN_CONFIG,
-    )
-    trainer = SFTTrainer(
-        model=model,
-        processing_class=tokenizer,
-        train_dataset=ds,
-        args=cfg,
-    )
-    trainer.train()
-    print(f"[SFT] Warm-up complete → {sft_hf}", flush=True)
-
-
-# ── LLM call with retry ────────────────────────────────────────────────────────
-
-def call_llm(obs: dict, assigned_this_episode: set, step_num: int) -> tuple[str, bool]:
-    """
-    Call LLM with up to MAX_RETRIES retries and exponential backoff.
-    Returns (response_text, used_llm: bool).
-    If all retries fail, returns ("", False) — caller uses rule-based fallback.
-    """
-    prompt = build_user_prompt(obs, assigned_this_episode)
-    messages_sys = [
-        {"role": "system", "content": R2_SYSTEM_PROMPT},
-        {"role": "user",   "content": prompt},
-    ]
-    messages_usr = [
-        {"role": "user", "content": f"{R2_SYSTEM_PROMPT}\n\n{prompt}"},
-    ]
-
-    last_err = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            # First attempt: system+user. Subsequent: merged (some endpoints reject system role)
-            msgs = messages_sys if attempt == 0 else messages_usr
-            completion = _get_openai_client().chat.completions.create(
-                model=MODEL_NAME,
-                messages=msgs,
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-            )
-            return completion.choices[0].message.content or "", True
-
-        except Exception as e:
-            last_err = e
-            err_name = type(e).__name__
-            if attempt < MAX_RETRIES - 1:
-                wait = RETRY_DELAYS[attempt]
-                print(
-                    f"[WARN] LLM attempt {attempt+1}/{MAX_RETRIES} failed "
-                    f"({err_name}), retrying in {wait}s...",
-                    flush=True,
-                )
-                time.sleep(wait)
-            else:
-                print(
-                    f"[WARN] LLM unavailable after {MAX_RETRIES} attempts "
-                    f"({err_name}), using rule-based fallback",
-                    flush=True,
-                )
-
-    return "", False
-
-
-# ── Episode runner ─────────────────────────────────────────────────────────────
-
-def run_episode(task_name: str) -> float:
-    """
-    Run one complete 60-day episode and return the final project score.
-
-    Episode-level state:
-      assigned_this_episode: set of task IDs the LLM has chosen to assign.
-        Prevents the agent looping on the same in_progress task.
-      last_failed_task: most recent task that triggered a negative reward
-        (used by fallback to avoid repeating the same mistake).
-      llm_fail_streak: consecutive steps where LLM was unavailable.
-        After 5+ consecutive failures we switch entirely to rule-based
-        for the rest of the episode to stop burning retry time.
-
-    Emits [START], [STEP]×N, [END] to stdout with flush=True.
-    """
-    print(f"[START] task={task_name}", flush=True)
-
-    obs = unwrap_observation(call_env("reset", {"task_name": task_name, "seed": 42}))
-    final_score = 0.01
-
-    # ── Episode memory ────────────────────────────────────────────────────────
-    assigned_this_episode: set[str] = set()   # tasks we've sent assign for
-    last_failed_task: Optional[str] = None    # last task that got negative reward
-    llm_fail_streak: int            = 0       # consecutive LLM failures
-    LLM_ABANDON_AFTER               = 5       # give up on LLM after this many consecutive failures
-    episode_skip_steps              = 0
-    episode_overload_assign_steps   = 0
-
-    step_num = 0
-    for step_num in range(1, MAX_STEPS + 1):
-        if obs.get("done", False):
-            break
-
-        # ── Choose action ─────────────────────────────────────────────────────
-        use_llm = (llm_fail_streak < LLM_ABANDON_AFTER)
-
-        # Optional batching: only call LLM every LLM_CALL_EVERY steps
-        # (set LLM_CALL_EVERY = 1 to always call)
-        should_call = (step_num % LLM_CALL_EVERY == 1 or LLM_CALL_EVERY == 1)
-
-        if use_llm and should_call:
-            response_text, llm_ok = call_llm(obs, assigned_this_episode, step_num)
-            if llm_ok:
-                llm_fail_streak = 0
-                action = parse_action(response_text)
-
-                # ── Validate LLM action and override if needed ────────────────
-                # If LLM tries to assign a task that's already in_progress or done,
-                # override with smart fallback
-                if action["action_type"] == "assign" and action.get("task_id"):
-                    tid    = action["task_id"]
-                    t_info = next((t for t in obs["tasks"] if t["id"] == tid), None)
-                    if t_info and t_info["status"] != "backlog":
-                        # Task is in_progress/done — LLM is looping, override
-                        action = get_rule_based_action(
-                            obs, assigned_this_episode, last_failed_task
-                        )
-                action = resolve_action_avoid_skip_and_overload(
-                    obs, action, assigned_this_episode, last_failed_task
-                )
-            else:
-                llm_fail_streak += 1
-                action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
-                action = resolve_action_avoid_skip_and_overload(
-                    obs, action, assigned_this_episode, last_failed_task
-                )
-        else:
-            # Either LLM abandoned or between batch intervals
-            action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
-            action = resolve_action_avoid_skip_and_overload(
-                obs, action, assigned_this_episode, last_failed_task
-            )
-
-        # Penalty accounting (pre-step state)
-        if action.get("action_type") == "skip":
-            episode_skip_steps += 1
-        if action.get("action_type") in ("assign", "reassign") and action.get("dev_id"):
-            _d = next(
-                (d for d in obs.get("developers", []) if d.get("id") == action.get("dev_id")),
-                None,
-            )
-            if _d is not None and dev_is_overloaded(_d):
-                episode_overload_assign_steps += 1
-
-        # Track assigned tasks to avoid re-assigning
-        if action["action_type"] == "assign" and action.get("task_id"):
-            assigned_this_episode.add(action["task_id"])
-
-        # ── Call environment ──────────────────────────────────────────────────
-        result = call_env("step", {"action": action})
-        obs    = unwrap_observation(result)
-        reward = result["reward"]
-        done   = result["done"]
-
-        # Track which task just failed (for fallback to avoid)
-        if reward < -0.5 and action.get("task_id"):
-            last_failed_task = action["task_id"]
-        elif reward > 0:
-            last_failed_task = None  # reset on success
-
-        # ── [STEP] ────────────────────────────────────────────────────────────
-        print(
-            f"[STEP] task={task_name} step={step_num} "
-            f"day={obs.get('current_day', '?')} "
-            f"sprint={obs.get('current_sprint', '?')} "
-            f"action={action.get('action_type')} "
-            f"task={action.get('task_id')} "
-            f"reward={reward:.4f} "
-            f"cumulative={obs.get('cumulative_reward', 0):.4f} "
-            f"inst_score={obs.get('instruction_following_score', 0):.3f} "
-            f"debt={len(obs.get('tech_debt', []))} "
-            f"done={done}",
-            flush=True,
+        tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN or None)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, quantization_config=bnb, device_map="auto",
+            token=HF_TOKEN or None,
         )
-
-        if done:
-            tasks_total   = len(obs.get("tasks", [])) or 1
-            tasks_done    = obs.get("tasks_completed", 0)
-            inst_score    = obs.get("instruction_following_score", 0.01)
-            delivery_rate = tasks_done / tasks_total
-            debt_count    = len(obs.get("tech_debt", []))
-            team_health   = max(0.01, 1.0 - debt_count * 0.02)
-            # Weighted: delivery 55%, inst 30%, health 15%
-            raw = delivery_rate * 0.55 + inst_score * 0.30 + team_health * 0.15
-            skip_penalty = min(
-                SKIP_SCORE_PENALTY_CAP,
-                episode_skip_steps * SKIP_SCORE_PENALTY_PER_STEP,
-            )
-            overload_penalty = min(
-                OVERLOAD_SCORE_PENALTY_CAP,
-                episode_overload_assign_steps * OVERLOAD_SCORE_PENALTY_ASSIGN,
-            )
-            raw -= skip_penalty + overload_penalty
-            final_score = max(0.01, min(0.99, raw))
-            break
-
-    # ── [END] ─────────────────────────────────────────────────────────────────
-    print(
-        f"[END] task={task_name} score={final_score:.4f} steps={step_num} "
-        f"completed={obs.get('tasks_completed', 0)} "
-        f"missed={obs.get('tasks_missed', 0)} "
-        f"inst_score={obs.get('instruction_following_score', 0):.3f} "
-        f"debt={len(obs.get('tech_debt', []))} "
-        f"skips={episode_skip_steps} overload_assigns={episode_overload_assign_steps}",
-        flush=True,
-    )
-
-    return final_score
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-def smoke_test() -> None:
-    """
-    Short connectivity + policy smoke — no GPU, no model loading.
-    Verifies R2 server, this file's rule-based path, optional R1 + GRPO dataset (train_llm).
-    Run before a GPU training session.
-    """
-    print("\n=== SMOKE TEST (no GPU, no LLM) ===\n", flush=True)
-
-    # R2 health is required for this repo entrypoint
-    try:
-        r2h = requests.get(f"{ENV_BASE_URL}/project/health", timeout=10)
-        r2h.raise_for_status()
-        print(f"[OK] R2 health: {r2h.json()}", flush=True)
+        lora_cfg = LoraConfig(
+            r=16, lora_alpha=32, lora_dropout=0.05,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            task_type=TaskType.CAUSAL_LM,
+        )
+        model = get_peft_model(model, lora_cfg)
+        print("[INFO] HF+PEFT model loaded.", flush=True)
+        return model, tokenizer, "hf"
     except Exception as e:
-        print(f"[ERROR] R2 server not reachable: {e}", flush=True)
-        print(f"        Check ENV_BASE_URL (default: {ENV_BASE_URL!r})", flush=True)
+        print(f"[ERROR] Cannot load model: {e}", flush=True)
         sys.exit(1)
 
-    try:
-        r1h = requests.get(f"{ENV_BASE_URL}/health", timeout=10).json()
-        print(f"[OK] R1 health: {r1h}", flush=True)
-    except Exception as e:
-        print(f"[WARN] R1 health not available (optional): {e}", flush=True)
 
-    results: dict[str, Optional[float]] = {}
+# ── GRPO trainer ───────────────────────────────────────────────────────────────
 
-    # ── R1 (optional — needs train_llm.smart_fallback_r1) ─────────────────────
+def train(
+    phase: str = "both",
+    n_dataset_examples: int = 200,
+    output_dir: str = "results/trained_model",
+    push_to_hub: bool = False,
+):
+    print(f"\n{'='*60}", flush=True)
+    print(f" GRPO TRAINING — Phase: {phase.upper()}", flush=True)
+    print(f" Model:  {MODEL_NAME}", flush=True)
+    print(f" Server: {ENV_BASE_URL}", flush=True)
+    print(f" Method: GRPO (NOT SFT) — reward-driven RL", flush=True)
+    print(f"{'='*60}\n", flush=True)
+
+    # 1. Load model
+    model, tokenizer, backend = load_model_and_tokenizer(MODEL_NAME)
+
+    # 2. Build dataset
+    print("[INFO] Building training dataset (rule-based collection, no LLM calls)...", flush=True)
+    dataset = build_grpo_dataset(n_examples=n_dataset_examples, phase=phase)
+
+    # 3. Build reward function
+    reward_fn = make_reward_fn(ENV_BASE_URL, phase)
+
+    # 4. Configure GRPOTrainer
     try:
-        from train_llm import smart_fallback_r1  # type: ignore[import-untyped]
+        from trl import GRPOConfig, GRPOTrainer
     except ImportError:
-        smart_fallback_r1 = None  # type: ignore[misc, assignment]
-        print("\n[R1] skipped (train_llm not importable)", flush=True)
+        print("[ERROR] trl not installed. Run: pip install trl>=0.9.0", flush=True)
+        sys.exit(1)
 
-    if smart_fallback_r1 is not None:
-        for task in ["easy_sprint"]:
-            print(f"\n[R1] {task}...", flush=True)
-            try:
-                r = requests.post(
-                    f"{ENV_BASE_URL}/reset",
-                    json={"task_name": task, "seed": 42},
-                    timeout=30,
-                )
-                r.raise_for_status()
-                obs = r.json()
-                obs = obs.get("observation", obs)
-                total_r = 0.0
-                for i in range(10):
-                    if obs.get("done", False):
-                        break
-                    action = smart_fallback_r1(obs)
-                    result = requests.post(
-                        f"{ENV_BASE_URL}/step",
-                        json={"action": action},
-                        timeout=30,
-                    ).json()
-                    obs = result.get("observation", obs)
-                    total_r += float(result.get("reward", 0.0))
-                    print(
-                        f"  step {i + 1}: action={action['action_type']} "
-                        f"day={obs.get('current_day', '?')} "
-                        f"done_tasks={obs.get('tasks_completed', '?')} "
-                        f"reward={float(result.get('reward', 0)):.3f}",
-                        flush=True,
-                    )
-                    if result.get("done", False):
-                        break
-                results[f"r1/{task}"] = round(total_r, 3)
-            except Exception as e:
-                print(f"  [ERROR] {e}", flush=True)
-                results[f"r1/{task}"] = None
+    grpo_config = GRPOConfig(
+        output_dir=output_dir,
+        report_to="none",
+        **GRPO_CONFIG,
+    )
 
-    # ── R2 (this module's rule-based policy) ─────────────────────────────────
-    for task in ["project_easy"]:
-        print(f"\n[R2] {task} (first 8 steps)...", flush=True)
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=reward_fn,
+        args=grpo_config,
+        train_dataset=dataset,
+    )
+
+    # 5. Train
+    print("[INFO] Starting GRPO training...", flush=True)
+    t0 = time.time()
+    trainer.train()
+    elapsed = time.time() - t0
+    print(f"\n[INFO] Training complete in {elapsed/60:.1f} min", flush=True)
+
+    # 6. Save
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"[INFO] Model saved to {output_dir}", flush=True)
+
+    # 7. Push to Hub
+    if push_to_hub and HF_REPO_ID:
+        print(f"[INFO] Pushing to HF Hub: {HF_REPO_ID}", flush=True)
+        model.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
+        tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
+        print(f"[INFO] Pushed to https://huggingface.co/{HF_REPO_ID}", flush=True)
+
+    return output_dir
+
+
+# ── Smoke test ─────────────────────────────────────────────────────────────────
+
+def smoke_test():
+    """
+    5-episode smoke test — no GPU, no model loading.
+    Verifies server connectivity, rule-based fallback, and dataset pipeline.
+    Run this locally before the GPU session.
+    """
+    print("\n=== SMOKE TEST (rule-based, no GPU) ===\n", flush=True)
+
+    import requests as _req
+
+    # Health checks
+    try:
+        r1h = _req.get(f"{ENV_BASE_URL}/health", timeout=10).json()
+        r2h = _req.get(f"{ENV_BASE_URL}/project/health", timeout=10).json()
+        print(f"[OK] R1 health: {r1h}", flush=True)
+        print(f"[OK] R2 health: {r2h}", flush=True)
+    except Exception as e:
+        print(f"[ERROR] Server not reachable: {e}", flush=True)
+        print(f"        Start your server: python ui.py", flush=True)
+        sys.exit(1)
+
+    results = {}
+
+    # ── R1 test ──────────────────────────────────────────────────────────────
+    for task in ["easy_sprint"]:
+        print(f"\n[R1] {task}...", flush=True)
         try:
-            obs = unwrap_observation(
-                call_env("reset", {"task_name": task, "seed": 42})
-            )
-            assigned: set[str] = set()
-            for i in range(8):
+            obs = _req.post(f"{ENV_BASE_URL}/reset",
+                            json={"task_name": task, "seed": 42}, timeout=30).json()
+            total_r = 0.0
+            for i in range(10):
                 if obs.get("done", False):
                     break
-                action = get_rule_based_action(obs, assigned, None)
-                if action["action_type"] == "assign" and action.get("task_id"):
-                    assigned.add(action["task_id"])
-                result = call_env("step", {"action": action})
-                obs = unwrap_observation(result)
+                action = smart_fallback_r1(obs)
+                result = _req.post(f"{ENV_BASE_URL}/step",
+                                   json={"action": action}, timeout=30).json()
+                obs = result["observation"]
+                total_r += result["reward"]
                 print(
-                    f"  step {i + 1}: action={action['action_type']} "
-                    f"task={action.get('task_id')} "
-                    f"day={obs.get('current_day', '?')} "
-                    f"sprint={obs.get('current_sprint', '?')} "
-                    f"reward={float(result.get('reward', 0)):.3f} "
-                    f"inst={float(obs.get('instruction_following_score', 0)):.2f}",
+                    f"  step {i+1}: action={action['action_type']} "
+                    f"day={obs['current_day']} "
+                    f"done_tasks={obs['tasks_completed']} reward={result['reward']:.3f}",
                     flush=True,
                 )
                 if result.get("done", False):
                     break
-            results["r2/project_easy"] = round(
-                float(obs.get("cumulative_reward", 0.0)), 3
-            )
+            results[f"r1/{task}"] = round(total_r, 3)
+        except Exception as e:
+            print(f"  [ERROR] {e}", flush=True)
+            results[f"r1/{task}"] = None
+
+    # ── R2 test ──────────────────────────────────────────────────────────────
+    for task in ["project_easy"]:
+        print(f"\n[R2] {task} (first 8 steps)...", flush=True)
+        try:
+            obs = _req.post(f"{ENV_BASE_URL}/project/reset",
+                            json={"task_name": task, "seed": 42}, timeout=30).json()
+            assigned: set[str] = set()
+            for i in range(8):
+                if obs.get("done", False):
+                    break
+                action = smart_fallback_r2(obs, assigned)
+                if action["action_type"] == "assign" and action.get("task_id"):
+                    assigned.add(action["task_id"])
+                result = _req.post(f"{ENV_BASE_URL}/project/step",
+                                   json={"action": action}, timeout=30).json()
+                obs = result["observation"]
+                print(
+                    f"  step {i+1}: action={action['action_type']} "
+                    f"task={action.get('task_id')} "
+                    f"day={obs['current_day']} sprint={obs['current_sprint']} "
+                    f"reward={result['reward']:.3f} inst={obs['instruction_following_score']:.2f}",
+                    flush=True,
+                )
+                if result.get("done", False):
+                    break
+            results["r2/project_easy"] = round(obs["cumulative_reward"], 3)
         except Exception as e:
             print(f"  [ERROR] {e}", flush=True)
             results["r2/project_easy"] = None
 
-    # ── Dataset pipeline ──────────────────────────────────────────────────────
-    print("\n[DATASET] Testing collection (12 examples)...", flush=True)
+    # ── Dataset pipeline test ─────────────────────────────────────────────────
+    print(f"\n[DATASET] Testing dataset collection (12 examples)...", flush=True)
     try:
-        from train_llm import build_grpo_dataset  # type: ignore[import-untyped]
-
         dataset = build_grpo_dataset(n_examples=12, phase="both")
-        print(f"  [OK] GRPO dataset size: {len(dataset)}", flush=True)
+        print(f"  [OK] Dataset size: {len(dataset)}", flush=True)
         print(f"  [OK] Keys: {list(dataset[0].keys())}", flush=True)
     except Exception as e:
-        print(f"  [WARN] build_grpo_dataset failed: {e}", flush=True)
-        try:
-            rows = collect_r2_sft_examples(
-                n_target=12,
-                min_record_step=1,
-                max_record_step=8,
-            )
-            print(f"  [OK] R2 SFT rows (fallback): {len(rows)}", flush=True)
-            if rows:
-                print(f"  [OK] Keys: {list(rows[0].keys())}", flush=True)
-        except Exception as e2:
-            print(f"  [WARN] collect_r2_sft_examples failed: {e2}", flush=True)
+        print(f"  [WARN] Dataset collection failed: {e}", flush=True)
 
-    print("\n=== SMOKE TEST RESULTS ===", flush=True)
+    print(f"\n=== SMOKE TEST RESULTS ===", flush=True)
     for k, v in results.items():
         print(f"  {k}: {v}", flush=True)
-    print("\n[OK] Smoke test complete.", flush=True)
+    print(f"\n✅ Smoke test complete. Server is ready for GPU training.", flush=True)
 
 
-def main() -> None:
-    print(f"[INFO] model={MODEL_NAME} server={ENV_BASE_URL}", flush=True)
-    print(f"[INFO] retry_config=max_retries={MAX_RETRIES} delays={RETRY_DELAYS} "
-          f"llm_call_every={LLM_CALL_EVERY}", flush=True)
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-    # Health check
-    try:
-        health = call_env("health", method="GET")
-        print(f"[INFO] health={health}", flush=True)
-        assert health.get("round") == 2, "Expected R2 health endpoint"
-    except Exception as e:
-        print(f"[ERROR] Cannot reach R2 env server: {e}", flush=True)
-        print(f"[ERROR] Make sure ENV_BASE_URL points to a running server", flush=True)
-        sys.exit(1)
-
-    scores: dict[str, float] = {}
-    start_time = time.time()
-
-    for task in TASKS:
-        try:
-            score = run_episode(task)
-            scores[task] = score
-        except Exception as e:
-            print(f"[ERROR] task={task} error={e}", flush=True)
-            scores[task] = 0.01
-
-    elapsed = time.time() - start_time
-
-    print("\n" + "=" * 62, flush=True)
-    print(" ROUND 2 — SCORES", flush=True)
-    print("=" * 62, flush=True)
-    for task, score in scores.items():
-        bar = "█" * int(score * 20)
-        print(f"  {task:<22} {score:.4f}  {bar}", flush=True)
-    avg = sum(scores.values()) / len(scores) if scores else 0.0
-    print(f"  {'AVERAGE':<22} {avg:.4f}", flush=True)
-    print(f"\n  Runtime: {elapsed:.1f}s", flush=True)
-    print("=" * 62, flush=True)
-
-
-def _cli() -> None:
-    parser = argparse.ArgumentParser(
-        description="R2 OpenEnv inference, SFT JSONL export, or TRL SFT warm-up.",
-    )
-    parser.add_argument(
-        "--sft-collect",
-        action="store_true",
-        help="Collect rule-based (prompt→JSON) pairs and write JSONL, then exit",
-    )
-    parser.add_argument(
-        "--sft-train",
-        action="store_true",
-        help="Collect pairs and run TRL SFTTrainer (GPU + trl + transformers)",
-    )
-    parser.add_argument(
-        "--sft-out",
-        type=str,
-        default="data/r2_sft.jsonl",
-        help="Output path for --sft-collect",
-    )
-    parser.add_argument(
-        "--sft-out-dir",
-        type=str,
-        default="results/sft_r2",
-        help="Output directory for --sft-train (JSONL + HF checkpoints)",
-    )
-    parser.add_argument(
-        "--sft-n",
-        type=int,
-        default=200,
-        help="Target number of supervised rows",
-    )
-    parser.add_argument(
-        "--sft-min-step",
-        type=int,
-        default=3,
-        help="First timestep index (per episode) to record",
-    )
-    parser.add_argument(
-        "--sft-max-step",
-        type=int,
-        default=12,
-        help="Last timestep index (per episode) to record",
-    )
-    parser.add_argument(
-        "--sft-model",
-        type=str,
-        default=None,
-        help="HF model id for --sft-train (default: MODEL_NAME env / default)",
-    )
-    parser.add_argument(
-        "--smoke-test",
-        action="store_true",
-        help="Run R1/R2 + dataset connectivity smoke (no GPU, no LLM)",
-    )
+def main():
+    parser = argparse.ArgumentParser(description="GRPO training for AI Sprint Manager R2")
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Run smoke test (no GPU). Do this locally first.")
+    parser.add_argument("--phase", choices=["r1", "r2", "both"], default="both")
+    parser.add_argument("--episodes", type=int, default=200,
+                        help="Number of dataset examples to collect (default: 200)")
+    parser.add_argument("--output", type=str, default="results/trained_model")
+    parser.add_argument("--push", action="store_true",
+                        help="Push trained model to HF Hub (requires HF_REPO_ID)")
     args = parser.parse_args()
 
     if args.smoke_test:
         smoke_test()
         return
 
-    if args.sft_collect or args.sft_train:
-        try:
-            health = call_env("health", method="GET")
-            print(f"[INFO] health={health}", flush=True)
-            if health.get("round") != 2:
-                print("[WARN] health.round != 2 — continuing anyway", flush=True)
-        except Exception as e:
-            print(f"[ERROR] Cannot reach R2 env: {e}", flush=True)
-            sys.exit(1)
-
-    if args.sft_train:
-        run_sft_trainer(
-            args.sft_out_dir,
-            n_examples=args.sft_n,
-            min_step=args.sft_min_step,
-            max_step=args.sft_max_step,
-            model_name=args.sft_model,
-        )
-        return
-
-    if args.sft_collect:
-        rows = collect_r2_sft_examples(
-            n_target=args.sft_n,
-            min_record_step=args.sft_min_step,
-            max_record_step=args.sft_max_step,
-        )
-        if not rows:
-            print("[SFT] No rows collected.", flush=True)
-            sys.exit(1)
-        save_sft_jsonl(args.sft_out, rows)
-        return
-
-    main()
+    train(phase=args.phase, n_dataset_examples=args.episodes,
+          output_dir=args.output, push_to_hub=args.push)
 
 
 if __name__ == "__main__":
-    _cli()
+    main()
