@@ -3,155 +3,29 @@ train_llm.py — AI Sprint Manager R1+R2 Training
 ================================================
 TRAINING APPROACH: SFT warm-up → GRPO fine-tuning (curriculum)
 
-═══════════════════════════════════════════════════════════════
-WHY THIS COMBINATION?
-═══════════════════════════════════════════════════════════════
-
-1. SFT WARM-UP (Phase 0, optional but recommended)
-   ─────────────────────────────────────────────────
-   Why: Cold-start GRPO on Llama-3.1-8B with a random policy can collapse
-   early because all 4 generations get similar rewards → GRPO gradient is
-   zero → no learning signal. A brief SFT warm-up (1–2 epochs on rule-based
-   trajectories) teaches the model the output FORMAT (JSON schema) before
-   reward-driven exploration begins.
-
-   What we SFT on: (observation, rule-based_action) pairs. Rule-based is
-   NOT the optimal policy — it's just good enough to seed valid JSON output.
-
-   This is identical to how InstructGPT (and DeepSeek-R1) bootstraps: SFT
-   first for format, then RLHF/GRPO for quality.
-
-2. GRPO FINE-TUNING (Main training)
-   ──────────────────────────────────
-   Why GRPO over PPO: No value network required → 40% less GPU memory.
-   On a T4 (16GB) with 4-bit QLoRA this is the difference between fitting
-   and OOMing.
-
-   Why GRPO over RLVR/RLVE: RLVR (RL with Verifiable Rewards) applies when
-   the reward is binary (correct/incorrect), e.g. maths problems. Our reward
-   is continuous and multi-component → GRPO with group-relative normalisation
-   is a better fit.
-
-   GRPO mechanism:
-     - Sample num_generations=4 completions per prompt
-     - Each completion is an action JSON
-     - Call /step on the env → get step_reward
-     - Compute group baseline = mean(rewards over 4 generations)
-     - Policy gradient = encourage completions above baseline, penalise below
-     - KL divergence penalty (beta) prevents policy from drifting too far
-       from the reference model (anti-reward-hacking measure #1)
-
-3. CURRICULUM LEARNING (Phase both)
-   ──────────────────────────────────
-   Ratio 2:2 (R1 then R2) per group of 4. R1 tasks (10 steps, simple) give
-   a denser reward signal early in training; R2 tasks (60 steps, complex)
-   build long-horizon planning. Without curriculum, GRPO on R2 cold-start
-   is extremely sample-inefficient.
-
-═══════════════════════════════════════════════════════════════
-REWARD DESIGN & ANTI-HACKING MEASURES
-═══════════════════════════════════════════════════════════════
-
-R1 REWARD (single sprint, 10 days):
-  step_reward from /step:
-    +1.5 to +2.0  : assign task → task completes by deadline
-    +0.5 to +1.0  : correct skill match
-    -0.05         : skip (opportunity cost, not catastrophic)
-    -0.1          : assign already-in_progress task (invalid)
-    -2.0 to -2.5  : sprint ends with incomplete high-priority task
-    -0.2          : unknown action type
-
-  Normalised for GRPO:
-    r_norm = clip((step_reward + 3.0) / 5.0, 0, 1)
-    Shift +3 centres the no-op case at 0.60 so the model sees a gradient
-    even for neutral actions. Without this shift, most rewards cluster near
-    0.0 and GRPO training collapses.
-
-  ANTI-HACKING: R1 is graded by the graders.py functions which are
-  SERVER-SIDE and stateful. The agent cannot fake a task completion —
-  the server checks effort remaining, developer availability, deadlines.
-
-R2 REWARD (multi-sprint, 60 days):
-  Three-level reward structure:
-    a) Step reward (dense, every action):
-         Same structure as R1 step reward.
-    b) Sprint-boundary bonus (every 10 days):
-         +0.5 per sprint completed above threshold delivery rate.
-         -0.3 per developer with burnout (productivity < 0.5).
-         -2.0 per task missed at sprint boundary.
-    c) Final project score (day 60 only, sparse):
-         delivery_rate = tasks_completed / tasks_total
-         team_health   = max(0.01, 1.0 - tech_debt_items * 0.02)
-         final_score   = delivery_rate * 0.55
-                       + instruction_following_score * 0.30
-                       + team_health * 0.15
-
-  Combined training reward:
-    step_norm  = clip((step_reward + 3.0) / 5.0, 0, 1)
-    combined   = step_norm * 0.6 + inst_score * 0.4
-
-  Why instruction_following_score as auxiliary reward?
-    - Without it, GRPO learns to ignore instructions (they're sparse signals).
-    - inst_score is a running average: 1.0 if agent always acts on active
-      instructions, 0.0 if it always ignores them.
-    - Adding it as 0.4 weight makes every step instruction-aware.
-
-  ANTI-HACKING MEASURES:
-    1. KL penalty (beta=0.04): penalises policy that diverges too far from
-       base model — prevents the model from finding degenerate strategies
-       like outputting skip forever.
-    2. Reward normalisation per GRPO group: absolute magnitudes don't matter,
-       only relative ordering within each batch → can't inflate reward by
-       gaming normalisation scale.
-    3. Server-side state: the environment server is authoritative. The reward
-       function can't be gamed client-side because:
-         - task completion requires server-tracked effort countdown
-         - instruction_following_score computed by server from actual actions
-         - tech_debt is server state, can't be cleared by client action
-    4. Clamping: all scores clamped to [0.01, 0.99] — the model can't earn
-       a 1.0 reward by any single action, so it can't learn a trivial hack.
-    5. Episode-reset: each reward_fn call resets the environment to a fixed
-       seed. The model cannot carry state between reward evaluations.
-    6. Skip penalty (-0.05): prevents "always skip" degenerate policy since
-       skipping looks cheaper than risking a wrong assignment. The penalty
-       makes skipping costlier than a bad assignment in the medium term.
-    7. tech_debt permanent drag: each missed sprint task permanently reduces
-       a developer's productivity by 2%. This makes short-horizon hacking
-       (rush tasks to get early reward) self-defeating over 60 days.
-
-FIXES IN THIS VERSION vs. original train_llm.py:
-  [FIX-T1] reward_fn now resets env BEFORE calling /step (was calling /step
-            on stale state from a previous episode — reward was meaningless).
-  [FIX-T2] Observation extracted from reset response, not from step (reset
-            returns obs directly, not wrapped in observation key).
-  [FIX-T3] SFT warmup phase added (--phase sft or --sft-epochs > 0).
-  [FIX-T4] Dataset now samples from MIDDLE of episodes (steps 3-8) not just
-            from step 0 — gives the model harder, more diverse states to learn
-            from. Step-0 prompts are trivially easy and over-represented.
-  [FIX-T5] Tokenizer pad_token fix: Llama has no pad_token by default →
-            setting to eos_token (standard practice).
-  [FIX-T6] GRPOConfig: removed unsupported fields for older trl versions;
-            added graceful version detection.
-  [FIX-T7] Push uses model.merge_and_unload() before push if Unsloth so
-            the pushed model is a full weight checkpoint, not just LoRA diff.
-  [FIX-T8] Neutral fallback reward changed from 0.3 to 0.5 (true neutral)
-            so env failures don't bias toward low-reward actions.
-  [FIX-T9] build_grpo_dataset wraps each episode in try/except so a single
-            HF Space timeout doesn't kill the whole dataset collection.
-
-═══════════════════════════════════════════════════════════════
-RECOMMENDED GPU USAGE
-═══════════════════════════════════════════════════════════════
-Model: Qwen2.5-1.5B for TRAINING (loaded locally — no HF router needed).
-       Llama-3.1-8B for INFERENCE via HF router.
-
-| GPU  | VRAM | Batch | Generations | Approx time (300ep) |
-|------|------|-------|-------------|---------------------|
-| T4   | 16GB | 1     | 2           | ~4-5 hours          |
-| A10G | 24GB | 2     | 4           | ~2-3 hours          |
-| A100 | 40GB | 4     | 4           | ~60-90 min          |
-
-Colab setup (9 cells) — see PROJECT_HANDOFF.md for details.
+FIXES IN THIS VERSION vs previous:
+  [FIX-T1]  reward_fn resets env BEFORE calling /step
+  [FIX-T2]  Observation extracted from reset response
+  [FIX-T3]  SFT warmup phase added
+  [FIX-T4]  Dataset samples from MIDDLE of episodes (steps 3-8)
+  [FIX-T5]  Tokenizer pad_token fix
+  [FIX-T6]  GRPOConfig: removed unsupported fields
+  [FIX-T7]  Push uses model.merge_and_unload() before push
+  [FIX-T8]  Neutral fallback reward changed from 0.3 to 0.5
+  [FIX-T9]  build_grpo_dataset wraps each episode in try/except
+  [FIX-T10] make_reward_fn: extra -0.2 penalty for unnecessary skips
+             (skip when backlog+avail_devs are non-empty → normalized
+             reward was 0.59, above the 0.5 neutral, teaching the model
+             that skipping is "safe". Now: skip with valid assignments
+             available is explicitly punished below neutral.)
+  [FIX-T11] _build_r2_prompt: adds DO_NOT_ASSIGN line listing in_progress
+             task IDs so the model stops trying to re-assign them during
+             training (matches the EPISODE_MEMORY hint in inference).
+  [FIX-T12] make_reward_fn: extra -0.1 penalty when assign/reassign
+             returns step_r <= -0.1 (server rejected the assignment).
+             Gives a stronger gradient signal against invalid assigns.
+  [FIX-T13] make_format_reward_fn: skip gets 0.1 (was 0.3 = same as a
+             valid assign). Format reward now discourages skip-spamming.
 """
 
 from __future__ import annotations
@@ -165,45 +39,32 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-# ── Env config ────────────────────────────────────────────────────────────────
-
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 HF_TOKEN     = os.getenv("HF_TOKEN", "")
-MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")  # for LOCAL training
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
 HF_REPO_ID   = os.getenv("HF_REPO_ID", "")
 
-# ── GRPO hyperparameters ───────────────────────────────────────────────────────
-# Defaults for T4 (16GB). Adjust per GPU via CLI or env override.
 GRPO_CONFIG = {
     "learning_rate":               5e-6,
     "num_train_epochs":            1,
-    "per_device_train_batch_size": 1,   # T4-safe; effective batch=8 (1*8*1)
-    "gradient_accumulation_steps": 8,   # eff batch 8 must be divisible by num_generations (8/4=2 ✓)
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 8,
     "max_prompt_length":           1024,
-    "max_completion_length":       96,  # action JSON < 80 tokens; 96 gives margin
-    # FIX-DOC1: num_generations 2→4. With 2, frac_reward_zero_std=1.0 (all groups had
-    # identical rewards → GRPO gradient=0 → no learning). 4 gives meaningful group variance.
-    # Docs: effective batch size must be divisible by num_generations. 8/4=2 ✓
+    "max_completion_length":       96,
     "num_generations":             4,
-    # FIX-DOC2: temperature 0.8→1.0. TRL docs default and recommended for generation
-    # diversity in GRPO. Higher diversity → non-zero reward std → real gradients.
     "temperature":                 1.0,
-    "beta":                        0.04,  # KL penalty — anti-reward-hacking; loads ref model
+    "beta":                        0.04,
     "logging_steps":               5,
     "save_steps":                  50,
-    # FIX-DOC3: warmup_ratio deprecated in TRL v5.2. Replace with warmup_steps.
-    # 5% of ~225 GRPO steps ≈ 11 steps.
     "warmup_steps":                11,
     "seed":                        42,
 }
 
-# SFT warm-up config
 SFT_CONFIG = {
     "num_train_epochs":            2,
     "per_device_train_batch_size": 2,
     "gradient_accumulation_steps": 4,
-    "learning_rate":               2e-5,  # higher than GRPO — SFT is supervised
-    # FIX-DOC3: warmup_ratio deprecated → warmup_steps (SFT has ~48 steps; 5%≈2, use 5)
+    "learning_rate":               2e-5,
     "warmup_steps":                5,
     "logging_steps":               5,
     "save_steps":                  100,
@@ -215,9 +76,6 @@ R2_TASKS = ["project_easy", "project_medium", "project_hard"]
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-
-# ── System prompts ────────────────────────────────────────────────────────────
-# Must match inference_r2.py exactly so training and inference are aligned.
 
 R1_SYSTEM_PROMPT = """You are an expert Tech Lead managing an agile sprint.
 Each step output a JSON action with this exact schema:
@@ -247,10 +105,7 @@ Rules (follow in order):
 Output ONLY the JSON. No explanation."""
 
 
-# ── Rule-based fallback policies ─────────────────────────────────────────────
-
 def smart_fallback_r1(obs: dict) -> dict:
-    """R1: assign highest-priority backlog task with skill match."""
     tasks  = obs.get("tasks", [])
     devs   = obs.get("developers", [])
     avail  = [d for d in devs
@@ -270,10 +125,6 @@ def smart_fallback_r1(obs: dict) -> dict:
 
 
 def smart_fallback_r2(obs: dict, assigned_set: Optional[set] = None) -> dict:
-    """
-    R2: instruction-first, dep-aware, skill-matching fallback.
-    assigned_set prevents re-assigning tasks already assigned this episode.
-    """
     if assigned_set is None:
         assigned_set = set()
 
@@ -299,7 +150,6 @@ def smart_fallback_r2(obs: dict, assigned_set: Optional[set] = None) -> dict:
 
     skip = {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
-    # 1. Instructions first
     active = sorted(
         [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)],
         key=lambda i: i.get("target_sprint", 99)
@@ -313,7 +163,6 @@ def smart_fallback_r2(obs: dict, assigned_set: Optional[set] = None) -> dict:
                     return {"action_type": "assign", "task_id": task["id"],
                             "dev_id": dev["id"], "new_priority": None}
 
-    # 2. Highest-priority backlog with deps met
     backlog = sorted(
         [t for t in tasks if t.get("status") == "backlog"],
         key=lambda t: (t.get("priority", 9), t.get("deadline", 99))
@@ -325,7 +174,6 @@ def smart_fallback_r2(obs: dict, assigned_set: Optional[set] = None) -> dict:
                 return {"action_type": "assign", "task_id": task["id"],
                         "dev_id": dev["id"], "new_priority": None}
 
-    # 3. Unblock
     for task in tasks:
         if task.get("status") == "blocked":
             deps = task.get("metadata", {}).get("depends_on", [])
@@ -336,22 +184,11 @@ def smart_fallback_r2(obs: dict, assigned_set: Optional[set] = None) -> dict:
     return skip
 
 
-# ── Action parser ─────────────────────────────────────────────────────────────
-
 _VALID_ACTIONS = {"assign", "reassign", "reprioritize", "skip", "unblock"}
 _NULL_STRINGS  = {"null", "none", "None", "Null", "", "undefined", "N/A", "nil"}
 
 
 def _parse_action(text) -> dict:
-    """
-    Parse LLM completion → action dict.
-    Takes the LAST JSON object in the text (handles chain-of-thought prefix).
-
-    FIX: TRL >=0.9 / Unsloth 2026.x passes completions as list[dict] in chat
-    message format instead of a plain str:
-      e.g. [{"role": "assistant", "content": '{"action_type":"assign"...}'}]
-    Extract the assistant content string before any string operations.
-    """
     if isinstance(text, list):
         text = " ".join(
             m.get("content", "") for m in text if m.get("role") == "assistant"
@@ -360,7 +197,6 @@ def _parse_action(text) -> dict:
     if "```" in text:
         text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
 
-    # Find the LAST balanced {...} block
     d          = None
     depth      = 0
     obj_start  = -1
@@ -417,8 +253,6 @@ def _parse_action(text) -> dict:
             "dev_id": d.get("dev_id"), "new_priority": d.get("new_priority")}
 
 
-# ── Prompt builders ───────────────────────────────────────────────────────────
-
 def _build_r1_prompt(obs: dict) -> str:
     tasks_summary = "\n".join(
         f"  [{t['id']}] {t.get('name','?')} | P{t.get('priority','?')} | effort={t.get('effort','?')} "
@@ -441,7 +275,15 @@ def _build_r1_prompt(obs: dict) -> str:
 
 
 def _build_r2_prompt(obs: dict) -> str:
-    """Compact R2 prompt matching inference_r2.py format."""
+    """
+    [FIX-T11] Added DO_NOT_ASSIGN line listing in_progress task IDs.
+    Previously the prompt showed IN_PROG tasks but didn't explicitly forbid
+    re-assigning them. The model would still attempt to assign them, getting
+    -0.15 penalties (server rejects assign of in_progress tasks). Now we
+    add a hard explicit prohibition so the model stops wasting steps on them.
+    This matches the EPISODE_MEMORY/NO_REASSIGN_UNTIL_BACKLOG hint in
+    inference_r2.py, keeping training and inference distributions aligned.
+    """
     current_sprint = obs.get("current_sprint", 1)
     current_day    = obs.get("current_day", 1)
     days_left      = max(0, current_sprint * 10 - current_day + 1)
@@ -474,6 +316,14 @@ def _build_r2_prompt(obs: dict) -> str:
         for d in avail_devs
     )
 
+    # [FIX-T11] Explicit prohibition on in_progress tasks (aligns with inference memory block)
+    no_assign_str = ""
+    if in_prog:
+        no_assign_str = (
+            "DO_NOT_ASSIGN: " + " ".join(f"[{t['id']}]" for t in in_prog)
+            + " — already in_progress, assigning again is INVALID.\n"
+        )
+
     return (
         f"D{current_day}/60 S{current_sprint}/6 {days_left}d "
         f"done={obs.get('tasks_completed',0)} miss={obs.get('tasks_missed',0)} "
@@ -482,30 +332,23 @@ def _build_r2_prompt(obs: dict) -> str:
         f"BACKLOG(✓=deps_ok): {backlog_str}\n"
         f"IN_PROG: {inprog_str}\n"
         f"DEVS(avail): {devs_str}\n"
+        f"{no_assign_str}"
         f"JSON:"
     )
 
 
-# ── GRPO reward functions ─────────────────────────────────────────────────────
-#
-# ANTI-HACKING design:
-#   - Each reward_fn call resets the environment to a FIXED seed before stepping.
-#     The model cannot exploit carry-over state between generations.
-#   - Reward is normalised within the GRPO group (not absolute), so inflating
-#     one generation's reward doesn't help unless it's relatively better.
-#   - KL penalty (beta=0.04) prevents the policy from drifting to degenerate
-#     strategies (e.g. "always assign T01 to dev1" for a cheap reward spike).
-#   - Neutral fallback = 0.5 (true neutral), not 0.3, so env failures don't
-#     bias learning toward low-reward actions.
-
 def make_reward_fn(env_base_url: str, phase: str):
     """
-    Returns a GRPO reward function evaluating completions against the live env.
+    [FIX-T10] Added extra penalty for unnecessary skips:
+      If the model skips when there ARE backlog tasks AND available devs,
+      we subtract 0.2 from the normalized reward. Previously skip got
+      normalized reward 0.59 (above 0.5 neutral), effectively teaching the
+      model that skipping is "safe". Now unnecessary skip lands at ~0.39,
+      clearly below neutral.
 
-    [FIX-T1] Resets env immediately before stepping — the env MUST be in the
-    correct initial state when we evaluate each action. Previously, the reset
-    was called but the obs was ignored and /step ran on whatever the env's
-    current state was (potentially mid-episode from a previous call).
+    [FIX-T12] Added extra -0.1 penalty when assign/reassign is explicitly
+      rejected by the server (step_r <= -0.1). Gives a stronger gradient
+      signal against invalid assigns beyond what the raw env reward provides.
     """
     import requests
 
@@ -522,7 +365,6 @@ def make_reward_fn(env_base_url: str, phase: str):
             episode_counter[0] += 1
             n = episode_counter[0]
 
-            # Curriculum: alternating R1/R2 (2:2 ratio for "both" phase)
             if phase == "r1":
                 use_r2 = False
             elif phase == "r2":
@@ -535,18 +377,19 @@ def make_reward_fn(env_base_url: str, phase: str):
 
             try:
                 if not use_r2:
-                    # [FIX-T1] Reset, then step
                     task = R1_TASKS[n % len(R1_TASKS)]
                     _post(f"{env_base_url}/reset",
                           {"task_name": task, "seed": n % 100})
                     result = _post(f"{env_base_url}/step", {"action": action})
 
                     step_r = float(result.get("reward", 0.0))
-                    # Normalise R1 reward: [-3,+2] → [0,1]
                     r = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
 
+                    # [FIX-T12] Extra penalty for server-rejected assign/reassign
+                    if action["action_type"] in ("assign", "reassign") and step_r <= -0.1:
+                        r = max(0.0, r - 0.1)
+
                 else:
-                    # [FIX-T1] Reset project, then step
                     task = R2_TASKS[n % len(R2_TASKS)]
                     _post(f"{env_base_url}/project/reset",
                           {"task_name": task, "seed": n % 100})
@@ -558,14 +401,28 @@ def make_reward_fn(env_base_url: str, phase: str):
                     inst_score = float(obs2.get("instruction_following_score", 0.5))
                     step_norm  = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
 
-                    # Combined: step quality (60%) + instruction compliance (40%)
-                    # Anti-hacking: inst_score is server-side computed running avg;
-                    # can't be faked by the model outputting anything in particular.
                     r = step_norm * 0.6 + inst_score * 0.4
+
+                    # [FIX-T12] Extra penalty for server-rejected assign/reassign
+                    if action["action_type"] in ("assign", "reassign") and step_r <= -0.1:
+                        r = max(0.0, r - 0.1)
+
+                    # [FIX-T10] Extra penalty for unnecessary skip.
+                    # If the model skipped when there were assignable tasks and
+                    # available devs, penalize below neutral (was 0.59 → now ≤0.39).
+                    if action["action_type"] == "skip":
+                        backlog_ct = sum(
+                            1 for t in obs2.get("tasks", []) if t.get("status") == "backlog"
+                        )
+                        avail_ct = sum(
+                            1 for d in obs2.get("developers", []) if d.get("is_available")
+                        )
+                        if backlog_ct > 0 and avail_ct > 0:
+                            r = max(0.0, r - 0.20)
 
             except Exception as e:
                 print(f"[WARN] reward_fn env call failed: {e}", flush=True)
-                r = 0.5  # [FIX-T8] true neutral
+                r = 0.5  # [FIX-T8]
 
             rewards.append(float(r))
         return rewards
@@ -575,24 +432,15 @@ def make_reward_fn(env_base_url: str, phase: str):
 
 def make_format_reward_fn():
     """
-    FIX-DOC5: Secondary reward function checking JSON schema validity.
-    Pattern from TRL GRPO docs Example 2 (format reward).
-
-    Why: The env reward (make_reward_fn) is only non-neutral when the env
-    successfully parses and executes the action. If the model outputs invalid
-    JSON, the env call fails and returns the neutral 0.5 fallback — giving no
-    gradient signal about FORMAT correctness.
-
-    This function gives a small but always-available dense signal:
-      +0.3 : valid JSON with correct action_type and required fields
-      +0.1 : valid JSON but missing required fields
-       0.0 : not valid JSON at all
-
-    Used with reward_weights=[1.0, 0.2] so it contributes 0.2x relative to
-    the env reward — enough to guide format learning without dominating.
-
-    Docs ref: GRPOTrainer supports multiple reward functions. The reward is
-    the weighted sum: total = env_reward*1.0 + format_reward*0.2.
+    [FIX-T13] Reduced skip format reward from 0.3 → 0.1.
+    Previously skip received 0.3 (same as a fully-valid assign/reassign action
+    with task_id + dev_id). This meant the format signal did nothing to
+    discourage skip-spamming. Now:
+      0.3 = valid assign/reassign/reprioritize/unblock with required fields
+      0.1 = valid JSON but action_type is skip OR missing required fields
+      0.0 = not valid JSON
+    This way the format reward actively discourages skip relative to a valid
+    action with all required fields.
     """
     import re
     _VALID_ACTIONS_SET = {"assign", "reassign", "reprioritize", "unblock", "skip"}
@@ -601,7 +449,6 @@ def make_format_reward_fn():
     def format_reward_fn(completions, **kwargs) -> list[float]:
         rewards = []
         for completion in completions:
-            # Handle TRL >=0.9 list[dict] format (same as _parse_action fix)
             if isinstance(completion, list):
                 text = " ".join(
                     m.get("content", "") for m in completion if m.get("role") == "assistant"
@@ -610,14 +457,11 @@ def make_format_reward_fn():
                 text = str(completion)
 
             text = text.strip()
-            # Strip markdown fences
             text = re.sub(r"^```[a-z]*\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
 
-            # Try to parse JSON
             score = 0.0
             try:
-                # Find last balanced {} block
                 depth = 0; obj_start = -1; last_start = -1; last_end = -1
                 for i, ch in enumerate(text):
                     if ch == "{":
@@ -634,21 +478,22 @@ def make_format_reward_fn():
 
                 action_type = obj.get("action_type", "")
                 if action_type in _VALID_ACTIONS_SET:
-                    score = 0.1  # valid JSON + valid action_type
-                    # Full score: assign/reassign need task_id+dev_id; others need task_id
-                    if action_type in ("assign", "reassign"):
-                        tid = obj.get("task_id")
-                        did = obj.get("dev_id")
-                        if (tid and _TASK_ID_RE.match(str(tid)) and did):
-                            score = 0.3
-                    elif action_type in ("reprioritize", "unblock"):
-                        tid = obj.get("task_id")
-                        if tid and _TASK_ID_RE.match(str(tid)):
-                            score = 0.3
-                    elif action_type == "skip":
-                        score = 0.3  # skip is always structurally valid
+                    # [FIX-T13] skip gets 0.1, not 0.3 — discourage skip-spamming
+                    if action_type == "skip":
+                        score = 0.1
+                    else:
+                        score = 0.1  # valid JSON + valid action_type but incomplete fields
+                        if action_type in ("assign", "reassign"):
+                            tid = obj.get("task_id")
+                            did = obj.get("dev_id")
+                            if (tid and _TASK_ID_RE.match(str(tid)) and did):
+                                score = 0.3
+                        elif action_type in ("reprioritize", "unblock"):
+                            tid = obj.get("task_id")
+                            if tid and _TASK_ID_RE.match(str(tid)):
+                                score = 0.3
             except (json.JSONDecodeError, Exception):
-                score = 0.0  # not valid JSON at all
+                score = 0.0
 
             rewards.append(float(score))
         return rewards
@@ -656,19 +501,7 @@ def make_format_reward_fn():
     return format_reward_fn
 
 
-# ── Dataset builder ───────────────────────────────────────────────────────────
-#
-# [FIX-T4] Samples from MIDDLE of episodes (skip first N steps).
-# The first 1-2 steps are trivially easy (full backlog, no instructions yet).
-# Sampling from steps 3+ gives the model harder, more diverse training states.
-# [FIX-T9] Each episode wrapped in try/except — HF Space timeouts don't kill collection.
-
 def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
-    """
-    Build a HuggingFace Dataset of (prompt) examples.
-    Each prompt is a serialised chat message list.
-    The LLM is NOT called — only rule-based policy advances the game.
-    """
     try:
         from datasets import Dataset
     except ImportError:
@@ -687,17 +520,15 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
     tasks_r2 = R2_TASKS if phase in ("r2", "both") else []
     per_task = max(1, n_examples // max(1, len(tasks_r1) + len(tasks_r2)))
 
-    SKIP_STEPS_R1 = 1   # skip first step (trivial full-backlog state)
-    SKIP_STEPS_R2 = 2   # skip first 2 steps (instructions not yet released)
-    SAMPLE_PER_EP = 6   # states to sample per episode
+    SKIP_STEPS_R1 = 1
+    SKIP_STEPS_R2 = 2
+    SAMPLE_PER_EP = 6
 
-    # ── Collect R1 snapshots ──────────────────────────────────────────────────
     for task_name in tasks_r1:
         print(f"  [DATASET] R1 {task_name} × {per_task} episodes...", flush=True)
         for ep in range(per_task):
             try:
                 obs = post(f"{ENV_BASE_URL}/reset", {"task_name": task_name, "seed": ep})
-                # [FIX-T4] Advance past trivial early steps
                 for _ in range(SKIP_STEPS_R1):
                     if obs.get("done", False):
                         break
@@ -723,9 +554,8 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
                     if result.get("done", False):
                         break
             except Exception as e:
-                print(f"  [WARN] R1 ep{ep} failed: {e}", flush=True)  # [FIX-T9]
+                print(f"  [WARN] R1 ep{ep} failed: {e}", flush=True)
 
-    # ── Collect R2 snapshots ──────────────────────────────────────────────────
     for task_name in tasks_r2:
         print(f"  [DATASET] R2 {task_name} × {per_task} episodes...", flush=True)
         for ep in range(per_task):
@@ -734,7 +564,6 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
                            {"task_name": task_name, "seed": ep})
                 assigned_set: set[str] = set()
 
-                # [FIX-T4] Advance past trivial initial state
                 for _ in range(SKIP_STEPS_R2):
                     if obs.get("done", False):
                         break
@@ -764,7 +593,7 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
                     if result.get("done", False):
                         break
             except Exception as e:
-                print(f"  [WARN] R2 ep{ep} failed: {e}", flush=True)  # [FIX-T9]
+                print(f"  [WARN] R2 ep{ep} failed: {e}", flush=True)
 
     print(f"  [DATASET] Total examples: {len(examples)}", flush=True)
     if not examples:
@@ -773,14 +602,7 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
     return Dataset.from_list(examples)
 
 
-# ── SFT dataset builder ────────────────────────────────────────────────────────
-# [FIX-T3] Used for SFT warm-up phase. Adds 'completion' field (the rule-based action).
-
 def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
-    """
-    Build a supervised fine-tuning dataset with (prompt, completion) pairs.
-    The completion is the rule-based action — good enough to teach JSON format.
-    """
     try:
         from datasets import Dataset
     except ImportError:
@@ -855,13 +677,7 @@ def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
     return Dataset.from_list(examples)
 
 
-# ── Model loader ───────────────────────────────────────────────────────────────
-
 def load_model_and_tokenizer(model_name: str):
-    """
-    Load model with Unsloth 4-bit QLoRA. Falls back to HF+PEFT if unavailable.
-    [FIX-T5] Sets pad_token = eos_token for Llama/Qwen (they have no pad token by default).
-    """
     try:
         from unsloth import FastLanguageModel
         print(f"[INFO] Loading {model_name} with Unsloth 4-bit QLoRA...", flush=True)
@@ -878,16 +694,11 @@ def load_model_and_tokenizer(model_name: str):
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
             lora_alpha=32,
-            # FIX-DOC4: lora_dropout 0.05→0.0. Unsloth logs explicitly warn:
-            # "Dropout=0 is supported for fast patching. You are using dropout=0.05.
-            #  Unsloth will patch all other layers, except LoRA matrices, causing a
-            #  performance hit." Setting 0.0 enables Unsloth full fast-kernel path.
             lora_dropout=0.0,
             bias="none",
             use_gradient_checkpointing="unsloth",
             random_state=42,
         )
-        # [FIX-T5]
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -910,7 +721,6 @@ def _load_hf_model(model_name: str):
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN or None)
-        # [FIX-T5]
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -920,7 +730,7 @@ def _load_hf_model(model_name: str):
         )
         lora_cfg = LoraConfig(
             r=16, lora_alpha=32,
-            lora_dropout=0.0,  # FIX-DOC4: same as Unsloth path — 0 for fast patching
+            lora_dropout=0.0,
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
             task_type=TaskType.CAUSAL_LM,
@@ -933,13 +743,7 @@ def _load_hf_model(model_name: str):
         sys.exit(1)
 
 
-# ── SFT trainer ────────────────────────────────────────────────────────────────
-
 def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
-    """
-    [FIX-T3] SFT warm-up: teach the model JSON format before GRPO exploration.
-    Uses TRL SFTTrainer with the rule-based (obs, action) pairs.
-    """
     print(f"\n[SFT] Warm-up phase ({n_examples} examples)...", flush=True)
     try:
         from trl import SFTTrainer, SFTConfig
@@ -950,7 +754,6 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
     sft_data = build_sft_dataset(n_examples=n_examples, phase=phase)
 
     def format_fn(example):
-        """Convert chat messages + completion to a single formatted string."""
         parts = []
         for msg in example["prompt"]:
             parts.append(f"<|{msg['role']}|>\n{msg['content']}")
@@ -978,15 +781,13 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
     return trainer.model
 
 
-# ── GRPO trainer ───────────────────────────────────────────────────────────────
-
 def train(
     phase: str         = "both",
     n_dataset_examples: int = 200,
     output_dir: str    = "results/trained_model",
     push_to_hub: bool  = False,
-    sft_epochs: int    = 0,     # 0 = skip SFT warm-up
-    gpu_tier: str      = "t4",  # "t4", "a10g", or "a100"
+    sft_epochs: int    = 0,
+    gpu_tier: str      = "t4",
 ):
     print(f"\n{'='*60}", flush=True)
     print(f" GRPO TRAINING — Phase: {phase.upper()} | GPU: {gpu_tier.upper()}", flush=True)
@@ -995,7 +796,6 @@ def train(
     print(f" SFT warm-up epochs: {sft_epochs}", flush=True)
     print(f"{'='*60}\n", flush=True)
 
-    # Adjust config for GPU tier
     cfg = dict(GRPO_CONFIG)
     if gpu_tier == "a10g":
         cfg["per_device_train_batch_size"] = 2
@@ -1005,70 +805,41 @@ def train(
         cfg["num_generations"]             = 4
         cfg["gradient_accumulation_steps"] = 4
 
-    # 1. Load model
     model, tokenizer, backend = load_model_and_tokenizer(MODEL_NAME)
 
-    # 2. SFT warm-up (optional)
     if sft_epochs > 0:
         sft_n = max(50, n_dataset_examples // 3)
         SFT_CONFIG["num_train_epochs"] = sft_epochs
         model = run_sft(model, tokenizer, phase, sft_n, output_dir)
 
-    # 3. Build GRPO dataset
     print("[INFO] Building GRPO training dataset...", flush=True)
     dataset = build_grpo_dataset(n_examples=n_dataset_examples, phase=phase)
 
-    # 4. Build reward function
     reward_fn = make_reward_fn(ENV_BASE_URL, phase)
 
-    # 5. Configure GRPOTrainer
     try:
         from trl import GRPOConfig, GRPOTrainer
     except ImportError:
         print("[ERROR] trl not installed. Run: pip install trl>=0.9.0", flush=True)
         sys.exit(1)
 
-    # [FIX-T6] graceful version check for older trl
     import trl as _trl
     _trl_version = tuple(int(x) for x in _trl.__version__.split(".")[:2])
     if _trl_version < (0, 9):
         print(f"[WARN] trl {_trl.__version__} detected — recommend trl>=0.9.0", flush=True)
-        # Remove keys that don't exist in older versions
         for key in ("warmup_ratio",):
             cfg.pop(key, None)
 
-    # FIX-DOC5: Build format reward function (secondary, weight=0.2)
-    # Gives a dense always-available signal for JSON schema correctness,
-    # separate from the sparse environment reward.
     format_reward_fn = make_format_reward_fn()
 
     grpo_config = GRPOConfig(
         output_dir=output_dir,
         report_to="none",
-        # FIX-DOC6: loss_type="dapo" (TRL new default). Normalises by total active
-        # tokens in the accumulated batch → eliminates response length bias.
-        # "grpo" (old default) had length bias: shorter responses with positive
-        # advantages were over-weighted. "dapo" fixes this.
         loss_type="dapo",
-        # FIX-DOC7: mask_truncated_completions=True. Truncated completions are
-        # excluded from the loss. Prevents noise from incomplete JSON outputs
-        # being penalised as if they were intentionally bad. DAPO paper recommends.
         mask_truncated_completions=True,
-        # FIX-DOC8: scale_rewards="group". Explicit: normalises reward within each
-        # group of num_generations completions (group-relative, the "GR" in GRPO).
         scale_rewards="group",
-        # FIX-DOC9: disable_dropout=True. Docs: "useful for training with a reference
-        # model — prevents the model from generating different logprobs for the same
-        # input." We have beta=0.04 (non-zero), so the reference model IS loaded.
-        # Without this, the KL term gets noisy estimates.
         disable_dropout=True,
-        # FIX-DOC10: log_completions=True. Logs (prompt, completion) sample pairs
-        # every logging_steps. Makes it easy to see what the model is outputting
-        # during training without adding any overhead.
         log_completions=True,
-        # FIX-DOC11: reward_weights for dual reward functions.
-        # env_reward * 1.0 + format_reward * 0.2
-        # Format reward is weighted lightly so it guides format without dominating.
         reward_weights=[1.0, 0.2],
         **cfg,
     )
@@ -1076,30 +847,24 @@ def train(
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
-        # FIX-DOC5: Pass both reward functions. TRL sums them weighted by reward_weights.
-        # Docs: "you can pass several reward functions as a list"
         reward_funcs=[reward_fn, format_reward_fn],
         args=grpo_config,
         train_dataset=dataset,
     )
 
-    # 6. Train
     print("[INFO] Starting GRPO training...", flush=True)
     t0 = time.time()
     trainer.train()
     elapsed = time.time() - t0
     print(f"\n[INFO] Training complete in {elapsed/60:.1f} min", flush=True)
 
-    # 7. Save
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
     print(f"[INFO] Model saved to {output_dir}", flush=True)
 
-    # 8. Push to Hub
     if push_to_hub and HF_REPO_ID:
         print(f"[INFO] Pushing to HF Hub: {HF_REPO_ID}", flush=True)
-        # [FIX-T7] Merge LoRA weights before push so hub model is self-contained
         if backend == "unsloth":
             try:
                 from unsloth import FastLanguageModel
@@ -1118,17 +883,10 @@ def train(
     return output_dir
 
 
-# ── Smoke test ─────────────────────────────────────────────────────────────────
-
 def smoke_test():
-    """
-    Smoke test — no GPU, no model loading.
-    Verifies: server reachability, R1/R2 env steps, SFT+GRPO dataset pipeline.
-    """
     print("\n=== SMOKE TEST (rule-based, no GPU) ===\n", flush=True)
     import requests as _req
 
-    # Health checks
     try:
         r1h = _req.get(f"{ENV_BASE_URL}/health",         timeout=10).json()
         r2h = _req.get(f"{ENV_BASE_URL}/project/health", timeout=10).json()
@@ -1140,7 +898,6 @@ def smoke_test():
 
     results = {}
 
-    # ── R1 test ──────────────────────────────────────────────────────────────
     task = "easy_sprint"
     print(f"\n[R1] {task} (10 steps)...", flush=True)
     try:
@@ -1167,7 +924,6 @@ def smoke_test():
         print(f"  [ERROR] {e}", flush=True)
         results["r1/easy_sprint"] = None
 
-    # ── R2 test ──────────────────────────────────────────────────────────────
     task = "project_easy"
     print(f"\n[R2] {task} (8 steps)...", flush=True)
     try:
@@ -1197,7 +953,6 @@ def smoke_test():
         print(f"  [ERROR] {e}", flush=True)
         results["r2/project_easy"] = None
 
-    # ── Dataset pipeline test ─────────────────────────────────────────────────
     print(f"\n[DATASET] Testing GRPO dataset (12 examples)...", flush=True)
     try:
         ds = build_grpo_dataset(n_examples=12, phase="both")
@@ -1224,23 +979,15 @@ def smoke_test():
           f"--sft-epochs 2 --gpu-tier a100 --output results/trained_model --push", flush=True)
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="SFT+GRPO training for AI Sprint Manager")
-    parser.add_argument("--smoke-test",  action="store_true",
-                        help="Run smoke test (no GPU). Do this locally first.")
-    parser.add_argument("--phase",       choices=["r1", "r2", "both", "sft"], default="both",
-                        help="Training phase. 'sft' runs SFT only.")
-    parser.add_argument("--episodes",    type=int, default=200,
-                        help="GRPO dataset examples to collect (default: 200)")
-    parser.add_argument("--sft-epochs",  type=int, default=0,
-                        help="SFT warm-up epochs before GRPO (default: 0 = skip)")
-    parser.add_argument("--gpu-tier",    choices=["t4", "a10g", "a100"], default="t4",
-                        help="GPU tier for batch size scaling (default: t4)")
+    parser.add_argument("--smoke-test",  action="store_true")
+    parser.add_argument("--phase",       choices=["r1", "r2", "both", "sft"], default="both")
+    parser.add_argument("--episodes",    type=int, default=200)
+    parser.add_argument("--sft-epochs",  type=int, default=0)
+    parser.add_argument("--gpu-tier",    choices=["t4", "a10g", "a100"], default="t4")
     parser.add_argument("--output",      type=str, default="results/trained_model")
-    parser.add_argument("--push",        action="store_true",
-                        help="Push trained model to HF Hub (requires HF_REPO_ID)")
+    parser.add_argument("--push",        action="store_true")
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -1248,7 +995,6 @@ def main():
         return
 
     if args.phase == "sft":
-        # SFT only — useful to check format learning before GRPO
         model, tokenizer, _ = load_model_and_tokenizer(MODEL_NAME)
         run_sft(model, tokenizer, "both", 200, args.output)
         tokenizer.save_pretrained(args.output)
