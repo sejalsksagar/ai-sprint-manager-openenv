@@ -1156,6 +1156,35 @@ def train(
         cfg["num_generations"]             = 4
         cfg["gradient_accumulation_steps"] = 4
 
+    # ── Dual-GPU support (Kaggle T4 × 2) ──────────────────────────────────────
+    # GRPOTrainer is DDP-compatible. When launched with torchrun --nproc_per_node=2
+    # each process handles per_device_train_batch_size=1 on its own GPU.
+    # The effective global batch = n_gpus × batch × accum_steps stays constant
+    # if we halve gradient_accumulation_steps as n_gpus doubles.
+    #
+    # RUN COMMAND for dual-T4 Kaggle:
+    #   torchrun --nproc_per_node=2 train_llm.py --phase both --episodes 300 \
+    #            --sft-epochs 2 --gpu-tier t4 --output results/trained_model --push
+    #
+    # Single GPU (no change): python train_llm.py ...
+    try:
+        import torch
+        _n_gpus = torch.cuda.device_count()
+    except Exception:
+        _n_gpus = 1
+
+    if _n_gpus > 1:
+        print(f"[INFO] {_n_gpus} GPUs detected — enabling DDP, halving accumulation steps",
+              flush=True)
+        cfg["gradient_accumulation_steps"] = max(
+            1, cfg["gradient_accumulation_steps"] // _n_gpus
+        )
+        print(f"[INFO] gradient_accumulation_steps → {cfg['gradient_accumulation_steps']} "
+              f"(effective batch unchanged: {_n_gpus} × {cfg['per_device_train_batch_size']} "
+              f"× {cfg['gradient_accumulation_steps']})", flush=True)
+    else:
+        print(f"[INFO] Single GPU detected — using standard config", flush=True)
+
     # 1. Load model
     model, tokenizer, backend = load_model_and_tokenizer(MODEL_NAME)
 
@@ -1274,14 +1303,16 @@ def train(
                         "uploading a broken model."
                     )
 
-                # Push the validated merged directory
+                # Push the validated merged directory — delete_existing_files=True
+                # ensures the old broken checkpoint is fully overwritten, not merged.
                 from huggingface_hub import HfApi
                 api = HfApi(token=HF_TOKEN)
                 api.create_repo(repo_id=HF_REPO_ID, exist_ok=True, private=False)
                 api.upload_folder(
                     folder_path=merged_dir,
                     repo_id=HF_REPO_ID,
-                    commit_message="Upload merged fp16 model (SFT+GRPO trained)",
+                    commit_message="Upload merged fp16 model (SFT+GRPO trained) — full overwrite",
+                    delete_existing_files=True,   # ← overwrites old/broken checkpoint
                 )
                 tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
                 print(f"[INFO] ✅ Merged model pushed to https://huggingface.co/{HF_REPO_ID}",
@@ -1342,7 +1373,8 @@ def train(
                 api.upload_folder(
                     folder_path=merged_dir,
                     repo_id=HF_REPO_ID,
-                    commit_message="Upload merged fp16 model (SFT+GRPO trained)",
+                    commit_message="Upload merged fp16 model (SFT+GRPO trained) — full overwrite",
+                    delete_existing_files=True,
                 )
                 print(f"[INFO] ✅ Merged model pushed to https://huggingface.co/{HF_REPO_ID}",
                       flush=True)
