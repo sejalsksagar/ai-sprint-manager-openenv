@@ -244,11 +244,16 @@ def validate_llm_action(
 
     if at in ("assign", "reassign"):
         st = task.get("status")
-        if st != "backlog":
+        # [FIX-I3] reassign should accept in_progress tasks (that is its purpose);
+        # only assign requires status=backlog.
+        if at == "assign" and st != "backlog":
             return False, f"assign_bad_status:{st}"
+        if at == "reassign" and st not in ("backlog", "in_progress"):
+            return False, f"reassign_bad_status:{st}"
         if not _deps_met_task(obs, task):
             return False, "assign_deps"
-        if tid in assigned_this_episode:
+        # Only block re-assign for plain assign; reassign is explicitly re-routing
+        if at == "assign" and tid in assigned_this_episode:
             return False, "assign_already_started_episode"
         did = action.get("dev_id")
         if not did:
@@ -494,12 +499,24 @@ _parse_action = parse_action
 
 # ─── Smart fallback ───────────────────────────────────────────────────────────
 
-def smart_fallback(obs: dict, assigned_this_episode: set, last_dev_idx: list) -> dict:
+def smart_fallback(
+    obs: dict,
+    assigned_this_episode: set,
+    last_dev_idx: list,
+    assign_attempted_episode: Optional[set] = None,
+) -> dict:
+    """
+    [FIX-I2] accept assign_attempted_episode and skip recently-failed task IDs.
+    Tasks attempted but not confirmed in_progress (server rejected) are in
+    recently_failed. We skip them first pass to break the T15/T23 repeat loops.
+    If filtering leaves nothing assignable, fall back to unfiltered list.
+    """
     tasks          = obs.get("tasks", [])
     devs           = obs.get("developers", [])
     instructions   = obs.get("instruction_queue", [])
     current_sprint = obs.get("current_sprint", 1)
     completed_ids  = {t["id"] for t in tasks if t.get("status") == "done"}
+    recently_failed = (assign_attempted_episode or set()) - assigned_this_episode
 
     def deps_met(task: dict) -> bool:
         meta = task.get("metadata", {}) or {}   # [FIX-I5]
@@ -529,8 +546,17 @@ def smart_fallback(obs: dict, assigned_this_episode: set, last_dev_idx: list) ->
             return {"action_type": "reprioritize", "task_id": task["id"],
                     "dev_id": None, "new_priority": 1}
 
-    # Tier 3: assign
-    assignable = [t for t in tasks if t.get("status") == "backlog" and deps_met(t)]
+    # Tier 3: assign — [FIX-I2] exclude recently-failed task IDs (first pass)
+    assignable = [
+        t for t in tasks
+        if t.get("status") == "backlog"
+        and deps_met(t)
+        and t["id"] not in recently_failed
+    ]
+    # Second pass: if exclusion left nothing, retry without filter
+    # (something may have changed, e.g. a dev became available again)
+    if not assignable:
+        assignable = [t for t in tasks if t.get("status") == "backlog" and deps_met(t)]
     if not assignable:
         return skip
 
@@ -621,9 +647,12 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
         sprint = obs.get("current_sprint", 1)
 
         router_ok = _local_model is not None or bool(HF_TOKEN)
+        # [FIX-I1] Was `== 1`, but n % 1 is always 0, so condition was ALWAYS False.
+        # The LLM was never called in the entire episode — every action was rule-based.
+        # Fix: `== 0` fires on every step when LLM_CALL_EVERY=1 (correct intent).
         allow_llm = (
             USE_LLM
-            and (step_num % LLM_CALL_EVERY == 1)
+            and (step_num % LLM_CALL_EVERY == 0)
             and router_ok
             and step_num > llm_cooldown_until
         )
@@ -709,7 +738,8 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                 )
 
         if action is None:
-            action = smart_fallback(obs, assigned_this_episode, last_dev_idx)
+            # [FIX-I2] pass assign_attempted_episode so fallback skips recently-failed tasks
+            action = smart_fallback(obs, assigned_this_episode, last_dev_idx, assign_attempted_episode)
 
         if action.get("action_type") in ("assign", "reassign") and action.get("task_id"):
             assign_attempted_episode.add(action["task_id"])
@@ -719,9 +749,16 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
 
         for attempt in range(MAX_STEP_RETRIES):
             result = step_env(action)
-            new_obs = result.get("observation", result)
+            # [FIX-I5] More robust obs extraction: if the response has no
+            # "observation" key and also has no "current_day" (i.e. it is a raw
+            # error envelope), keep the old obs to avoid spurious regression.
+            raw_obs = result.get("observation", result)
+            if raw_obs.get("current_day") is None:
+                new_obs = obs  # server returned a non-obs response; keep stale
+            else:
+                new_obs = raw_obs
 
-            # 🚨 HARD GUARD: detect time regression
+            # HARD GUARD: detect time regression
             if (
                 new_obs.get("current_day", 0) < obs.get("current_day", 0) or
                 new_obs.get("current_sprint", 0) < obs.get("current_sprint", 0)
@@ -734,8 +771,29 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
             break
 
         if not success:
-            print("[FATAL] Repeated environment corruption — aborting episode", flush=True)
-            break
+            # [FIX-I4] Before aborting, try a no-op skip as recovery.
+            # Regression sometimes happens because the server returned a response
+            # without an "observation" key [FIX-I5], so new_obs got current_day=0.
+            # A skip will return a fresh obs that we can sanity-check.
+            recovered = False
+            try:
+                skip_action = {"action_type": "skip", "task_id": None,
+                               "dev_id": None, "new_priority": None}
+                rec_result  = step_env(skip_action)
+                rec_obs     = rec_result.get("observation", {})
+                # Accept if day didn't go backwards relative to what we last knew
+                if rec_obs.get("current_day", 0) >= obs.get("current_day", 0):
+                    result    = rec_result
+                    new_obs   = rec_obs
+                    action    = skip_action   # log the actual action taken
+                    recovered = True
+                    print("[RECOVER] Skip recovery succeeded", flush=True)
+            except Exception as rec_err:
+                print(f"[RECOVER] Skip recovery failed: {rec_err}", flush=True)
+            if not recovered:
+                print("[FATAL] Repeated environment corruption — aborting episode",
+                      flush=True)
+                break
 
         reward     = result.get("reward", 0.0)
         obs        = new_obs
