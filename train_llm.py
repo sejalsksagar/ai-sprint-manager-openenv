@@ -205,7 +205,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*max_new_token
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 HF_TOKEN     = os.getenv("HF_TOKEN", "")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")  # for LOCAL training
-HF_REPO_ID   = os.getenv("HF_REPO_ID", "")
+HF_REPO_ID   = os.getenv("HF_REPO_ID", "sejal-k/multi-sprint-model")
 
 # ── GRPO hyperparameters ───────────────────────────────────────────────────────
 # Defaults for T4 (16GB). Adjust per GPU via CLI or env override.
@@ -1102,6 +1102,9 @@ def train(
     print(f" Model:  {MODEL_NAME}", flush=True)
     print(f" Server: {ENV_BASE_URL}", flush=True)
     print(f" SFT warm-up epochs: {sft_epochs}", flush=True)
+    if push_to_hub:
+        _resolved_repo = HF_REPO_ID or "(HF_REPO_ID not set — push will be skipped)"
+        print(f" Push to Hub: {_resolved_repo}", flush=True)
     print(f"{'='*60}\n", flush=True)
 
     # Adjust config for GPU tier
@@ -1195,22 +1198,117 @@ def train(
     print(f"[INFO] Model saved to {output_dir}", flush=True)
 
     # 8. Push to Hub
+    # [FIX-PUSH] The original code called model.merge_and_unload() directly on a
+    # 4-bit quantized model, which silently produces a broken 40-byte stub.
+    # The fix: dequantize to float16 first (via Unsloth's save_pretrained_merged),
+    # validate the output, then push the full-weight checkpoint.
+    # For the HF+PEFT backend, we merge the LoRA adapter via peft merge_and_unload
+    # only after casting to float16 to avoid the bitsandbytes quantized-merge bug.
     if push_to_hub and HF_REPO_ID:
         print(f"[INFO] Pushing to HF Hub: {HF_REPO_ID}", flush=True)
-        # [FIX-T7] Merge LoRA weights before push so hub model is self-contained
+        merged_dir = str(Path(output_dir) / "merged_for_hub")
+
         if backend == "unsloth":
+            # [FIX-PUSH-A] Use Unsloth's save_pretrained_merged which handles
+            # dequantization internally before merging — avoids the bitsandbytes
+            # 4-bit merge bug that produced the 40-byte adapter_model.safetensors.
             try:
-                merged = model.merge_and_unload()
-                merged.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
+                from unsloth import FastLanguageModel
+                print("[INFO] Saving merged model via Unsloth (dequantized fp16)...", flush=True)
+                model.save_pretrained_merged(
+                    merged_dir,
+                    tokenizer,
+                    save_method="merged_16bit",   # full weights in fp16, not 4-bit
+                )
+                # Validate: merged checkpoint must have a real safetensors file (> 100 MB)
+                merged_path = Path(merged_dir)
+                weight_files = list(merged_path.glob("*.safetensors")) + \
+                               list(merged_path.glob("*.bin"))
+                total_bytes  = sum(f.stat().st_size for f in weight_files)
+                print(f"[INFO] Merged checkpoint size: {total_bytes / 1e9:.2f} GB "
+                      f"({len(weight_files)} weight file(s))", flush=True)
+
+                if total_bytes < 100 * 1024 * 1024:  # < 100 MB → broken merge
+                    raise RuntimeError(
+                        f"Merged checkpoint is suspiciously small ({total_bytes} bytes). "
+                        "This indicates a failed merge. Aborting push to prevent "
+                        "uploading a broken model."
+                    )
+
+                # Push the validated merged directory
+                from huggingface_hub import HfApi
+                api = HfApi(token=HF_TOKEN)
+                api.create_repo(repo_id=HF_REPO_ID, exist_ok=True, private=False)
+                api.upload_folder(
+                    folder_path=merged_dir,
+                    repo_id=HF_REPO_ID,
+                    commit_message="Upload merged fp16 model (SFT+GRPO trained)",
+                )
                 tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
-                print(f"[INFO] Merged model pushed to https://huggingface.co/{HF_REPO_ID}", flush=True)
+                print(f"[INFO] ✅ Merged model pushed to https://huggingface.co/{HF_REPO_ID}",
+                      flush=True)
+
             except Exception as e:
-                print(f"[WARN] Merge failed ({e}), pushing LoRA adapter only", flush=True)
-                model.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
-                tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
+                print(f"[ERROR] Merged push failed: {e}", flush=True)
+                print("[INFO] Falling back: saving LoRA adapter + base model card "
+                      "(NOT a standalone model — use with base + PEFT for inference)", flush=True)
+                # Push the LoRA adapter checkpoint so training isn't lost, but
+                # clearly mark it as an adapter-only upload so inference scripts
+                # don't mistake it for a full model.
+                adapter_repo = HF_REPO_ID + "-lora-adapter"
+                try:
+                    model.push_to_hub(adapter_repo, token=HF_TOKEN)
+                    tokenizer.push_to_hub(adapter_repo, token=HF_TOKEN)
+                    print(f"[WARN] LoRA adapter saved to {adapter_repo} — "
+                          f"NOT usable directly; load with base model + peft.", flush=True)
+                except Exception as e2:
+                    print(f"[ERROR] Adapter push also failed: {e2}", flush=True)
+
         else:
-            model.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
-            tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
+            # [FIX-PUSH-B] HF+PEFT backend: must cast to fp16 before merge because
+            # peft's merge_and_unload on a 4-bit model also produces broken weights.
+            try:
+                import torch
+                from peft import PeftModel
+                print("[INFO] Casting to fp16 and merging LoRA for HF+PEFT backend...",
+                      flush=True)
+                # Save the LoRA adapter locally first
+                adapter_dir = str(Path(output_dir) / "lora_adapter")
+                model.save_pretrained(adapter_dir)
+                tokenizer.save_pretrained(adapter_dir)
+
+                # Reload base model in fp16 (without quantization) and merge
+                from transformers import AutoModelForCausalLM, AutoTokenizer
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    MODEL_NAME,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    token=HF_TOKEN or None,
+                )
+                merged_model = PeftModel.from_pretrained(base_model, adapter_dir)
+                merged_model = merged_model.merge_and_unload()
+
+                # Validate
+                total_params = sum(p.numel() for p in merged_model.parameters())
+                print(f"[INFO] Merged model params: {total_params:,}", flush=True)
+                if total_params < 1_000_000:
+                    raise RuntimeError("Merged model has suspiciously few parameters.")
+
+                merged_model.save_pretrained(merged_dir, safe_serialization=True)
+                tokenizer.save_pretrained(merged_dir)
+
+                from huggingface_hub import HfApi
+                api = HfApi(token=HF_TOKEN)
+                api.create_repo(repo_id=HF_REPO_ID, exist_ok=True, private=False)
+                api.upload_folder(
+                    folder_path=merged_dir,
+                    repo_id=HF_REPO_ID,
+                    commit_message="Upload merged fp16 model (SFT+GRPO trained)",
+                )
+                print(f"[INFO] ✅ Merged model pushed to https://huggingface.co/{HF_REPO_ID}",
+                      flush=True)
+            except Exception as e:
+                print(f"[ERROR] HF+PEFT merged push failed: {e}", flush=True)
 
     return output_dir
 
@@ -1372,6 +1470,10 @@ def main():
         model, tokenizer, _ = load_model_and_tokenizer(MODEL_NAME)
         run_sft(model, tokenizer, "both", 200, args.output)
         tokenizer.save_pretrained(args.output)
+        if args.push:
+            # Reuse the same push logic via train() with 0 GRPO steps
+            print("[INFO] --push with --phase sft: use --phase both --episodes 0 "
+                  "to push after SFT. Skipping push for SFT-only mode.", flush=True)
         return
 
     train(
