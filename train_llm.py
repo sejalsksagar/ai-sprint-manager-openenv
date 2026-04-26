@@ -677,6 +677,41 @@ def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
     return Dataset.from_list(examples)
 
 
+def _format_to_string(example, tokenizer):
+    prompt = example.get("prompt")
+    completion = example.get("completion")
+
+    # Convert prompt -> string
+    if isinstance(prompt, list):
+        if hasattr(tokenizer, "apply_chat_template"):
+            prompt = tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt = "\n".join(
+                f"<|{m.get('role','user')}|>\n{m.get('content','')}"
+                for m in prompt
+            ) + "\n<|assistant|>\n"
+
+    # Final safety cast (fixes list/object type crashes in tokenization)
+    prompt = str(prompt) if prompt is not None else ""
+    completion = str(completion) if completion is not None else ""
+
+    return {
+        "prompt": prompt,
+        "completion": completion,
+    }
+
+
+def _force_str(example):
+    return {
+        "prompt": str(example["prompt"]),
+        "completion": str(example["completion"]),
+    }
+
+
 def load_model_and_tokenizer(model_name: str):
     try:
         from unsloth import FastLanguageModel
@@ -752,13 +787,14 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
         return model
 
     sft_data = build_sft_dataset(n_examples=n_examples, phase=phase)
+    sft_data = sft_data.map(
+        lambda x: _format_to_string(x, tokenizer),
+        num_proc=1,  # keep 1 to avoid multiprocessing serialization issues
+    )
+    sft_data = sft_data.map(_force_str, num_proc=1)
 
     def format_fn(example):
-        parts = []
-        for msg in example["prompt"]:
-            parts.append(f"<|{msg['role']}|>\n{msg['content']}")
-        parts.append(f"<|assistant|>\n{example['completion']}")
-        return {"text": "\n".join(parts)}
+        return {"text": f"{example['prompt']}{example['completion']}"}
 
     sft_data = sft_data.map(format_fn)
 
