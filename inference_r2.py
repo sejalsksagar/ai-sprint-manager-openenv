@@ -25,10 +25,11 @@ KEY FIXES IN THIS VERSION
         (task, dev) pair in it. It also skips tasks already
         in_progress in the current observation.
 
-[FIX-E] LOCAL FINETUNED MODEL BY DEFAULT
-        USE_LLM defaults to on: loads priyaaaaaasharmaaaaa/trial1 via
-        LOCAL_MODEL_PATH (Unsloth/PEFT). Set USE_LLM=0 for rule-based-only.
-        If load fails, main() falls back to HF router or rule-based.
+[FIX-E] LLM DISABLED BY DEFAULT (too many invalid actions)
+        The fine-tuned model produces `unblock_not_blocked` and
+        `assign_bad_status:missed` on almost every call. With
+        USE_LLM=0 the rule-based system runs clean and scores higher.
+        Set USE_LLM=1 only if you have a better checkpoint.
 
 [FIX-F] SKIP ONLY AFTER GENUINE EXHAUSTION
         smart_fallback now tries every valid (task, dev) combo before
@@ -78,18 +79,14 @@ ENV_BASE_URL     = os.getenv("ENV_BASE_URL",     "https://sejal-k-ai-sprint-mana
 API_BASE_URL     = os.getenv("API_BASE_URL",     "https://router.huggingface.co/v1")
 HF_TOKEN         = os.getenv("HF_TOKEN",         "")
 
-# Local fine-tune (trial1) on by default; USE_LLM=0 to disable
-_use_llm_raw = os.getenv("USE_LLM", "1").strip().lower()
+# [FIX-E] Default LLM OFF — rule-based outperforms broken checkpoint
+_use_llm_raw = os.getenv("USE_LLM", "0").strip().lower()
 USE_LLM      = _use_llm_raw not in ("0", "false", "no", "off", "")
 
 LLM_COOLDOWN_STEPS        = int(os.getenv("LLM_COOLDOWN_STEPS",        "5"))
-MAX_LLM_SOFT_FAIL_STREAK  = int(os.getenv("MAX_LLM_SOFT_FAIL_STREAK",  "2"))
+MAX_LLM_SOFT_FAIL_STREAK  = int(os.getenv("MAX_LLM_SOFT_FAIL_STREAK",  "3"))
 MAX_LLM_SKIP_STREAK       = int(os.getenv("MAX_LLM_SKIP_STREAK",       "4"))
 MAX_SAME_BAD_ASSIGN_STREAK = int(os.getenv("MAX_SAME_BAD_ASSIGN_STREAK", "2"))
-# After this many invalid LLM actions in one episode, stop calling the model (rule-based only).
-EPISODE_LLM_MAX_INVALID   = int(os.getenv("EPISODE_LLM_MAX_INVALID",   "4"))
-# Extra env-step retries when the server reports day/sprint regression (rotate actions).
-MAX_STEP_RETRIES          = int(os.getenv("MAX_STEP_RETRIES",          "12"))
 
 MAX_TOKENS     = 96
 MAX_RETRIES    = 2
@@ -279,20 +276,7 @@ def _assignable_tasks(obs: dict, excluded: Optional[set] = None) -> List[dict]:
 # ---------------------------------------------------------------------------
 # A set of (task_id, dev_id) string tuples that caused regressions or
 # repeated env rejections. Populated by run_episode() and passed through.
-BadComboSet      = Set[Tuple[str, str]]
-RegressionBanSet = Set[str]
-
-
-def _action_fingerprint(a: dict) -> str:
-    """Stable key for an action; used to avoid repeating env day/sprint regressions."""
-    return "|".join(
-        [
-            str(a.get("action_type", "")),
-            str(a.get("task_id") or ""),
-            str(a.get("dev_id") or ""),
-            str(a.get("new_priority") if a.get("new_priority") is not None else ""),
-        ]
-    )
+BadComboSet = Set[Tuple[str, str]]
 
 
 # ---------------------------------------------------------------------------
@@ -537,10 +521,8 @@ def _reprioritize_waiting_deps(
     min_priority: int,
     *,
     relax_dev: bool,
-    regression_banned: Optional[RegressionBanSet] = None,
 ) -> Optional[dict]:
     """Raise priority to 1 for backlog tasks whose dependencies are not yet done."""
-    banned = regression_banned or set()
     for task in tasks:
         if task.get("status") != "backlog" or _deps_met(obs, task):
             continue
@@ -552,8 +534,6 @@ def _reprioritize_waiting_deps(
             "dev_id":       None,
             "new_priority": 1,
         }
-        if _action_fingerprint(action) in banned:
-            continue
         ok, _ = validate_action(
             obs, action, assigned_this_episode, relax_dev_avail=relax_dev,
         )
@@ -568,10 +548,8 @@ def _scan_reprioritize_variants(
     assigned_this_episode: set,
     *,
     relax_dev: bool,
-    regression_banned: Optional[RegressionBanSet] = None,
 ) -> Optional[dict]:
     """Any valid reprioritize that changes numeric priority (unsticks repeated Txx→P1 loops)."""
-    banned = regression_banned or set()
     for task in tasks:
         if task.get("status") != "backlog":
             continue
@@ -585,8 +563,6 @@ def _scan_reprioritize_variants(
                 "dev_id":       None,
                 "new_priority": np,
             }
-            if _action_fingerprint(action) in banned:
-                continue
             ok, _ = validate_action(
                 obs, action, assigned_this_episode, relax_dev_avail=relax_dev,
             )
@@ -606,7 +582,6 @@ def smart_fallback(
     bad_combos: Optional[BadComboSet] = None,
     *,
     force_non_skip: bool = False,
-    regression_banned: Optional[RegressionBanSet] = None,
 ) -> dict:
     """
     Tiered decision engine. Passes bad_combos through to _guarantee_assign
@@ -620,7 +595,6 @@ def smart_fallback(
     Tier 5  Skip (disabled when force_non_skip — reprioritize variants + relax-skill assign)
     """
     bad    = bad_combos or set()
-    banned = regression_banned or set()
     tasks  = obs.get("tasks", [])
     instructions = obs.get("instruction_queue", [])
 
@@ -637,8 +611,6 @@ def smart_fallback(
                 inst.get("text", ""), obs, assigned_this_episode, bad
             )
             if action:
-                if _action_fingerprint(action) in banned:
-                    continue
                 print(
                     f"  [FB-T0] inst text parse -> {action['task_id']}->{action['dev_id']}",
                     flush=True,
@@ -654,8 +626,6 @@ def smart_fallback(
                 "dev_id":       None,
                 "new_priority": None,
             }
-            if _action_fingerprint(action) in banned:
-                continue
             ok, _ = validate_action(
                 obs, action, assigned_this_episode, relax_dev_avail=force_non_skip,
             )
@@ -694,12 +664,7 @@ def smart_fallback(
 
     # ── Tier 4 (normal) ───────────────────────────────────────────────────────
     act4 = _reprioritize_waiting_deps(
-        obs,
-        tasks,
-        assigned_this_episode,
-        2,
-        relax_dev=force_non_skip,
-        regression_banned=banned,
+        obs, tasks, assigned_this_episode, 2, relax_dev=force_non_skip,
     )
     if act4:
         print(f"  [FB-T4] reprioritize {act4['task_id']} (waiting deps)", flush=True)
@@ -708,12 +673,7 @@ def smart_fallback(
     # ── Recovery / no-skip tail ─────────────────────────────────────────────
     if force_non_skip:
         act4b = _reprioritize_waiting_deps(
-            obs,
-            tasks,
-            assigned_this_episode,
-            0,
-            relax_dev=True,
-            regression_banned=banned,
+            obs, tasks, assigned_this_episode, 0, relax_dev=True,
         )
         if act4b:
             print(
@@ -733,8 +693,6 @@ def smart_fallback(
                 "dev_id":       None,
                 "new_priority": np,
             }
-            if _action_fingerprint(action) in banned:
-                continue
             ok, _ = validate_action(
                 obs, action, assigned_this_episode, relax_dev_avail=True,
             )
@@ -769,7 +727,7 @@ def smart_fallback(
             )
             return loose
         scan = _scan_reprioritize_variants(
-            obs, tasks, assigned_this_episode, relax_dev=True, regression_banned=banned,
+            obs, tasks, assigned_this_episode, relax_dev=True,
         )
         if scan:
             print(
@@ -1102,11 +1060,9 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
     recover_until_assign = False
     last_neg_combo: Optional[Tuple[str, str]] = None
     neg_reward_streak   = 0
-    regression_banned: RegressionBanSet = set()
-    episode_llm_invalid   = 0
-    episode_llm_disabled  = False
 
-    MAX_STEPS = 200
+    MAX_STEPS        = 200
+    MAX_STEP_RETRIES = 3
 
     print(f"\n[START] task={scenario}", flush=True)
 
@@ -1132,7 +1088,6 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
         router_ok = _local_model is not None or bool(HF_TOKEN)
         allow_llm = (
             USE_LLM
-            and not episode_llm_disabled
             and (step_num % LLM_CALL_EVERY == 0)
             and router_ok
             and step_num > llm_cooldown_until
@@ -1195,23 +1150,14 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                                 proposed = None
 
                     if proposed is not None:
-                        llm_skip_streak       = 0
-                        llm_soft_fail_streak  = 0
-                        bad_assign_tid        = None
-                        bad_assign_streak     = 0
-                        episode_llm_invalid   = 0
-                        action                = proposed
+                        llm_skip_streak      = 0
+                        llm_soft_fail_streak = 0
+                        bad_assign_tid       = None
+                        bad_assign_streak    = 0
+                        action               = proposed
                 else:
                     llm_soft_fail_streak += 1
-                    episode_llm_invalid += 1
                     print(f"  [REJECT] LLM invalid ({reason}) -> fallback", flush=True)
-                    if episode_llm_invalid >= EPISODE_LLM_MAX_INVALID:
-                        episode_llm_disabled = True
-                        print(
-                            f"  [LLM] disabled for rest of episode "
-                            f"({episode_llm_invalid} invalid actions ≥ {EPISODE_LLM_MAX_INVALID})",
-                            flush=True,
-                        )
                     if proposed.get("action_type") in ("assign", "reassign"):
                         tidp    = proposed.get("task_id")
                         tid_key = str(tidp) if tidp else None
@@ -1253,7 +1199,6 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                 last_dev_idx,
                 bad_combos=bad_combos,
                 force_non_skip=recover_until_assign,
-                regression_banned=regression_banned,
             )
             ok, reason = validate_action(
                 obs,
@@ -1335,7 +1280,6 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                         last_dev_idx,
                         bad_combos=bad_combos,
                         force_non_skip=recover_until_assign,
-                        regression_banned=regression_banned,
                     )
                     ok2, _ = validate_action(
                         obs,
@@ -1370,44 +1314,23 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                         flush=True,
                     )
                 else:
-                    fp = _action_fingerprint(last_action)
-                    regression_banned.add(fp)
                     print(
-                        f"  [REGRESSION-BAN] {fp} (attempt {attempt+1})",
+                        f"  [ERROR] State regression (attempt {attempt+1}) -- retrying",
                         flush=True,
                     )
-                    action = smart_fallback(
+                    action = _guarantee_assign(
+                        obs,
+                        assigned_this_episode,
+                        inst_task_ids,
+                        bad_combos=bad_combos,
+                        expand_devs=True,
+                    ) or smart_fallback(
                         obs,
                         assigned_this_episode,
                         last_dev_idx,
                         bad_combos=bad_combos,
                         force_non_skip=True,
-                        regression_banned=regression_banned,
                     )
-                    ok3, _ = validate_action(
-                        obs,
-                        action,
-                        assigned_this_episode,
-                        relax_dev_avail=True,
-                        relax_skill_match=action.get("action_type")
-                        in ("assign", "reassign"),
-                    )
-                    if not ok3:
-                        action = _guarantee_assign(
-                            obs,
-                            assigned_this_episode,
-                            inst_task_ids,
-                            bad_combos=bad_combos,
-                            expand_devs=True,
-                            relax_skill=True,
-                        ) or smart_fallback(
-                            obs,
-                            assigned_this_episode,
-                            last_dev_idx,
-                            bad_combos=bad_combos,
-                            force_non_skip=True,
-                            regression_banned=regression_banned,
-                        )
                     print(
                         f"  [RETRY-REG] pivoted to "
                         f"{action.get('action_type')} {action.get('task_id')}→{action.get('dev_id')}",
@@ -1417,7 +1340,6 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                 continue
 
             success = True
-            regression_banned.clear()
             break
 
         if not success:
