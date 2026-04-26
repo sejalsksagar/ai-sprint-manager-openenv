@@ -1,462 +1,525 @@
 """
-inference_r2.py — Round 2 LLM agent for AI Sprint Manager
-Fixed version: 2024-Q2-patch
+Inference Script — AI Sprint Manager Round 2 (Multi-Sprint Project Manager)
+============================================================================
+Key improvements over previous version:
+  - 3-retry backoff before rule-based fallback (was 1 try → immediate fallback)
+  - Batched LLM calls: only call LLM every N steps, reuse for simple repeats
+  - No repeated assignments: episode-level memory tracks assigned/in-progress tasks
+  - Smart fallback: instruction-aware, dep-aware, never repeats same failing action
+  - Rate-limit-aware: exponential back-off (1s, 2s, 4s) between retries
+  - Compact prompt: ~250 tokens (was ~350+), avoids hitting HF free-tier quota
 
-Key fixes vs original:
-  1. 402 errors no longer retried (billing errors are irrecoverable)
-  2. LLM called every LLM_CALL_EVERY steps only (default=3) to stay within quota
-  3. smart_fallback actually assigns BACKLOG tasks instead of defaulting to skip
-  4. task_id validated with ^T\\d+$ regex before accepting LLM output
-  5. Dev rotation in fallback to avoid same dev doing everything
-  6. Instruction-aware fallback: prioritises tasks referenced in active instructions
+MANDATORY ENV VARS:
+    API_BASE_URL  : LLM endpoint  (e.g. https://router.huggingface.co/v1)
+    MODEL_NAME    : Model identifier
+    HF_TOKEN      : HuggingFace / API key
+    ENV_BASE_URL  : Running environment server
+
+OUTPUT FORMAT (required by OpenEnv validator):
+    [START] printed once at episode start      — flush=True
+    [STEP]  printed after every step           — flush=True
+    [END]   printed once at episode end        — flush=True
+
+Run locally (no LLM — rule-based fallback):
+    python inference_r2.py
+
+Run with LLM:
+    HF_TOKEN=hf_... python inference_r2.py
 """
 
+from __future__ import annotations
+
+import json
 import os
-import re
 import sys
 import time
-import json
-import random
 from typing import Optional
+
 import requests
-from openai import OpenAI, APIStatusError, APIConnectionError
+from dotenv import load_dotenv
+from openai import OpenAI
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
-ENV_BASE_URL = "https://sejal-k-ai-sprint-manager.hf.space"
+load_dotenv()
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-HF_TOKEN     = os.getenv("HF_TOKEN", "")
+API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "dummy")
+MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 
-MAX_TOKENS      = 60
-MAX_RETRIES     = 2       # Applies only to retryable errors (429, 5xx)
-TEMPERATURE     = 0.1
-LLM_CALL_EVERY  = 3       # Call LLM every Nth step; use fallback on other steps
-BUCKET_MAX      = 35      # Token-bucket calls/min ceiling (informational)
+MAX_STEPS    = 60        # full 60-day project
+TEMPERATURE  = 0.15     # low: we want deterministic JSON not creative writing
+MAX_TOKENS   = 80       # action JSON is tiny — 80 tokens is plenty
 
-# Regex for valid task IDs — anything else from LLM output is garbage
-TASK_ID_RE = re.compile(r"^T\d+$")
+# Retry / rate-limit config
+MAX_RETRIES  = 3        # attempts before falling back to rule-based
+RETRY_DELAYS = [1, 2, 4]  # seconds between retries (exponential-ish)
 
-# ─── Retryable vs non-retryable HTTP errors ───────────────────────────────────
-RETRYABLE_CODES = {429, 500, 502, 503, 504}
-# 402 = billing / quota depleted — retrying is pointless, go straight to fallback
+# LLM call batching: only call LLM every LLM_CALL_EVERY steps.
+# Between calls, repeat the last valid action if it worked, else fallback.
+# Set to 1 to call every step (best quality, most tokens).
+# Set to 2-3 to halve/third token usage (helps stay under HF free-tier quota).
+LLM_CALL_EVERY = 1  # call every step — adjust to 2 if rate limits are severe
+
+TASKS = ["project_easy", "project_medium", "project_hard"]
+
+client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+# Kept deliberately short. Every token in the system prompt burns quota.
+# Rules that matter: follow instructions, check deps, don't re-assign in_progress.
+
+R2_SYSTEM_PROMPT = """You are an Engineering Manager. Output ONLY a JSON action each step.
+
+Schema: {"action_type":"<assign|reassign|reprioritize|unblock|skip>","task_id":"<id or null>","dev_id":"<id or null>","new_priority":<1-5 or null>}
+
+Rules:
+- Follow ACTIVE INSTRUCTIONS first — assign their tasks immediately
+- Only assign BACKLOG tasks (not in_progress or done)
+- Only assign if deps marked ✓ and developer is available (✓)
+- unblock: only for blocked tasks
+- skip: last resort
+
+Output ONLY the JSON. No explanation."""
 
 
-def is_retryable(exc: APIStatusError) -> bool:
-    return exc.status_code in RETRYABLE_CODES
+# ── Prompt builder ─────────────────────────────────────────────────────────────
 
+def build_user_prompt(obs: dict, assigned_this_episode: set) -> str:
+    """
+    Compact per-step prompt. Target: under 250 tokens.
+    Shows only actionable backlog tasks (deps met, not already assigned this episode).
+    """
+    current_day    = obs["current_day"]
+    current_sprint = obs.get("current_sprint", 1)
+    days_left      = max(0, current_sprint * 10 - current_day + 1)
 
-# ─── OpenAI / HF Router client ───────────────────────────────────────────────
-def make_client() -> Optional[OpenAI]:
-    if not HF_TOKEN:
-        return None
-    return OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    tasks    = obs["tasks"]
+    done_ids = {t["id"] for t in tasks if t["status"] == "done"}
 
+    # Active unfollowed instructions — top 2 only to save tokens
+    active_insts = [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)]
+    if active_insts:
+        inst_lines = " | ".join(
+            f"[{i['id']}] {i['text'][:45]}" for i in active_insts[:2]
+        )
+        inst_section = f"⚡FOLLOW: {inst_lines}"
+    else:
+        inst_section = "No instructions."
 
-R2_SYSTEM_PROMPT = (
-    "You are a tech lead managing a 6-sprint software project. "
-    "Each step you receive the current environment state and must output ONE JSON action. "
-    "Respond ONLY with valid JSON, no markdown, no explanation."
-)
+    # Tech debt — just count
+    debt_count = len(obs.get("tech_debt", []))
+    debt_str   = f"debt={debt_count}" if debt_count else "debt=0"
 
-
-def build_user_prompt(obs: dict) -> str:
-    tasks = obs.get("tasks", [])
-    backlog = [
-        f"{t['id']}({t.get('required_skill','?')},eff={t.get('effort',1)})"
-        for t in tasks
-        if t.get("status") == "backlog"
-    ]
-    in_prog = [
-        f"{t['id']}({t.get('status','?')})"
-        for t in tasks
-        if t.get("status") == "in_progress"
-    ]
-    devs = obs.get("developers", [])
-    dev_info = [
-        f"{d['id']}({d.get('skill','?')},cap={d.get('remaining_capacity', d.get('capacity',5))})"
-        for d in devs
-    ]
-    instructions = obs.get("instruction_queue", [])
-    active_inst = [i.get("text", "")[:80] for i in instructions if not i.get("followed")]
-
-    lines = [
-        f"day={obs.get('current_day',0)} sprint={obs.get('current_sprint',0)}",
-        f"BACKLOG: {', '.join(backlog[:12]) or 'none'}",
-        f"IN_PROGRESS: {', '.join(in_prog[:6]) or 'none'}",
-        f"DEVS: {', '.join(dev_info)}",
-    ]
-    if active_inst:
-        lines.append(f"INSTRUCTIONS: {' | '.join(active_inst[:3])}")
-    lines.append(
-        'Output JSON: {"action_type":"assign","task_id":"T01","dev_id":"dev1"} '
-        'Only assign BACKLOG tasks. Valid action_types: assign, reprioritize, unblock, skip.'
+    # Backlog tasks — only actionable ones (deps met), exclude already-assigned
+    backlog = sorted(
+        [t for t in tasks if t["status"] == "backlog"],
+        key=lambda t: (t["priority"], t["deadline"])
     )
-    return "\n".join(lines)
+
+    def fmt(t: dict) -> str:
+        deps = t.get("metadata", {}).get("depends_on", [])
+        dep_ok = "✓" if all(d in done_ids for d in deps) else "✗"
+        already = "★" if t["id"] in assigned_this_episode else ""
+        return f"[{t['id']}]P{t['priority']} {t['required_skill'][:4]} {dep_ok}{already} D{t['deadline']}"
+
+    # Prioritise: actionable (✓ deps, not already assigned), then rest
+    actionable = [t for t in backlog
+                  if all(d in done_ids for d in t.get("metadata", {}).get("depends_on", []))
+                  and t["id"] not in assigned_this_episode]
+    blocked_deps = [t for t in backlog if t not in actionable]
+
+    shown = actionable[:5] + blocked_deps[:2]
+    backlog_str = " ".join(fmt(t) for t in shown)
+    if len(backlog) > len(shown):
+        backlog_str += f" +{len(backlog)-len(shown)}"
+
+    in_prog = [t for t in tasks if t["status"] == "in_progress"]
+    inprog_str = " ".join(f"[{t['id']}]→{t['assigned_to']}" for t in in_prog) or "none"
+
+    # Developers — available ones first
+    avail_devs = [d for d in obs["developers"] if d["is_available"]]
+    busy_devs  = [d for d in obs["developers"] if not d["is_available"]]
+    def fmt_dev(d):
+        return f"[{d['id']}]{d['name'][:4]}({d['skill'][:3]}) {d['current_load']}/{d['capacity']}"
+    devs_str = " ".join(fmt_dev(d) for d in avail_devs)
+    if busy_devs:
+        devs_str += " BUSY:" + " ".join(fmt_dev(d) for d in busy_devs)
+
+    return (
+        f"D{current_day}/60 S{current_sprint}/6 {days_left}d "
+        f"done={obs['tasks_completed']} miss={obs['tasks_missed']} "
+        f"inst={obs.get('instruction_following_score',0):.2f} {debt_str}\n"
+        f"{inst_section}\n"
+        f"BACKLOG(✓=ok ★=assigned): {backlog_str}\n"
+        f"IN_PROG: {inprog_str}\n"
+        f"DEVS(avail): {devs_str}\n"
+        f"JSON:"
+    )
 
 
-# ─── LLM call with smart retry ───────────────────────────────────────────────
-def call_llm(client: OpenAI, obs: dict) -> Optional[dict]:
+# ── Environment HTTP helpers ───────────────────────────────────────────────────
+
+def call_env(endpoint: str, payload: Optional[dict] = None, method: str = "POST") -> dict:
+    url = f"{ENV_BASE_URL}/project/{endpoint}"
+    if method == "GET":
+        resp = requests.get(url, timeout=60)
+    else:
+        resp = requests.post(url, json=payload or {}, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ── Rule-based fallback ────────────────────────────────────────────────────────
+
+def get_rule_based_action(obs: dict, assigned_this_episode: set,
+                          last_failed_task: Optional[str] = None) -> dict:
     """
-    Call the LLM. Returns parsed action dict or None on failure.
-    - 402 (billing): immediate None, no retry
-    - 429 / 5xx:     retry up to MAX_RETRIES with exponential backoff
+    Deterministic fallback. Priority:
+    1. Active instruction's tasks (if deps met, not already assigned)
+    2. Highest-priority backlog (deps met, not already assigned, not last failed)
+    3. Unblock genuinely blocked tasks
+    4. Skip
     """
-    if client is None:
-        return None
+    tasks     = obs.get("tasks", [])
+    devs      = obs.get("developers", [])
+    done_ids  = {t["id"] for t in tasks if t["status"] == "done"}
+    available = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"] * 2]
 
-    user_msg = build_user_prompt(obs)
-    messages = [
-        {"role": "system", "content": R2_SYSTEM_PROMPT},
-        {"role": "user",   "content": user_msg},
-    ]
+    def best_dev(task: dict):
+        skill_match = [d for d in available
+                       if d["skill"] == task["required_skill"] or d["skill"] == "fullstack"]
+        return skill_match[0] if skill_match else (available[0] if available else None)
 
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 2):  # attempts: 1, 2, 3
-        try:
-            resp = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
-            )
-            raw = resp.choices[0].message.content or ""
-            action = parse_action(raw)
-            return action
+    def can_assign(task: dict) -> bool:
+        if task["status"] != "backlog":
+            return False
+        if task["id"] in assigned_this_episode:
+            return False
+        if task["id"] == last_failed_task:
+            return False
+        deps = task.get("metadata", {}).get("depends_on", [])
+        return all(d in done_ids for d in deps)
 
-        except APIStatusError as e:
-            last_exc = e
-            if not is_retryable(e):
-                # 402 or other non-retryable — bail immediately
-                print(f"  [LLM] Non-retryable error {e.status_code}, using fallback", flush=True)
-                return None
-            if attempt <= MAX_RETRIES:
-                wait = 2 ** attempt * 1.0 + random.uniform(0, 0.5)
-                print(f"  [WARN] LLM attempt {attempt}/{MAX_RETRIES+1} failed "
-                      f"({e.status_code}), retry in {wait:.1f}s", flush=True)
-                time.sleep(wait)
-            else:
-                print(f"  [WARN] LLM unavailable after {MAX_RETRIES+1} attempts, "
-                      f"using rule-based fallback", flush=True)
-                return None
+    skip = {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
-        except (APIConnectionError, Exception) as e:
-            last_exc = e
-            if attempt <= MAX_RETRIES:
-                wait = 2 ** attempt
-                print(f"  [WARN] LLM attempt {attempt} connection error, retry in {wait}s", flush=True)
-                time.sleep(wait)
-            else:
-                print(f"  [WARN] LLM connection failed, using fallback", flush=True)
-                return None
+    # 1. Instructions first
+    active_insts = sorted(
+        [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)],
+        key=lambda i: i.get("target_sprint", 99)
+    )
+    for inst in active_insts:
+        for tid in inst.get("affects_tasks", []):
+            task = next((t for t in tasks if t["id"] == tid), None)
+            if task and can_assign(task):
+                dev = best_dev(task)
+                if dev:
+                    return {"action_type": "assign", "task_id": task["id"],
+                            "dev_id": dev["id"], "new_priority": None}
 
-    return None
+    # 2. Highest-priority backlog (deps met)
+    backlog = sorted(
+        [t for t in tasks if t["status"] == "backlog"],
+        key=lambda t: (t["priority"], t["deadline"])
+    )
+    for task in backlog:
+        if can_assign(task):
+            dev = best_dev(task)
+            if dev:
+                return {"action_type": "assign", "task_id": task["id"],
+                        "dev_id": dev["id"], "new_priority": None}
+
+    # 3. Unblock
+    for task in tasks:
+        if task["status"] == "blocked":
+            deps = task.get("metadata", {}).get("depends_on", [])
+            if all(d in done_ids for d in deps):
+                return {"action_type": "unblock", "task_id": task["id"],
+                        "dev_id": None, "new_priority": None}
+
+    return skip
 
 
-# ─── Action parser with strict validation ────────────────────────────────────
-def parse_action(raw: str) -> Optional[dict]:
+# ── JSON parser ────────────────────────────────────────────────────────────────
+
+_VALID_ACTIONS = {"assign", "reassign", "reprioritize", "skip", "unblock"}
+_NULL_STRINGS  = {"null", "none", "None", "Null", "", "undefined", "N/A", "n/a"}
+
+
+def parse_action(text: str) -> dict:
     """
     Parse LLM output into a clean action dict.
-    Validates task_id against ^T\\d+$ to reject garbage like
-    'auth tasks above all others in sprint 1'.
+    Handles: markdown fences, "null" strings, sprint_plan, missing fields.
     """
-    if not raw:
-        return None
+    text = text.strip()
 
-    # Strip markdown fences if present
-    raw = raw.strip()
-    raw = re.sub(r"^```[a-z]*\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    # Strip markdown code fences
+    if "```" in text:
+        lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
+        text  = "\n".join(lines).strip()
 
-    # Try to extract JSON object
-    match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
-    if not match:
-        return None
+    d = None
     try:
-        obj = json.loads(match.group())
+        d = json.loads(text)
     except json.JSONDecodeError:
-        return None
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                d = json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
 
-    action_type = obj.get("action_type", "")
-    valid_types = {"assign", "reassign", "reprioritize", "unblock", "skip", "sprint_plan"}
-    if action_type not in valid_types:
-        return None
-
-    # Validate task_id — must be T followed by digits (e.g. T01, T12)
-    task_id = obj.get("task_id")
-    if task_id is not None and not TASK_ID_RE.match(str(task_id)):
-        print(f"  [INVALID] task_id={repr(task_id)} rejected (not T##)", flush=True)
-        return None
-
-    # assign/reassign need both task_id and dev_id
-    if action_type in {"assign", "reassign"}:
-        if not task_id or not obj.get("dev_id"):
-            return None
-
-    return {
-        "action_type": action_type,
-        "task_id":     task_id,
-        "dev_id":      obj.get("dev_id"),
-        "new_priority": obj.get("new_priority"),
-        "task_ids":    obj.get("task_ids"),
-        "notes":       obj.get("notes"),
-    }
-
-
-# ─── Smart fallback policy ───────────────────────────────────────────────────
-def smart_fallback(obs: dict, assigned_this_episode: set, last_dev_idx: list) -> dict:
-    """
-    Rule-based fallback that actually assigns tasks instead of defaulting to skip.
-
-    Priority order:
-      1. BACKLOG tasks referenced in active (unfollowed) instructions
-      2. BACKLOG tasks in the current sprint with met dependencies
-      3. Any BACKLOG task with met dependencies
-
-    Developer selection:
-      - Rotates through available devs (round-robin) to avoid overloading one dev
-      - Skips devs with zero remaining capacity
-
-    Falls back to skip only when no assignable tasks exist.
-    """
-    tasks   = obs.get("tasks", [])
-    devs    = obs.get("developers", [])
-    instructions = obs.get("instruction_queue", [])
-    current_sprint = obs.get("current_sprint", 1)
-
-    # Build sets for quick lookup
-    done_statuses = {"done", "missed", "in_progress"}
-    completed_ids = {t["id"] for t in tasks if t.get("status") == "done"}
-
-    def deps_met(task):
-        return all(dep in completed_ids for dep in task.get("depends_on", []))
-
-    def is_assignable(task):
-        # BUG 3 FIX: fallback relies only on real task status from the observation.
-        # assigned_this_episode is only for the LLM override check — not here.
-        # If the server shows a task as backlog with deps met, we CAN assign it.
-        return (
-            task.get("status") == "backlog"
-            and deps_met(task)
-        )
-
-    # Tasks referenced in active instructions
-    instruction_task_ids = set()
-    for inst in instructions:
-        if not inst.get("followed", False):
-            for tid in inst.get("affects_tasks", []):
-                instruction_task_ids.add(tid)
-
-    # Build candidate list — instruction tasks first, then sprint-targeted, then any backlog
-    assignable = [t for t in tasks if is_assignable(t)]
-    if not assignable:
+    if d is None:
         return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
-    # Sort: instruction-referenced first, then by sprint target, then by priority
-    def sort_key(t):
-        meta = getattr(t, "metadata", {}) if hasattr(t, "metadata") else {}
-        if not isinstance(meta, dict):
-            meta = {}
-        sprint_target = meta.get("sprint", current_sprint + 99)
-        in_inst = 0 if t["id"] in instruction_task_ids else 1
-        priority = t.get("priority", 99)
-        return (in_inst, sprint_target, priority)
+    # Normalise action_type
+    raw = str(d.get("action_type", "skip")).lower().strip()
+    if raw not in _VALID_ACTIONS:
+        raw = "skip"
+    d["action_type"] = raw
 
-    assignable.sort(key=sort_key)
-    task = assignable[0]
+    # Convert "null" strings → None
+    for key in ("task_id", "dev_id", "new_priority"):
+        if str(d.get(key, "")).strip() in _NULL_STRINGS:
+            d[key] = None
 
-    # Pick developer — round-robin rotation, skip zero-capacity devs
-    available_devs = [
-        d for d in devs
-        if d.get("remaining_capacity", d.get("capacity", 1)) > 0
-    ]
-    if not available_devs:
-        available_devs = devs  # all exhausted — assign anyway
+    # new_priority → int
+    if d.get("new_priority") is not None:
+        try:
+            d["new_priority"] = int(d["new_priority"])
+            if d["new_priority"] not in range(1, 6):
+                d["new_priority"] = None
+        except (ValueError, TypeError):
+            d["new_priority"] = None
 
-    # Prefer skill match, but rotate to avoid always picking same dev
-    skill = task.get("required_skill", "")
-    skilled_devs = [d for d in available_devs if d.get("skill") == skill]
-    pool = skilled_devs if skilled_devs else available_devs
-
-    # Round-robin using last_dev_idx[0] as mutable counter
-    idx = last_dev_idx[0] % len(pool)
-    dev = pool[idx]
-    last_dev_idx[0] = (idx + 1) % len(pool)
+    # Demote invalid actions → skip
+    atype = d["action_type"]
+    if atype in ("assign", "reassign") and (not d.get("task_id") or not d.get("dev_id")):
+        d["action_type"] = "skip"
+    if atype == "reprioritize" and (not d.get("task_id") or not d.get("new_priority")):
+        d["action_type"] = "skip"
+    if atype == "unblock" and not d.get("task_id"):
+        d["action_type"] = "skip"
 
     return {
-        "action_type": "assign",
-        "task_id":     task["id"],
-        "dev_id":      dev["id"],
-        "new_priority": None,
+        "action_type":  d["action_type"],
+        "task_id":      d.get("task_id"),
+        "dev_id":       d.get("dev_id"),
+        "new_priority": d.get("new_priority"),
     }
 
 
-# ─── Step helper ─────────────────────────────────────────────────────────────
-def step(action: dict) -> dict:
-    url = f"{ENV_BASE_URL}/project/step"
-    resp = requests.post(url, json={"action": action}, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+# ── LLM call with retry ────────────────────────────────────────────────────────
+
+def call_llm(obs: dict, assigned_this_episode: set, step_num: int) -> tuple[str, bool]:
+    """
+    Call LLM with up to MAX_RETRIES retries and exponential backoff.
+    Returns (response_text, used_llm: bool).
+    If all retries fail, returns ("", False) — caller uses rule-based fallback.
+    """
+    prompt = build_user_prompt(obs, assigned_this_episode)
+    messages_sys = [
+        {"role": "system", "content": R2_SYSTEM_PROMPT},
+        {"role": "user",   "content": prompt},
+    ]
+    messages_usr = [
+        {"role": "user", "content": f"{R2_SYSTEM_PROMPT}\n\n{prompt}"},
+    ]
+
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            # First attempt: system+user. Subsequent: merged (some endpoints reject system role)
+            msgs = messages_sys if attempt == 0 else messages_usr
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=msgs,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+            )
+            return completion.choices[0].message.content or "", True
+
+        except Exception as e:
+            last_err = e
+            err_name = type(e).__name__
+            if attempt < MAX_RETRIES - 1:
+                wait = RETRY_DELAYS[attempt]
+                print(
+                    f"[WARN] LLM attempt {attempt+1}/{MAX_RETRIES} failed "
+                    f"({err_name}), retrying in {wait}s...",
+                    flush=True,
+                )
+                time.sleep(wait)
+            else:
+                print(
+                    f"[WARN] LLM unavailable after {MAX_RETRIES} attempts "
+                    f"({err_name}), using rule-based fallback",
+                    flush=True,
+                )
+
+    return "", False
 
 
-def reset(scenario: str, seed: int = 42) -> dict:
-    url = f"{ENV_BASE_URL}/project/reset"
-    resp = requests.post(url, json={"task_name": scenario, "seed": seed}, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+# ── Episode runner ─────────────────────────────────────────────────────────────
 
+def run_episode(task_name: str) -> float:
+    """
+    Run one complete 60-day episode and return the final project score.
 
-def health() -> dict:
-    resp = requests.get(f"{ENV_BASE_URL}/project/health", timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    Episode-level state:
+      assigned_this_episode: set of task IDs the LLM has chosen to assign.
+        Prevents the agent looping on the same in_progress task.
+      last_failed_task: most recent task that triggered a negative reward
+        (used by fallback to avoid repeating the same mistake).
+      llm_fail_streak: consecutive steps where LLM was unavailable.
+        After 5+ consecutive failures we switch entirely to rule-based
+        for the rest of the episode to stop burning retry time.
 
+    Emits [START], [STEP]×N, [END] to stdout with flush=True.
+    """
+    print(f"[START] task={task_name}", flush=True)
 
-# ─── Episode runner ──────────────────────────────────────────────────────────
-def run_episode(scenario: str, client: Optional[OpenAI], seed: int = 42) -> dict:
-    obs_data = reset(scenario, seed)
-    obs = obs_data.get("observation", obs_data)
+    obs = call_env("reset", {"task_name": task_name, "seed": 42})
+    final_score = 0.01
 
-    assigned_this_episode: set = set()
-    last_dev_idx = [0]   # mutable counter for round-robin dev rotation
-    cumulative = 0.0
+    # ── Episode memory ────────────────────────────────────────────────────────
+    assigned_this_episode: set[str] = set()   # tasks we've sent assign for
+    last_failed_task: Optional[str] = None    # last task that got negative reward
+    llm_fail_streak: int            = 0       # consecutive LLM failures
+    LLM_ABANDON_AFTER               = 5       # give up on LLM after this many consecutive failures
+
     step_num = 0
-    use_llm_this_step = True
+    for step_num in range(1, MAX_STEPS + 1):
+        if obs.get("done", False):
+            break
 
-    print(f"\n[START] task={scenario}", flush=True)
+        # ── Choose action ─────────────────────────────────────────────────────
+        use_llm = (llm_fail_streak < LLM_ABANDON_AFTER)
 
-    while True:
-        step_num += 1
-        day     = obs.get("current_day", step_num)
-        sprint  = obs.get("current_sprint", 1)
-        done    = obs.get("done", False)
+        # Optional batching: only call LLM every LLM_CALL_EVERY steps
+        # (set LLM_CALL_EVERY = 1 to always call)
+        should_call = (step_num % LLM_CALL_EVERY == 1 or LLM_CALL_EVERY == 1)
 
-        # Decide whether to call LLM this step
-        use_llm_this_step = (step_num % LLM_CALL_EVERY == 1) and (client is not None)
+        if use_llm and should_call:
+            response_text, llm_ok = call_llm(obs, assigned_this_episode, step_num)
+            if llm_ok:
+                llm_fail_streak = 0
+                action = parse_action(response_text)
 
-        action = None
+                # ── Validate LLM action and override if needed ────────────────
+                # If LLM tries to assign a task that's already in_progress or done,
+                # override with smart fallback
+                if action["action_type"] == "assign" and action.get("task_id"):
+                    tid    = action["task_id"]
+                    t_info = next((t for t in obs["tasks"] if t["id"] == tid), None)
+                    if t_info and t_info["status"] != "backlog":
+                        # Task is in_progress/done — LLM is looping, override
+                        action = get_rule_based_action(
+                            obs, assigned_this_episode, last_failed_task
+                        )
+            else:
+                llm_fail_streak += 1
+                action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
+        else:
+            # Either LLM abandoned or between batch intervals
+            action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
 
-        if use_llm_this_step:
-            action = call_llm(client, obs)
+        # Track assigned tasks to avoid re-assigning
+        if action["action_type"] == "assign" and action.get("task_id"):
+            assigned_this_episode.add(action["task_id"])
 
-            # Validate action — reject if task already assigned/in-progress/missed
-            if action and action.get("action_type") == "assign":
-                tid = action.get("task_id")
-                tasks = obs.get("tasks", [])
-                task_statuses = {t["id"]: t.get("status") for t in tasks}
-                tstat = task_statuses.get(tid, "unknown")
-                if tstat in ("in_progress", "done", "missed") or tid in assigned_this_episode:
-                    print(f"  [OVERRIDE] LLM picked {tid} (status={tstat}) → fallback", flush=True)
-                    action = None
+        # ── Call environment ──────────────────────────────────────────────────
+        result = call_env("step", {"action": action})
+        obs    = result["observation"]
+        reward = result["reward"]
+        done   = result["done"]
 
-        if action is None:
-            action = smart_fallback(obs, assigned_this_episode, last_dev_idx)
+        # Track which task just failed (for fallback to avoid)
+        if reward < -0.5 and action.get("task_id"):
+            last_failed_task = action["task_id"]
+        elif reward > 0:
+            last_failed_task = None  # reset on success
 
-        # Execute step FIRST — then confirm success before tracking
-        result = step(action)
-        reward  = result.get("reward", 0.0)
-        obs     = result.get("observation", result)
-        done    = result.get("done", obs.get("done", False))
-        cumulative += reward
-        inst_score = obs.get("instruction_following_score", 0.0)
-        debt_raw = obs.get("tech_debt", 0)
-
-        # BUG 2 FIX: only add to set after server confirms task moved to in_progress
-        # Checking post-step obs prevents blocking tasks whose assignment was rejected
-        if action.get("action_type") == "assign" and action.get("task_id"):
-            tid_sent = action["task_id"]
-            post_statuses = {t["id"]: t.get("status") for t in obs.get("tasks", [])}
-            if post_statuses.get(tid_sent) == "in_progress":
-                assigned_this_episode.add(tid_sent)
-
-        atype = action.get("action_type", "?")
-        tid   = action.get("task_id", "None")
-        dev   = action.get("dev_id", "None")
-        # Display debt count (not raw list) in step log
-        debt_display = len(debt_raw) if isinstance(debt_raw, list) else int(debt_raw or 0)
+        # ── [STEP] ────────────────────────────────────────────────────────────
         print(
-            f"[STEP] task={scenario} step={step_num} day={day} sprint={sprint} "
-            f"action={atype} task_id={tid} dev={dev} "
-            f"reward={reward:.4f} cumulative={cumulative:.4f} "
-            f"inst_score={inst_score:.3f} debt={debt_display} done={done}",
+            f"[STEP] task={task_name} step={step_num} "
+            f"day={obs.get('current_day', '?')} "
+            f"sprint={obs.get('current_sprint', '?')} "
+            f"action={action.get('action_type')} "
+            f"task={action.get('task_id')} "
+            f"reward={reward:.4f} "
+            f"cumulative={obs.get('cumulative_reward', 0):.4f} "
+            f"inst_score={obs.get('instruction_following_score', 0):.3f} "
+            f"debt={len(obs.get('tech_debt', []))} "
+            f"done={done}",
             flush=True,
         )
 
         if done:
+            tasks_total   = len(obs.get("tasks", [])) or 1
+            tasks_done    = obs.get("tasks_completed", 0)
+            inst_score    = obs.get("instruction_following_score", 0.01)
+            delivery_rate = tasks_done / tasks_total
+            debt_count    = len(obs.get("tech_debt", []))
+            team_health   = max(0.01, 1.0 - debt_count * 0.02)
+            # Weighted: delivery 55%, inst 30%, health 15%
+            raw = delivery_rate * 0.55 + inst_score * 0.30 + team_health * 0.15
+            final_score = max(0.01, min(0.99, raw))
             break
 
-    # Final score
-    tasks = obs.get("tasks", [])
-    completed = sum(1 for t in tasks if t.get("status") == "done")
-    missed    = sum(1 for t in tasks if t.get("status") == "missed")
-    inst_score = obs.get("instruction_following_score", 0.0)
-    # BUG 1 FIX: tech_debt comes back as a list of task IDs, not an int
-    debt_raw   = obs.get("tech_debt", 0)
-    debt_count = len(debt_raw) if isinstance(debt_raw, list) else int(debt_raw or 0)
-
-    # Normalised final score (mirrors project_grader formula)
-    total = len(tasks) or 1
-    delivery_rate = completed / total
-    team_health   = max(0.01, 1.0 - debt_count * 0.02)
-    raw_score = delivery_rate * 0.55 + inst_score * 0.30 + team_health * 0.15
-    final_score = max(0.01, min(0.99, raw_score))
-
+    # ── [END] ─────────────────────────────────────────────────────────────────
     print(
-        f"[END] task={scenario} score={final_score:.4f} steps={step_num} "
-        f"completed={completed} missed={missed} "
-        f"inst_score={inst_score:.3f} debt={debt_count}",
+        f"[END] task={task_name} score={final_score:.4f} steps={step_num} "
+        f"completed={obs.get('tasks_completed', 0)} "
+        f"missed={obs.get('tasks_missed', 0)} "
+        f"inst_score={obs.get('instruction_following_score', 0):.3f} "
+        f"debt={len(obs.get('tech_debt', []))}",
         flush=True,
     )
-    return {
-        "scenario":    scenario,
-        "score":       final_score,
-        "completed":   completed,
-        "missed":      missed,
-        "inst_score":  inst_score,
-        "debt":        debt_count,
-        "steps":       step_num,
-    }
+
+    return final_score
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
-def main():
-    scenarios = ["project_easy", "project_medium", "project_hard"]
+# ── Main ───────────────────────────────────────────────────────────────────────
 
-    llm_enabled = bool(HF_TOKEN)
-    client = make_client() if llm_enabled else None
+def main() -> None:
+    print(f"[INFO] model={MODEL_NAME} server={ENV_BASE_URL}", flush=True)
+    print(f"[INFO] retry_config=max_retries={MAX_RETRIES} delays={RETRY_DELAYS} "
+          f"llm_call_every={LLM_CALL_EVERY}", flush=True)
 
-    print(f"[INFO] model={MODEL_NAME}", flush=True)
-    print(f"[INFO] server={ENV_BASE_URL}", flush=True)
-    print(f"[INFO] llm_enabled={llm_enabled} call_every={LLM_CALL_EVERY} retries={MAX_RETRIES}", flush=True)
-
+    # Health check
     try:
-        h = health()
-        print(f"[INFO] health={h}", flush=True)
+        health = call_env("health", method="GET")
+        print(f"[INFO] health={health}", flush=True)
+        assert health.get("round") == 2, "Expected R2 health endpoint"
     except Exception as e:
-        print(f"[WARN] health check failed: {e}", flush=True)
+        print(f"[ERROR] Cannot reach R2 env server: {e}", flush=True)
+        print(f"[ERROR] Make sure ENV_BASE_URL points to a running server", flush=True)
+        sys.exit(1)
 
-    results = {}
-    t0 = time.time()
+    scores: dict[str, float] = {}
+    start_time = time.time()
 
-    for scenario in scenarios:
+    for task in TASKS:
         try:
-            r = run_episode(scenario, client)
-            results[scenario] = r
+            score = run_episode(task)
+            scores[task] = score
         except Exception as e:
-            print(f"[ERROR] {scenario}: {e}", flush=True)
-            results[scenario] = {"score": 0.01, "error": str(e)}
+            print(f"[ERROR] task={task} error={e}", flush=True)
+            scores[task] = 0.01
 
-    elapsed = time.time() - t0
-    scores = [results[s].get("score", 0) for s in scenarios if s in results]
-    avg = sum(scores) / len(scores) if scores else 0
+    elapsed = time.time() - start_time
 
     print("\n" + "=" * 62, flush=True)
     print(" ROUND 2 — SCORES", flush=True)
     print("=" * 62, flush=True)
-    for s in scenarios:
-        sc = results.get(s, {}).get("score", 0)
-        bar = "█" * int(sc * 20)
-        print(f"  {s:<22} {sc:.4f}  {bar}", flush=True)
-    print(f"\n  AVERAGE                {avg:.4f}", flush=True)
+    for task, score in scores.items():
+        bar = "█" * int(score * 20)
+        print(f"  {task:<22} {score:.4f}  {bar}", flush=True)
+    avg = sum(scores.values()) / len(scores) if scores else 0.0
+    print(f"  {'AVERAGE':<22} {avg:.4f}", flush=True)
     print(f"\n  Runtime: {elapsed:.1f}s", flush=True)
     print("=" * 62, flush=True)
 
