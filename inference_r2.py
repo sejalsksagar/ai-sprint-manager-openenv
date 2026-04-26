@@ -25,11 +25,10 @@ KEY FIXES IN THIS VERSION
         (task, dev) pair in it. It also skips tasks already
         in_progress in the current observation.
 
-[FIX-E] LLM DISABLED BY DEFAULT (too many invalid actions)
-        The fine-tuned model produces `unblock_not_blocked` and
-        `assign_bad_status:missed` on almost every call. With
-        USE_LLM=0 the rule-based system runs clean and scores higher.
-        Set USE_LLM=1 only if you have a better checkpoint.
+[FIX-E] LOCAL FINETUNED MODEL BY DEFAULT
+        USE_LLM defaults to on: loads priyaaaaaasharmaaaaa/trial1 via
+        LOCAL_MODEL_PATH (Unsloth/PEFT). Set USE_LLM=0 for rule-based-only.
+        If load fails, main() falls back to HF router or rule-based.
 
 [FIX-F] SKIP ONLY AFTER GENUINE EXHAUSTION
         smart_fallback now tries every valid (task, dev) combo before
@@ -73,14 +72,14 @@ import requests
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "sejal-k/ai-sprint-manager-trained")
+LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "priyaaaaaasharmaaaaa/trial1")
 MODEL_NAME       = os.getenv("MODEL_NAME",       "meta-llama/Llama-3.1-8B-Instruct")
 ENV_BASE_URL     = os.getenv("ENV_BASE_URL",     "https://sejal-k-ai-sprint-manager.hf.space")
 API_BASE_URL     = os.getenv("API_BASE_URL",     "https://router.huggingface.co/v1")
 HF_TOKEN         = os.getenv("HF_TOKEN",         "")
 
-# [FIX-E] Default LLM OFF — rule-based outperforms broken checkpoint
-_use_llm_raw = os.getenv("USE_LLM", "0").strip().lower()
+# Local fine-tune (trial1) on by default; USE_LLM=0 to disable
+_use_llm_raw = os.getenv("USE_LLM", "1").strip().lower()
 USE_LLM      = _use_llm_raw not in ("0", "false", "no", "off", "")
 
 LLM_COOLDOWN_STEPS        = int(os.getenv("LLM_COOLDOWN_STEPS",        "5"))
