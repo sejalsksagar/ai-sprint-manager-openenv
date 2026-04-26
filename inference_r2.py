@@ -44,6 +44,19 @@ KEY FIXES IN THIS VERSION
 [FIX-H] INSTRUCTION PARSING WIDENED
         _parse_inst_action now also handles "D2" as dev_id by
         normalising "D2" → "dev2" if the env uses that format.
+
+[FIX-I] POST-SKIP MANDATORY NON-SKIP
+        After any skip step, the next action is never skip: we run an
+        expanded fallback (extra reprioritize passes + guarantee) so the
+        env advances with assign/unblock/reprioritize instead of skip chains.
+
+[FIX-J] REWARD-BASED BAD COMBO
+        Repeated strongly negative rewards on the same (task, dev) assign
+        blacklists that pair before the env hits state regression.
+
+[FIX-K] REGRESSION ON NON-ASSIGN
+        On day/sprint regression without assign, immediately try
+        guarantee_assign / fallback instead of retrying the same skip.
 """
 
 from __future__ import annotations
@@ -84,6 +97,10 @@ TASK_ID_RE      = re.compile(r"^T\d+$")
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 _SKIP = {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
+
+# Strongly negative assign → blacklist pair after this many hits
+REWARD_BLACKLIST_THRESHOLD = float(os.getenv("REWARD_BLACKLIST_THRESHOLD", "-0.12"))
+REWARD_BLACKLIST_STREAK = int(os.getenv("REWARD_BLACKLIST_STREAK", "2"))
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +225,25 @@ def _dev_by_id(obs: dict, dev_id: object) -> Optional[dict]:
     return None
 
 
-def _available_devs(obs: dict) -> List[dict]:
-    """Developers that are available with remaining capacity."""
+def _available_devs(obs: dict, *, expand: bool = False) -> List[dict]:
+    """Developers with remaining capacity. If expand=True (post-skip), also
+    include devs that still have capacity even when is_available is False —
+    the env sometimes clears availability flags while assignments are still valid.
+    """
+    def cap_ok(d: dict) -> bool:
+        try:
+            return int(d.get("remaining_capacity", d.get("capacity", 1))) > 0
+        except (TypeError, ValueError):
+            return False
+
+    if expand:
+        pool = [d for d in obs.get("developers", []) if cap_ok(d)]
+        if pool:
+            return pool
+
     with_cap = [
         d for d in obs.get("developers", [])
-        if d.get("is_available", False)
-        and int(d.get("remaining_capacity", d.get("capacity", 1))) > 0
+        if d.get("is_available", False) and cap_ok(d)
     ]
     if with_cap:
         return with_cap
@@ -251,6 +281,8 @@ def _guarantee_assign(
     assigned_this_episode: set,
     priority_task_ids: Optional[set] = None,
     bad_combos: Optional[BadComboSet] = None,
+    *,
+    expand_devs: bool = False,
 ) -> Optional[dict]:
     """
     Exhaustively search every task x every dev for a valid assignment.
@@ -259,7 +291,7 @@ def _guarantee_assign(
     """
     priority_ids   = priority_task_ids or set()
     bad            = bad_combos or set()
-    avail          = _available_devs(obs)
+    avail          = _available_devs(obs, expand=expand_devs)
     backlog        = _assignable_tasks(obs, excluded=assigned_this_episode)
     current_sprint = obs.get("current_sprint", 1)
 
@@ -315,6 +347,8 @@ def validate_action(
     obs: dict,
     action: Optional[dict],
     assigned_this_episode: set,
+    *,
+    relax_dev_avail: bool = False,
 ) -> Tuple[bool, str]:
     if not action:
         return False, "empty"
@@ -371,7 +405,7 @@ def validate_action(
         dev = _dev_by_id(obs, did)
         if dev is None:
             return False, "assign_unknown_dev"
-        if not dev.get("is_available", False):
+        if not relax_dev_avail and not dev.get("is_available", False):
             return False, "assign_dev_unavailable"
         try:
             if int(dev.get("remaining_capacity", dev.get("capacity", 1))) <= 0:
@@ -437,7 +471,9 @@ def _parse_inst_action(
     combo = (str(action["task_id"]), str(dev_id))
     if combo in bad:
         return None
-    ok, _ = validate_action(obs, action, assigned_this_episode)
+    ok, _ = validate_action(
+        obs, action, assigned_this_episode, relax_dev_avail=False,
+    )
     return action if ok else None
 
 
@@ -450,6 +486,8 @@ def smart_fallback(
     assigned_this_episode: set,
     last_dev_idx: list,
     bad_combos: Optional[BadComboSet] = None,
+    *,
+    force_non_skip: bool = False,
 ) -> dict:
     """
     Tiered decision engine. Passes bad_combos through to _guarantee_assign
@@ -460,7 +498,7 @@ def smart_fallback(
     Tier 2  Assign backlog tasks related to active instructions
     Tier 3  Assign any backlog task (exhaustive, blacklist-aware)
     Tier 4  Reprioritize blocked-by-dep tasks
-    Tier 5  Skip
+    Tier 5  Skip (disabled when force_non_skip — use extra assigns / reprioritize)
     """
     bad    = bad_combos or set()
     tasks  = obs.get("tasks", [])
@@ -490,7 +528,9 @@ def smart_fallback(
                 "dev_id":       None,
                 "new_priority": None,
             }
-            ok, _ = validate_action(obs, action, assigned_this_episode)
+            ok, _ = validate_action(
+                obs, action, assigned_this_episode, relax_dev_avail=force_non_skip,
+            )
             if ok:
                 print(f"  [FB-T1] unblock {task['id']}", flush=True)
                 return action
@@ -501,37 +541,98 @@ def smart_fallback(
             obs, assigned_this_episode,
             priority_task_ids=instruction_task_ids,
             bad_combos=bad,
+            expand_devs=force_non_skip,
         )
         if action:
             print(f"  [FB-T2] inst assign -> {action['task_id']}->{action['dev_id']}", flush=True)
             return action
+        # Instruction tasks may be dead-ends (all dev pairs blacklisted). General assign.
+        action = _guarantee_assign(
+            obs, assigned_this_episode,
+            priority_task_ids=set(),
+            bad_combos=bad,
+            expand_devs=force_non_skip,
+        )
+        if action:
+            print(f"  [FB-T2b] non-inst assign -> {action['task_id']}->{action['dev_id']}", flush=True)
+            return action
 
     # ── Tier 3 ────────────────────────────────────────────────────────────────
-    action = _guarantee_assign(obs, assigned_this_episode, bad_combos=bad)
+    action = _guarantee_assign(
+        obs, assigned_this_episode, bad_combos=bad, expand_devs=force_non_skip,
+    )
     if action:
         print(f"  [FB-T3] general assign -> {action['task_id']}->{action['dev_id']}", flush=True)
         return action
 
     # ── Tier 4 ────────────────────────────────────────────────────────────────
-    for task in tasks:
-        if (
-            task.get("status") == "backlog"
-            and not _deps_met(obs, task)
-            and int(task.get("priority", 1)) > 2
-        ):
+    def _tier4_reprioritize(min_priority: int = 1) -> Optional[dict]:
+        """min_priority: only bump tasks strictly above this priority (unless 0 = any waiting-deps)."""
+        for task in tasks:
+            if task.get("status") != "backlog" or _deps_met(obs, task):
+                continue
+            if min_priority > 0 and int(task.get("priority", 1)) <= min_priority:
+                continue
             action = {
                 "action_type":  "reprioritize",
                 "task_id":      task["id"],
                 "dev_id":       None,
                 "new_priority": 1,
             }
-            ok, _ = validate_action(obs, action, assigned_this_episode)
+            ok, _ = validate_action(
+                obs, action, assigned_this_episode, relax_dev_avail=force_non_skip,
+            )
             if ok:
-                print(f"  [FB-T4] reprioritize {task['id']} (waiting deps)", flush=True)
+                return action
+        return None
+
+    act4 = _tier4_reprioritize(min_priority=2)
+    if act4:
+        print(f"  [FB-T4] reprioritize {act4['task_id']} (waiting deps)", flush=True)
+        return act4
+
+    if force_non_skip:
+        act4b = _tier4_reprioritize(min_priority=0)
+        if act4b:
+            print(f"  [FB-T4b] reprioritize {act4b['task_id']} (post-skip unblock deps)", flush=True)
+            return act4b
+        # Bump priority on any backlog with met deps to refresh ordering (valid cheap action)
+        for task in tasks:
+            if task.get("status") != "backlog" or not _deps_met(obs, task):
+                continue
+            np = max(1, min(5, int(task.get("priority", 3)) - 1))
+            if np == int(task.get("priority", 3)):
+                continue
+            action = {
+                "action_type":  "reprioritize",
+                "task_id":      task["id"],
+                "dev_id":       None,
+                "new_priority": np,
+            }
+            ok, _ = validate_action(
+                obs, action, assigned_this_episode, relax_dev_avail=force_non_skip,
+            )
+            if ok:
+                print(f"  [FB-T4c] reprioritize {task['id']} -> P{np} (post-skip)", flush=True)
                 return action
 
     # ── Tier 5 ────────────────────────────────────────────────────────────────
-    print("  [FB-T5] genuine skip -- no valid action available", flush=True)
+    if force_non_skip:
+        again = _guarantee_assign(
+            obs, assigned_this_episode,
+            priority_task_ids=set(),
+            bad_combos=bad,
+            expand_devs=True,
+        )
+        if again:
+            print(
+                f"  [FB-T5x] post-skip assign -> {again['task_id']}->{again['dev_id']}",
+                flush=True,
+            )
+            return again
+        print("  [FB-T5] post-skip: still no assign — using skip", flush=True)
+    else:
+        print("  [FB-T5] genuine skip -- no valid action available", flush=True)
     return _SKIP
 
 
@@ -546,6 +647,8 @@ def _anti_skip(
     instruction_task_ids: set,
     source: str,
     bad_combos: Optional[BadComboSet] = None,
+    *,
+    expand_devs: bool = False,
 ) -> dict:
     if action.get("action_type") != "skip":
         return action
@@ -554,7 +657,15 @@ def _anti_skip(
         obs, assigned_this_episode,
         priority_task_ids=instruction_task_ids,
         bad_combos=bad_combos,
+        expand_devs=expand_devs,
     )
+    if not override and instruction_task_ids:
+        override = _guarantee_assign(
+            obs, assigned_this_episode,
+            priority_task_ids=set(),
+            bad_combos=bad_combos,
+            expand_devs=expand_devs,
+        )
     if override:
         print(
             f"  [ANTI-SKIP] {source} skip overridden -> "
@@ -819,6 +930,11 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
     bad_assign_streak     = 0
     llm_cooldown_until    = 0
 
+    # [FIX-I] After a skip, the next step must not be skip (penalise skip in env + recover).
+    force_non_skip_next = False
+    last_neg_combo: Optional[Tuple[str, str]] = None
+    neg_reward_streak   = 0
+
     MAX_STEPS        = 200
     MAX_STEP_RETRIES = 3
 
@@ -868,8 +984,13 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                 ok, reason = validate_action(obs, proposed, assigned_this_episode)
                 if ok:
                     proposed = _anti_skip(
-                        proposed, obs, assigned_this_episode,
-                        inst_task_ids, "LLM", bad_combos=bad_combos,
+                        proposed,
+                        obs,
+                        assigned_this_episode,
+                        inst_task_ids,
+                        "LLM",
+                        bad_combos=bad_combos,
+                        expand_devs=force_non_skip_next,
                     )
                     if proposed.get("action_type") == "skip":
                         llm_skip_streak += 1
@@ -947,19 +1068,37 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
         # ── Fallback path ──────────────────────────────────────────────────────
         if action is None:
             action = smart_fallback(
-                obs, assigned_this_episode, last_dev_idx, bad_combos=bad_combos
+                obs,
+                assigned_this_episode,
+                last_dev_idx,
+                bad_combos=bad_combos,
+                force_non_skip=force_non_skip_next,
             )
-            ok, reason = validate_action(obs, action, assigned_this_episode)
+            ok, reason = validate_action(
+                obs,
+                action,
+                assigned_this_episode,
+                relax_dev_avail=force_non_skip_next,
+            )
             if not ok:
                 print(f"  [FALLBACK_INVALID] {reason} -> guaranteed assign", flush=True)
                 action = _guarantee_assign(
-                    obs, assigned_this_episode, inst_task_ids, bad_combos=bad_combos
+                    obs,
+                    assigned_this_episode,
+                    inst_task_ids,
+                    bad_combos=bad_combos,
+                    expand_devs=force_non_skip_next,
                 ) or _SKIP
 
         # Final anti-skip
         action = _anti_skip(
-            action, obs, assigned_this_episode, inst_task_ids, "final",
+            action,
+            obs,
+            assigned_this_episode,
+            inst_task_ids,
+            "final",
             bad_combos=bad_combos,
+            expand_devs=force_non_skip_next,
         )
 
         if action.get("action_type") in ("assign", "reassign") and action.get("task_id"):
@@ -998,14 +1137,25 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                         bad_combos.add(combo)
                     # Pick a different action using updated blacklist
                     action = smart_fallback(
-                        obs, assigned_this_episode, last_dev_idx,
+                        obs,
+                        assigned_this_episode,
+                        last_dev_idx,
                         bad_combos=bad_combos,
+                        force_non_skip=force_non_skip_next,
                     )
-                    ok2, _ = validate_action(obs, action, assigned_this_episode)
+                    ok2, _ = validate_action(
+                        obs,
+                        action,
+                        assigned_this_episode,
+                        relax_dev_avail=force_non_skip_next,
+                    )
                     if not ok2:
                         action = _guarantee_assign(
-                            obs, assigned_this_episode, inst_task_ids,
+                            obs,
+                            assigned_this_episode,
+                            inst_task_ids,
                             bad_combos=bad_combos,
+                            expand_devs=force_non_skip_next,
                         ) or _SKIP
                     print(
                         f"  [RETRY] After blacklist: "
@@ -1016,6 +1166,24 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                 else:
                     print(
                         f"  [ERROR] State regression (attempt {attempt+1}) -- retrying",
+                        flush=True,
+                    )
+                    action = _guarantee_assign(
+                        obs,
+                        assigned_this_episode,
+                        inst_task_ids,
+                        bad_combos=bad_combos,
+                        expand_devs=True,
+                    ) or smart_fallback(
+                        obs,
+                        assigned_this_episode,
+                        last_dev_idx,
+                        bad_combos=bad_combos,
+                        force_non_skip=True,
+                    )
+                    print(
+                        f"  [RETRY-REG] pivoted to "
+                        f"{action.get('action_type')} {action.get('task_id')}→{action.get('dev_id')}",
                         flush=True,
                     )
                 time.sleep(0.5)
@@ -1032,6 +1200,42 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
         obs        = new_obs
         done       = result.get("done", obs.get("done", False))
         cumulative += reward
+
+        # [FIX-J] Blacklist (task, dev) pairs that keep paying strongly negative rewards
+        if action.get("action_type") in ("assign", "reassign") and action.get("task_id"):
+            tid_s = str(action["task_id"])
+            did_s = str(action.get("dev_id") or "")
+            combo_r = (tid_s, did_s)
+            if reward <= REWARD_BLACKLIST_THRESHOLD:
+                if combo_r == last_neg_combo:
+                    neg_reward_streak += 1
+                else:
+                    last_neg_combo = combo_r
+                    neg_reward_streak = 1
+                if neg_reward_streak >= REWARD_BLACKLIST_STREAK and did_s:
+                    if combo_r not in bad_combos:
+                        bad_combos.add(combo_r)
+                        print(
+                            f"  [BLACKLIST] reward-penalty {combo_r} "
+                            f"(r={reward:.3f} x{neg_reward_streak})",
+                            flush=True,
+                        )
+            else:
+                last_neg_combo = None
+                neg_reward_streak = 0
+        elif action.get("action_type") not in ("assign", "reassign"):
+            last_neg_combo = None
+            neg_reward_streak = 0
+
+        prev_was_skip = action.get("action_type") == "skip"
+        if prev_was_skip:
+            force_non_skip_next = True
+            print(
+                "  [SKIP-PENALTY] next step forced non-skip (assign/unblock/reprioritize)",
+                flush=True,
+            )
+        else:
+            force_non_skip_next = False
 
         if action.get("action_type") in ("assign", "reassign") and action.get("task_id"):
             tid_sent    = action["task_id"]
