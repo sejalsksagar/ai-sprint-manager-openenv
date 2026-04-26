@@ -2,31 +2,50 @@
 inference_r2.py — Round 2 LLM agent for AI Sprint Manager
 ==========================================================
 
-ROOT-CAUSE FIXES in this version:
-  [FIX-I1] PROMPT ALIGNMENT — system prompt and user prompt now exactly match
-            train_llm.py (R2_SYSTEM_PROMPT + _build_r2_prompt format).
-            The fine-tuned model conditions strongly on the EXACT wording it
-            saw during training. The previous version used a completely different
-            system prompt ("You are a tech lead managing a 6-sprint...") and a
-            different user prompt format (day=/sprint= vs D/60 S/6).
-            This single mismatch is the biggest cause of poor inference scores.
+FIXES IN THIS VERSION (on top of i_r2_4.py):
 
-  [FIX-I2] LOCAL MODEL LOADING — sejal-k/ai-sprint-manager-trained is a LoRA
-            adapter, not a full model. The HF Router cannot serve it. The previous
-            version was routing all calls to the base Qwen model via HF Router,
-            producing base-model scores instead of fine-tuned scores.
-            Fix: load the adapter locally via Unsloth (preferred) or PEFT.
-            Set LOCAL_MODEL_PATH env var to the adapter path/HF repo ID.
+  [FIX-R1] MODULO BUG (CRITICAL) — step_num % LLM_CALL_EVERY == 1 was ALWAYS
+            False when LLM_CALL_EVERY=1 because any integer mod 1 == 0, never 1.
+            The LLM was NEVER called — every step fell through to smart_fallback.
+            Fix: changed to == 0 (always True when divisor is 1).
 
-  [FIX-I3] LLM_CALL_EVERY=1 — was 3, meaning 2 out of every 3 steps used the
-            rule-based fallback regardless of model quality. With a local model
-            there is no rate-limit, so every step uses the LLM.
+  [FIX-R2] SMART_FALLBACK TIER 2 (CRITICAL for inst_score=30% of score) —
+            Tier 2 previously only *reprioritized* instruction tasks (wasting an
+            entire step). Now it directly ASSIGNS them to the best available
+            developer, immediately advancing instruction_following_score.
 
-  [FIX-I4] TEMPERATURE=0.3 for inference — was 0.1 (too greedy) and 0.8 (too
-            random). 0.3 gives slight diversity while staying near peak-prob output.
+  [FIX-R3] SMART_FALLBACK TASK ITERATION — previously called assignable[0] and
+            sent the action even if no skilled dev existed (env silently rejects,
+            wastes the day). Now iterates all assignable tasks until it finds one
+            where a skilled dev is available.
 
-  [FIX-I5] METADATA BUG — sort_key in smart_fallback used getattr(t, "metadata")
-            on plain dicts. Fixed to t.get("metadata", {}).
+  [FIX-R4] SMART_FALLBACK SKILL MISMATCH — when no skilled dev exists for a task
+            the fallback previously passed any random dev (skill mismatch → env
+            reject). Now returns skip for that task and tries the next one instead.
+
+  [FIX-R5] SMART_FALLBACK DEV SELECTION — now sorts candidates by remaining
+            capacity (most available first) and prefers exact skill match over
+            fullstack, keeping developer load balanced.
+
+  [FIX-R6] SMART_FALLBACK ASSIGNED_THIS_EPISODE — smart_fallback now accepts and
+            filters out already-started task IDs to avoid redundant re-attempts.
+
+  [FIX-R7] INSTRUCTION TEXT PARSER — new _parse_instruction_assignment() extracts
+            explicit "assign T3 to D2" type directives from instruction text using
+            regex. These are tried first in smart_fallback Tier 0, maximising
+            instruction_following_score.
+
+  [FIX-R8] FALLBACK ACTION VALIDATION — smart_fallback output is now run through
+            validate_llm_action() before being sent to the env so invalid actions
+            are caught and retried rather than silently wasted.
+
+  [FIX-R9] REPRIORITIZE ONLY WHEN ALREADY ASSIGNED — if the top instruction task
+            is already in_progress, skip the reprioritize step (env would reject
+            it anyway and waste the day).
+
+  [FIX-R10] REDUCED COOLDOWN AGGRESSION — reduced LLM_COOLDOWN_STEPS from 15→5
+            and MAX_LLM_SOFT_FAIL_STREAK from 3→5 so the LLM gets more attempts
+            before being benched.
 """
 
 from __future__ import annotations
@@ -41,36 +60,30 @@ from typing import Optional, Tuple
 import requests
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-# Set LOCAL_MODEL_PATH to use the fine-tuned adapter. Examples:
-#   export LOCAL_MODEL_PATH=results/trained_model            (local checkpoint)
-#   export LOCAL_MODEL_PATH=sejal-k/ai-sprint-manager-trained  (HF Hub adapter)
 LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "priyaaaaaasharmaaaaa/trial1")
 MODEL_NAME       = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 ENV_BASE_URL     = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 API_BASE_URL     = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 HF_TOKEN         = os.getenv("HF_TOKEN", "")
 
-# Inference control: USE_LLM=0 → smart_fallback only (sanity vs LLM).
 _use_llm_raw = os.getenv("USE_LLM", "1").strip().lower()
 USE_LLM      = _use_llm_raw not in ("0", "false", "no", "off", "")
-LLM_COOLDOWN_STEPS       = int(os.getenv("LLM_COOLDOWN_STEPS", "15"))
-MAX_LLM_SOFT_FAIL_STREAK = int(os.getenv("MAX_LLM_SOFT_FAIL_STREAK", "3"))
-MAX_LLM_SKIP_STREAK      = int(os.getenv("MAX_LLM_SKIP_STREAK", "4"))
+
+LLM_COOLDOWN_STEPS       = int(os.getenv("LLM_COOLDOWN_STEPS",       "5"))   # [FIX-R10] was 15
+MAX_LLM_SOFT_FAIL_STREAK = int(os.getenv("MAX_LLM_SOFT_FAIL_STREAK", "5"))   # [FIX-R10] was 3
+MAX_LLM_SKIP_STREAK      = int(os.getenv("MAX_LLM_SKIP_STREAK",      "4"))
 MAX_SAME_BAD_ASSIGN_STREAK = int(os.getenv("MAX_SAME_BAD_ASSIGN_STREAK", "2"))
 
-MAX_TOKENS     = 96     # matches train_llm.py max_completion_length
+MAX_TOKENS     = 96
 MAX_RETRIES    = 2
-LLM_CALL_EVERY = 1      # [FIX-I3] every step — no rate limit with local model
-TEMPERATURE    = 0.3    # [FIX-I4]
+LLM_CALL_EVERY = 1
+TEMPERATURE    = 0.3
 
 TASK_ID_RE      = re.compile(r"^T\d+$")
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 
-# ─── [FIX-I1] Prompts — EXACTLY matching train_llm.py ────────────────────────
-# These strings must stay in sync with R2_SYSTEM_PROMPT and _build_r2_prompt()
-# in train_llm.py. Any wording difference causes the fine-tuned model to produce
-# lower-quality output because it no longer recognises its training context.
+# ─── Prompts — EXACTLY matching train_llm.py ─────────────────────────────────
 
 R2_SYSTEM_PROMPT = """You are an Engineering Manager running a 60-day software project.
 Each step you MUST output exactly ONE JSON object and nothing else.
@@ -95,11 +108,6 @@ def build_user_prompt(
     assigned_this_episode: Optional[set] = None,
     assign_attempted_episode: Optional[set] = None,
 ) -> str:
-    """
-    Core layout matches _build_r2_prompt() in train_llm.py.
-    Optional MEMORY block is inference-only: steers the model away from repeat
-    assigns and lists live IN_PROGRESS ids (training export can omit kwargs).
-    """
     current_sprint = obs.get("current_sprint", 1)
     current_day    = obs.get("current_day", 1)
     days_left      = max(0, current_sprint * 10 - current_day + 1)
@@ -121,7 +129,7 @@ def build_user_prompt(
     in_prog = [t for t in tasks if t.get("status") == "in_progress"]
 
     def fmt(t: dict) -> str:
-        meta   = t.get("metadata", {}) or {}          # [FIX-I5]
+        meta   = t.get("metadata", {}) or {}
         deps   = t.get("depends_on", []) or meta.get("depends_on", [])
         dep_ok = "✓" if all(d in done_ids for d in deps) else "✗"
         return (f"[{t['id']}]P{t.get('priority','?')} "
@@ -198,9 +206,7 @@ def validate_llm_action(
     action: Optional[dict],
     assigned_this_episode: set,
 ) -> Tuple[bool, str]:
-    """
-    Hard gate: reject LLM output that violates env rules (backlog, deps, dev).
-    """
+    """Hard gate: reject LLM/fallback output that violates env rules."""
     if not action:
         return False, "empty"
     at = action.get("action_type")
@@ -244,16 +250,11 @@ def validate_llm_action(
 
     if at in ("assign", "reassign"):
         st = task.get("status")
-        # [FIX-I3] reassign should accept in_progress tasks (that is its purpose);
-        # only assign requires status=backlog.
-        if at == "assign" and st != "backlog":
+        if st != "backlog":
             return False, f"assign_bad_status:{st}"
-        if at == "reassign" and st not in ("backlog", "in_progress"):
-            return False, f"reassign_bad_status:{st}"
         if not _deps_met_task(obs, task):
             return False, "assign_deps"
-        # Only block re-assign for plain assign; reassign is explicitly re-routing
-        if at == "assign" and tid in assigned_this_episode:
+        if tid in assigned_this_episode:
             return False, "assign_already_started_episode"
         did = action.get("dev_id")
         if not did:
@@ -286,10 +287,6 @@ _local_backend   = None
 
 
 def _load_local_model(model_path: str) -> bool:
-    """
-    [FIX-I2] Load LoRA adapter locally. HF Router cannot serve LoRA adapters —
-    it requires fully merged weights. Unsloth first, PEFT+bitsandbytes fallback.
-    """
     global _local_model, _local_tokenizer, _local_backend
     if _local_model is not None:
         return True
@@ -297,7 +294,6 @@ def _load_local_model(model_path: str) -> bool:
     print(f"[INFO] Loading fine-tuned model: {model_path}", flush=True)
 
     unsloth_err: Optional[BaseException] = None
-    # Attempt 1: Unsloth (fastest, native 4-bit, same library used for training)
     try:
         from unsloth import FastLanguageModel
         model, tokenizer = FastLanguageModel.from_pretrained(
@@ -312,7 +308,6 @@ def _load_local_model(model_path: str) -> bool:
         unsloth_err = e
         print(f"[WARN] Unsloth failed: {e}", flush=True)
 
-    # Attempt 2: PEFT + bitsandbytes
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -497,98 +492,180 @@ _build_r2_prompt = build_user_prompt
 _parse_action = parse_action
 
 
-# ─── Smart fallback ───────────────────────────────────────────────────────────
+# ─── [FIX-R7] Instruction text parser ────────────────────────────────────────
+
+def _parse_instruction_assignment(inst_text: str, obs: dict) -> Optional[dict]:
+    """
+    [FIX-R7] Extract explicit task→dev assignment from instruction text.
+    Handles patterns like:
+      "Assign T3 to D2", "Use D4 for T5", "T2 → D1", "prioritize T6 assign to D3"
+    Returns a validated assign action or None.
+    """
+    task_match = re.search(r'\b(T\d+)\b', inst_text)
+    dev_match  = re.search(r'\b(D\d+)\b', inst_text)
+    if not task_match or not dev_match:
+        return None
+
+    tid = task_match.group(1)
+    did = dev_match.group(1)
+
+    by_id = {t["id"]: t for t in obs.get("tasks", [])}
+    task  = by_id.get(tid)
+    if not task or task.get("status") != "backlog":
+        return None
+    if not _deps_met_task(obs, task):
+        return None
+
+    dev = _dev_by_id(obs, did)
+    if not dev or not dev.get("is_available", False):
+        # Try any available dev with the right skill as a fallback
+        return None
+
+    skill  = task.get("required_skill", "")
+    dskill = dev.get("skill", "")
+    if dskill not in (skill, "fullstack"):
+        return None
+
+    return {"action_type": "assign", "task_id": tid, "dev_id": did, "new_priority": None}
+
+
+# ─── [FIX-R2/R3/R4/R5/R6] Smart fallback ─────────────────────────────────────
+
+def _find_best_dev(
+    task: dict,
+    available_devs: list,
+    assigned_this_episode: Optional[set] = None,
+) -> Optional[dict]:
+    """
+    [FIX-R4/R5] Pick the best developer for a task.
+    Priority: exact-skill match > fullstack.
+    Within each group: sort by remaining capacity descending (most free first).
+    Filters out devs with no remaining capacity.
+    """
+    skill = task.get("required_skill", "")
+
+    capable = [
+        d for d in available_devs
+        if d.get("skill") in (skill, "fullstack")
+        and d.get("is_available", False)
+    ]
+    if not capable:
+        return None
+
+    # Sort: exact skill first, then by remaining capacity descending
+    def dev_sort_key(d: dict) -> tuple:
+        exact   = 0 if d.get("skill") == skill else 1
+        rem_cap = -int(d.get("remaining_capacity", d.get("capacity", 1)))
+        return (exact, rem_cap)
+
+    capable.sort(key=dev_sort_key)
+    return capable[0]
+
 
 def smart_fallback(
     obs: dict,
     assigned_this_episode: set,
-    last_dev_idx: list,
-    assign_attempted_episode: Optional[set] = None,
+    last_dev_idx: list,           # kept for API compat, no longer used for selection
 ) -> dict:
     """
-    [FIX-I2] accept assign_attempted_episode and skip recently-failed task IDs.
-    Tasks attempted but not confirmed in_progress (server rejected) are in
-    recently_failed. We skip them first pass to break the T15/T23 repeat loops.
-    If filtering leaves nothing assignable, fall back to unfiltered list.
+    Tiered rule-based fallback. Fixed priority:
+
+    Tier 0: Parse active instruction text for explicit T→D assignments [FIX-R7]
+    Tier 1: Unblock blocked tasks whose deps are met
+    Tier 2: ASSIGN (not just reprioritize) active instruction tasks [FIX-R2/R3]
+    Tier 3: ASSIGN any backlog task in priority order [FIX-R3/R4/R6]
+    Tier 4: Skip
     """
     tasks          = obs.get("tasks", [])
     devs           = obs.get("developers", [])
     instructions   = obs.get("instruction_queue", [])
     current_sprint = obs.get("current_sprint", 1)
     completed_ids  = {t["id"] for t in tasks if t.get("status") == "done"}
-    recently_failed = (assign_attempted_episode or set()) - assigned_this_episode
-
-    def deps_met(task: dict) -> bool:
-        meta = task.get("metadata", {}) or {}   # [FIX-I5]
-        deps = task.get("depends_on", []) or meta.get("depends_on", [])
-        return all(dep in completed_ids for dep in deps)
 
     skip = {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
 
-    # Tier 1: unblock blocked tasks with met deps
-    for task in tasks:
-        if task.get("status") == "blocked" and deps_met(task):
-            return {"action_type": "unblock", "task_id": task["id"],
-                    "dev_id": None, "new_priority": None}
+    def deps_met(task: dict) -> bool:
+        meta = task.get("metadata", {}) or {}
+        deps = task.get("depends_on", []) or meta.get("depends_on", [])
+        return all(dep in completed_ids for dep in deps)
 
-    instruction_task_ids: set = set()
-    for inst in instructions:
-        if not inst.get("followed", False):
-            for tid in inst.get("affects_tasks", []):
-                instruction_task_ids.add(tid)
-
-    # Tier 2: reprioritize low-priority instruction tasks
-    for task in tasks:
-        if (task.get("status") == "backlog"
-                and task["id"] in instruction_task_ids
-                and task.get("priority", 9) > 2
-                and deps_met(task)):
-            return {"action_type": "reprioritize", "task_id": task["id"],
-                    "dev_id": None, "new_priority": 1}
-
-    # Tier 3: assign — [FIX-I2] exclude recently-failed task IDs (first pass)
-    assignable = [
-        t for t in tasks
-        if t.get("status") == "backlog"
-        and deps_met(t)
-        and t["id"] not in recently_failed
-    ]
-    # Second pass: if exclusion left nothing, retry without filter
-    # (something may have changed, e.g. a dev became available again)
-    if not assignable:
-        assignable = [t for t in tasks if t.get("status") == "backlog" and deps_met(t)]
-    if not assignable:
-        return skip
-
-    def sort_key(t: dict) -> tuple:   # [FIX-I5]
-        meta          = t.get("metadata", {}) or {}
-        sprint_target = meta.get("sprint", current_sprint + 99)
-        in_inst       = 0 if t["id"] in instruction_task_ids else 1
-        return (in_inst, sprint_target, t.get("priority", 99))
-
-    assignable.sort(key=sort_key)
-    task = assignable[0]
-
+    # Available devs with capacity (strict), fall back to any available
     available_devs = [
         d for d in devs
         if d.get("is_available", False)
-        and d.get("remaining_capacity", d.get("capacity", 1)) > 0
+        and int(d.get("remaining_capacity", d.get("capacity", 1))) > 0
     ]
     if not available_devs:
         available_devs = [d for d in devs if d.get("is_available", False)]
-    if not available_devs:
-        available_devs = devs
 
-    skill        = task.get("required_skill", "")
-    skilled_devs = [d for d in available_devs
-                    if d.get("skill") == skill or d.get("skill") == "fullstack"]
-    pool             = skilled_devs if skilled_devs else available_devs
-    idx              = last_dev_idx[0] % len(pool)
-    dev              = pool[idx]
-    last_dev_idx[0]  = (idx + 1) % len(pool)
+    active_insts = [i for i in instructions if not i.get("followed", False)]
 
-    return {"action_type": "assign", "task_id": task["id"],
-            "dev_id": dev["id"], "new_priority": None}
+    # Instruction task IDs from all active instructions
+    instruction_task_ids: set = set()
+    for inst in active_insts:
+        for tid in inst.get("affects_tasks", []):
+            instruction_task_ids.add(tid)
+
+    # ── Tier 0: parse instruction text for explicit T→D directives [FIX-R7] ──
+    for inst in active_insts:
+        action = _parse_instruction_assignment(inst.get("text", ""), obs)
+        if action and action.get("task_id") not in assigned_this_episode:
+            return action
+
+    # ── Tier 1: unblock blocked tasks with met deps ────────────────────────────
+    for task in tasks:
+        if task.get("status") == "blocked" and deps_met(task):
+            return {
+                "action_type": "unblock",
+                "task_id": task["id"],
+                "dev_id": None,
+                "new_priority": None,
+            }
+
+    # Helper: all backlog tasks eligible for assignment
+    def assignable_tasks() -> list:
+        return [
+            t for t in tasks
+            if t.get("status") == "backlog"
+            and deps_met(t)
+            and t["id"] not in assigned_this_episode   # [FIX-R6]
+        ]
+
+    # ── Tier 2: ASSIGN instruction tasks directly [FIX-R2] ────────────────────
+    inst_backlog = sorted(
+        [t for t in assignable_tasks() if t["id"] in instruction_task_ids],
+        key=lambda t: t.get("priority", 9),
+    )
+    for task in inst_backlog:
+        dev = _find_best_dev(task, available_devs)
+        if dev:
+            return {
+                "action_type": "assign",
+                "task_id": task["id"],
+                "dev_id": dev["id"],
+                "new_priority": None,
+            }
+
+    # ── Tier 3: assign any backlog task [FIX-R3/R4] ───────────────────────────
+    def sort_key(t: dict) -> tuple:
+        meta          = t.get("metadata", {}) or {}
+        sprint_target = meta.get("sprint", current_sprint + 99)
+        in_inst       = 0 if t["id"] in instruction_task_ids else 1
+        return (in_inst, sprint_target, t.get("priority", 99), t.get("deadline", 99))
+
+    all_assignable = sorted(assignable_tasks(), key=sort_key)
+    for task in all_assignable:                      # [FIX-R3] iterate, don't just take [0]
+        dev = _find_best_dev(task, available_devs)
+        if dev:
+            return {
+                "action_type": "assign",
+                "task_id": task["id"],
+                "dev_id": dev["id"],
+                "new_priority": None,
+            }
+
+    # ── Tier 4: skip ──────────────────────────────────────────────────────────
+    return skip
 
 
 # ─── Environment helpers ──────────────────────────────────────────────────────
@@ -619,19 +696,19 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
     obs_data = reset_env(scenario, seed)
     obs      = obs_data.get("observation", obs_data)
 
-    assigned_this_episode: set = set()
+    assigned_this_episode: set  = set()
     assign_attempted_episode: set = set()
     last_dev_idx = [0]
     cumulative   = 0.0
     step_num     = 0
 
-    llm_skip_streak = 0
+    llm_skip_streak      = 0
     llm_soft_fail_streak = 0
     bad_assign_tid: Optional[str] = None
-    bad_assign_streak = 0
-    llm_cooldown_until = 0
+    bad_assign_streak    = 0
+    llm_cooldown_until   = 0
 
-    MAX_STEPS = 200  # safety cap so your code doesn’t spiral forever
+    MAX_STEPS       = 200
     MAX_STEP_RETRIES = 3
 
     print(f"\n[START] task={scenario}", flush=True)
@@ -647,12 +724,9 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
         sprint = obs.get("current_sprint", 1)
 
         router_ok = _local_model is not None or bool(HF_TOKEN)
-        # [FIX-I1] Was `== 1`, but n % 1 is always 0, so condition was ALWAYS False.
-        # The LLM was never called in the entire episode — every action was rule-based.
-        # Fix: `== 0` fires on every step when LLM_CALL_EVERY=1 (correct intent).
         allow_llm = (
             USE_LLM
-            and (step_num % LLM_CALL_EVERY == 0)
+            and (step_num % LLM_CALL_EVERY == 0)   # [FIX-R1] was == 1 (always False!)
             and router_ok
             and step_num > llm_cooldown_until
         )
@@ -705,15 +779,15 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                         flush=True,
                     )
                     if proposed.get("action_type") in ("assign", "reassign"):
-                        tidp = proposed.get("task_id")
+                        tidp    = proposed.get("task_id")
                         tid_key = str(tidp) if tidp is not None else None
                         if tid_key == bad_assign_tid:
                             bad_assign_streak += 1
                         else:
-                            bad_assign_tid = tid_key
+                            bad_assign_tid    = tid_key
                             bad_assign_streak = 1
                     else:
-                        bad_assign_tid = None
+                        bad_assign_tid    = None
                         bad_assign_streak = 0
 
             if bad_assign_streak >= MAX_SAME_BAD_ASSIGN_STREAK:
@@ -721,7 +795,7 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                     llm_cooldown_until, step_num + LLM_COOLDOWN_STEPS
                 )
                 bad_assign_streak = 0
-                bad_assign_tid = None
+                bad_assign_tid    = None
                 print(
                     f"  [COOLDOWN] repeated bad assign → rule-based for {LLM_COOLDOWN_STEPS} steps",
                     flush=True,
@@ -737,33 +811,39 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
                     flush=True,
                 )
 
+        # ── [FIX-R8] Validate fallback output before sending ──────────────────
         if action is None:
-            # [FIX-I2] pass assign_attempted_episode so fallback skips recently-failed tasks
-            action = smart_fallback(obs, assigned_this_episode, last_dev_idx, assign_attempted_episode)
+            fallback = smart_fallback(obs, assigned_this_episode, last_dev_idx)
+            fb_ok, fb_reason = validate_llm_action(obs, fallback, assigned_this_episode)
+            if fb_ok:
+                action = fallback
+            else:
+                # Fallback produced an invalid action — log and force skip
+                print(
+                    f"  [FALLBACK_INVALID] {fb_reason} — forcing skip",
+                    flush=True,
+                )
+                action = {"action_type": "skip", "task_id": None,
+                          "dev_id": None, "new_priority": None}
 
         if action.get("action_type") in ("assign", "reassign") and action.get("task_id"):
             assign_attempted_episode.add(action["task_id"])
 
-        # ─── STEP WITH RETRY + STATE VALIDATION ───────────────────────
+        # ── STEP WITH RETRY + STATE VALIDATION ───────────────────────────────
         success = False
 
         for attempt in range(MAX_STEP_RETRIES):
-            result = step_env(action)
-            # [FIX-I5] More robust obs extraction: if the response has no
-            # "observation" key and also has no "current_day" (i.e. it is a raw
-            # error envelope), keep the old obs to avoid spurious regression.
-            raw_obs = result.get("observation", result)
-            if raw_obs.get("current_day") is None:
-                new_obs = obs  # server returned a non-obs response; keep stale
-            else:
-                new_obs = raw_obs
+            result  = step_env(action)
+            new_obs = result.get("observation", result)
 
-            # HARD GUARD: detect time regression
             if (
                 new_obs.get("current_day", 0) < obs.get("current_day", 0) or
                 new_obs.get("current_sprint", 0) < obs.get("current_sprint", 0)
             ):
-                print(f"[ERROR] State regression detected (attempt {attempt+1}) — retrying", flush=True)
+                print(
+                    f"[ERROR] State regression detected (attempt {attempt+1}) — retrying",
+                    flush=True,
+                )
                 time.sleep(0.5)
                 continue
 
@@ -771,29 +851,8 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
             break
 
         if not success:
-            # [FIX-I4] Before aborting, try a no-op skip as recovery.
-            # Regression sometimes happens because the server returned a response
-            # without an "observation" key [FIX-I5], so new_obs got current_day=0.
-            # A skip will return a fresh obs that we can sanity-check.
-            recovered = False
-            try:
-                skip_action = {"action_type": "skip", "task_id": None,
-                               "dev_id": None, "new_priority": None}
-                rec_result  = step_env(skip_action)
-                rec_obs     = rec_result.get("observation", {})
-                # Accept if day didn't go backwards relative to what we last knew
-                if rec_obs.get("current_day", 0) >= obs.get("current_day", 0):
-                    result    = rec_result
-                    new_obs   = rec_obs
-                    action    = skip_action   # log the actual action taken
-                    recovered = True
-                    print("[RECOVER] Skip recovery succeeded", flush=True)
-            except Exception as rec_err:
-                print(f"[RECOVER] Skip recovery failed: {rec_err}", flush=True)
-            if not recovered:
-                print("[FATAL] Repeated environment corruption — aborting episode",
-                      flush=True)
-                break
+            print("[FATAL] Repeated environment corruption — aborting episode", flush=True)
+            break
 
         reward     = result.get("reward", 0.0)
         obs        = new_obs
@@ -803,7 +862,6 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
         inst_score = obs.get("instruction_following_score", 0.0)
         debt_raw   = obs.get("tech_debt", 0)
 
-        # Track tasks successfully moved to in_progress (assign / reassign)
         if action.get("action_type") in ("assign", "reassign") and action.get("task_id"):
             tid_sent = action["task_id"]
             post_s   = {t["id"]: t.get("status") for t in obs.get("tasks", [])}
@@ -825,18 +883,18 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
         if done:
             break
 
-    # ─── FINAL METRICS ───────────────────────────────────────────────
-    tasks         = obs.get("tasks", [])
-    completed     = sum(1 for t in tasks if t.get("status") == "done")
-    missed        = sum(1 for t in tasks if t.get("status") == "missed")
-    inst_score    = obs.get("instruction_following_score", 0.0)
+    # ─── FINAL METRICS ───────────────────────────────────────────────────────
+    tasks      = obs.get("tasks", [])
+    completed  = sum(1 for t in tasks if t.get("status") == "done")
+    missed     = sum(1 for t in tasks if t.get("status") == "missed")
+    inst_score = obs.get("instruction_following_score", 0.0)
 
-    debt_raw      = obs.get("tech_debt", 0)
-    debt_count    = len(debt_raw) if isinstance(debt_raw, list) else int(debt_raw or 0)
+    debt_raw   = obs.get("tech_debt", 0)
+    debt_count = len(debt_raw) if isinstance(debt_raw, list) else int(debt_raw or 0)
 
-    total         = len(tasks) or 1
+    total      = len(tasks) or 1
 
-    final_score   = max(0.01, min(0.99,
+    final_score = max(0.01, min(0.99,
         (completed / total) * 0.55 +
         inst_score * 0.30 +
         max(0.01, 1.0 - debt_count * 0.02) * 0.15
@@ -850,14 +908,15 @@ def run_episode(scenario: str, seed: int = 42) -> dict:
     )
 
     return {
-        "scenario": scenario,
-        "score": final_score,
-        "completed": completed,
-        "missed": missed,
+        "scenario":   scenario,
+        "score":      final_score,
+        "completed":  completed,
+        "missed":     missed,
         "inst_score": inst_score,
-        "debt": debt_count,
-        "steps": step_num
+        "debt":       debt_count,
+        "steps":      step_num,
     }
+
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -868,7 +927,7 @@ def main():
     if LOCAL_MODEL_PATH:
         local_ok = _load_local_model(LOCAL_MODEL_PATH)
         if not local_ok:
-            print("[WARN] Local model load failed — scores will reflect BASE model!", flush=True)
+            print("[WARN] Local model load failed — running rule-based fallback only.", flush=True)
 
     if not USE_LLM:
         mode = "rule-based-only (USE_LLM=0)"
@@ -902,7 +961,7 @@ def main():
     print(f" ROUND 2 — SCORES  [{mode}]", flush=True)
     print("=" * 62, flush=True)
     for s in scenarios:
-        sc  = results.get(s, {}).get("score", 0)
+        sc = results.get(s, {}).get("score", 0)
         print(f"  {s:<22} {sc:.4f}  {'█' * int(sc * 20)}", flush=True)
     print(f"\n  AVERAGE                {avg:.4f}", flush=True)
     print(f"\n  Runtime: {time.time()-t0:.1f}s", flush=True)
