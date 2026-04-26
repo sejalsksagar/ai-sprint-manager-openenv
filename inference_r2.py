@@ -60,7 +60,7 @@ from typing import Optional, Tuple
 import requests
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "priyaaaaaasharmaaaaa/trial1")
+LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "priyaaaaaasharmaaaaa/smaller")
 MODEL_NAME       = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 ENV_BASE_URL     = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 API_BASE_URL     = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
