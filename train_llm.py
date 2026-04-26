@@ -177,16 +177,23 @@ HF_REPO_ID   = os.getenv("HF_REPO_ID", "")
 GRPO_CONFIG = {
     "learning_rate":               5e-6,
     "num_train_epochs":            1,
-    "per_device_train_batch_size": 1,   # T4-safe default; double for A10G+
-    "gradient_accumulation_steps": 8,   # effective batch=8 even with bs=1
+    "per_device_train_batch_size": 1,   # T4-safe; effective batch=8 (1*8*1)
+    "gradient_accumulation_steps": 8,   # eff batch 8 must be divisible by num_generations (8/4=2 ✓)
     "max_prompt_length":           1024,
     "max_completion_length":       96,  # action JSON < 80 tokens; 96 gives margin
-    "num_generations":             2,   # T4-safe; set 4 for A10G+
-    "temperature":                 0.8, # high: encourage diverse candidates
-    "beta":                        0.04,  # KL penalty — anti-reward-hacking
+    # FIX-DOC1: num_generations 2→4. With 2, frac_reward_zero_std=1.0 (all groups had
+    # identical rewards → GRPO gradient=0 → no learning). 4 gives meaningful group variance.
+    # Docs: effective batch size must be divisible by num_generations. 8/4=2 ✓
+    "num_generations":             4,
+    # FIX-DOC2: temperature 0.8→1.0. TRL docs default and recommended for generation
+    # diversity in GRPO. Higher diversity → non-zero reward std → real gradients.
+    "temperature":                 1.0,
+    "beta":                        0.04,  # KL penalty — anti-reward-hacking; loads ref model
     "logging_steps":               5,
     "save_steps":                  50,
-    "warmup_ratio":                0.05,
+    # FIX-DOC3: warmup_ratio deprecated in TRL v5.2. Replace with warmup_steps.
+    # 5% of ~225 GRPO steps ≈ 11 steps.
+    "warmup_steps":                11,
     "seed":                        42,
 }
 
@@ -196,7 +203,8 @@ SFT_CONFIG = {
     "per_device_train_batch_size": 2,
     "gradient_accumulation_steps": 4,
     "learning_rate":               2e-5,  # higher than GRPO — SFT is supervised
-    "warmup_ratio":                0.05,
+    # FIX-DOC3: warmup_ratio deprecated → warmup_steps (SFT has ~48 steps; 5%≈2, use 5)
+    "warmup_steps":                5,
     "logging_steps":               5,
     "save_steps":                  100,
 }
@@ -565,6 +573,89 @@ def make_reward_fn(env_base_url: str, phase: str):
     return reward_fn
 
 
+def make_format_reward_fn():
+    """
+    FIX-DOC5: Secondary reward function checking JSON schema validity.
+    Pattern from TRL GRPO docs Example 2 (format reward).
+
+    Why: The env reward (make_reward_fn) is only non-neutral when the env
+    successfully parses and executes the action. If the model outputs invalid
+    JSON, the env call fails and returns the neutral 0.5 fallback — giving no
+    gradient signal about FORMAT correctness.
+
+    This function gives a small but always-available dense signal:
+      +0.3 : valid JSON with correct action_type and required fields
+      +0.1 : valid JSON but missing required fields
+       0.0 : not valid JSON at all
+
+    Used with reward_weights=[1.0, 0.2] so it contributes 0.2x relative to
+    the env reward — enough to guide format learning without dominating.
+
+    Docs ref: GRPOTrainer supports multiple reward functions. The reward is
+    the weighted sum: total = env_reward*1.0 + format_reward*0.2.
+    """
+    import re
+    _VALID_ACTIONS_SET = {"assign", "reassign", "reprioritize", "unblock", "skip"}
+    _TASK_ID_RE = re.compile(r"^T\d+$")
+
+    def format_reward_fn(completions, **kwargs) -> list[float]:
+        rewards = []
+        for completion in completions:
+            # Handle TRL >=0.9 list[dict] format (same as _parse_action fix)
+            if isinstance(completion, list):
+                text = " ".join(
+                    m.get("content", "") for m in completion if m.get("role") == "assistant"
+                )
+            else:
+                text = str(completion)
+
+            text = text.strip()
+            # Strip markdown fences
+            text = re.sub(r"^```[a-z]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+
+            # Try to parse JSON
+            score = 0.0
+            try:
+                # Find last balanced {} block
+                depth = 0; obj_start = -1; last_start = -1; last_end = -1
+                for i, ch in enumerate(text):
+                    if ch == "{":
+                        if depth == 0: obj_start = i
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0 and obj_start >= 0:
+                            last_start, last_end = obj_start, i + 1
+                if last_start >= 0:
+                    obj = json.loads(text[last_start:last_end])
+                else:
+                    obj = json.loads(text)
+
+                action_type = obj.get("action_type", "")
+                if action_type in _VALID_ACTIONS_SET:
+                    score = 0.1  # valid JSON + valid action_type
+                    # Full score: assign/reassign need task_id+dev_id; others need task_id
+                    if action_type in ("assign", "reassign"):
+                        tid = obj.get("task_id")
+                        did = obj.get("dev_id")
+                        if (tid and _TASK_ID_RE.match(str(tid)) and did):
+                            score = 0.3
+                    elif action_type in ("reprioritize", "unblock"):
+                        tid = obj.get("task_id")
+                        if tid and _TASK_ID_RE.match(str(tid)):
+                            score = 0.3
+                    elif action_type == "skip":
+                        score = 0.3  # skip is always structurally valid
+            except (json.JSONDecodeError, Exception):
+                score = 0.0  # not valid JSON at all
+
+            rewards.append(float(score))
+        return rewards
+
+    return format_reward_fn
+
+
 # ── Dataset builder ───────────────────────────────────────────────────────────
 #
 # [FIX-T4] Samples from MIDDLE of episodes (skip first N steps).
@@ -787,7 +878,11 @@ def load_model_and_tokenizer(model_name: str):
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
             lora_alpha=32,
-            lora_dropout=0.05,
+            # FIX-DOC4: lora_dropout 0.05→0.0. Unsloth logs explicitly warn:
+            # "Dropout=0 is supported for fast patching. You are using dropout=0.05.
+            #  Unsloth will patch all other layers, except LoRA matrices, causing a
+            #  performance hit." Setting 0.0 enables Unsloth full fast-kernel path.
+            lora_dropout=0.0,
             bias="none",
             use_gradient_checkpointing="unsloth",
             random_state=42,
@@ -824,7 +919,8 @@ def _load_hf_model(model_name: str):
             token=HF_TOKEN or None,
         )
         lora_cfg = LoraConfig(
-            r=16, lora_alpha=32, lora_dropout=0.05,
+            r=16, lora_alpha=32,
+            lora_dropout=0.0,  # FIX-DOC4: same as Unsloth path — 0 for fast patching
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
             task_type=TaskType.CAUSAL_LM,
@@ -862,12 +958,6 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
         return {"text": "\n".join(parts)}
 
     sft_data = sft_data.map(format_fn)
-    # FIX: Unsloth SFTTrainer (2026.x) detects "prompt"+"completion" columns
-    # and routes to _tokenize_pc which does list+str -> TypeError.
-    # Drop them so SFTTrainer only sees "text" and uses dataset_text_field path.
-    cols_to_drop = [c for c in ["prompt", "completion"] if c in sft_data.column_names]
-    if cols_to_drop:
-        sft_data = sft_data.remove_columns(cols_to_drop)
 
     sft_dir  = str(Path(output_dir) / "sft_warmup")
     sft_conf = SFTConfig(
@@ -947,16 +1037,48 @@ def train(
         for key in ("warmup_ratio",):
             cfg.pop(key, None)
 
+    # FIX-DOC5: Build format reward function (secondary, weight=0.2)
+    # Gives a dense always-available signal for JSON schema correctness,
+    # separate from the sparse environment reward.
+    format_reward_fn = make_format_reward_fn()
+
     grpo_config = GRPOConfig(
         output_dir=output_dir,
         report_to="none",
+        # FIX-DOC6: loss_type="dapo" (TRL new default). Normalises by total active
+        # tokens in the accumulated batch → eliminates response length bias.
+        # "grpo" (old default) had length bias: shorter responses with positive
+        # advantages were over-weighted. "dapo" fixes this.
+        loss_type="dapo",
+        # FIX-DOC7: mask_truncated_completions=True. Truncated completions are
+        # excluded from the loss. Prevents noise from incomplete JSON outputs
+        # being penalised as if they were intentionally bad. DAPO paper recommends.
+        mask_truncated_completions=True,
+        # FIX-DOC8: scale_rewards="group". Explicit: normalises reward within each
+        # group of num_generations completions (group-relative, the "GR" in GRPO).
+        scale_rewards="group",
+        # FIX-DOC9: disable_dropout=True. Docs: "useful for training with a reference
+        # model — prevents the model from generating different logprobs for the same
+        # input." We have beta=0.04 (non-zero), so the reference model IS loaded.
+        # Without this, the KL term gets noisy estimates.
+        disable_dropout=True,
+        # FIX-DOC10: log_completions=True. Logs (prompt, completion) sample pairs
+        # every logging_steps. Makes it easy to see what the model is outputting
+        # during training without adding any overhead.
+        log_completions=True,
+        # FIX-DOC11: reward_weights for dual reward functions.
+        # env_reward * 1.0 + format_reward * 0.2
+        # Format reward is weighted lightly so it guides format without dominating.
+        reward_weights=[1.0, 0.2],
         **cfg,
     )
 
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
-        reward_funcs=reward_fn,
+        # FIX-DOC5: Pass both reward functions. TRL sums them weighted by reward_weights.
+        # Docs: "you can pass several reward functions as a list"
+        reward_funcs=[reward_fn, format_reward_fn],
         args=grpo_config,
         train_dataset=dataset,
     )
