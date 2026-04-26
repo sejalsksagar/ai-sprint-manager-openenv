@@ -44,7 +44,7 @@ import requests
 # Set LOCAL_MODEL_PATH to use the fine-tuned adapter. Examples:
 #   export LOCAL_MODEL_PATH=results/trained_model            (local checkpoint)
 #   export LOCAL_MODEL_PATH=sejal-k/ai-sprint-manager-trained  (HF Hub adapter)
-LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "priyaaaaaasharmaaaaa/trial1")
+LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "sejal-k/ai-sprint-manager-trained")
 MODEL_NAME       = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 ENV_BASE_URL     = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 API_BASE_URL     = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
