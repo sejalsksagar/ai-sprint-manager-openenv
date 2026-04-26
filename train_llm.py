@@ -334,21 +334,11 @@ _VALID_ACTIONS = {"assign", "reassign", "reprioritize", "skip", "unblock"}
 _NULL_STRINGS  = {"null", "none", "None", "Null", "", "undefined", "N/A", "nil"}
 
 
-def _parse_action(text) -> dict:
+def _parse_action(text: str) -> dict:
     """
     Parse LLM completion → action dict.
     Takes the LAST JSON object in the text (handles chain-of-thought prefix).
-
-    FIX: TRL ≥0.9 (used with Unsloth 2026.x) passes completions as
-    list[dict] in chat-message format instead of a plain string.
-    e.g. [{"role": "assistant", "content": '{"action_type":"assign"...}'}]
-    We extract the assistant content string before any string operations.
     """
-    # Handle TRL ≥0.9 list[dict] format
-    if isinstance(text, list):
-        text = " ".join(
-            m.get("content", "") for m in text if m.get("role") == "assistant"
-        )
     text = text.strip()
     if "```" in text:
         text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
@@ -863,6 +853,12 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
         return {"text": "\n".join(parts)}
 
     sft_data = sft_data.map(format_fn)
+    # FIX: Unsloth SFTTrainer (2026.x) detects "prompt"+"completion" columns
+    # and routes to _tokenize_pc which does list+str -> TypeError.
+    # Drop them so SFTTrainer only sees "text" and uses dataset_text_field path.
+    cols_to_drop = [c for c in ["prompt", "completion"] if c in sft_data.column_names]
+    if cols_to_drop:
+        sft_data = sft_data.remove_columns(cols_to_drop)
 
     sft_dir  = str(Path(output_dir) / "sft_warmup")
     sft_conf = SFTConfig(
