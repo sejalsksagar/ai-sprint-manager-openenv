@@ -1048,6 +1048,17 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
     """
     [FIX-T3] SFT warm-up: teach the model JSON format before GRPO exploration.
     Uses TRL SFTTrainer with the rule-based (obs, action) pairs.
+
+    [FIX-SFT] Unsloth's patched SFTTrainer scans dataset column names at __init__
+    time. If it sees both "prompt" (list[dict]) and "completion" (str), it routes
+    to its internal _tokenize_pc path which calls tokenizer("prompt") directly —
+    treating the list-of-dicts as a string input → ValueError.
+
+    Fix: convert everything to a single "text" string column FIRST, then drop
+    "prompt" and "completion" so Unsloth only sees "text" and uses
+    dataset_text_field as intended. We also disable multiprocessing on the map
+    call (num_proc=1) because Unsloth's multiprocess pool re-triggers the same
+    bad tokenization path in worker processes.
     """
     print(f"\n[SFT] Warm-up phase ({n_examples} examples)...", flush=True)
     try:
@@ -1056,17 +1067,44 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
         print("[WARN] SFTTrainer not in this trl version — skipping SFT warm-up", flush=True)
         return model
 
-    sft_data = build_sft_dataset(n_examples=n_examples, phase=phase)
+    raw_data = build_sft_dataset(n_examples=n_examples, phase=phase)
 
+    # [FIX-SFT] Build the formatted text column.
+    # Uses the tokenizer's apply_chat_template if available (correct special tokens),
+    # falls back to a manual format that still works.
     def format_fn(example):
-        """Convert chat messages + completion to a single formatted string."""
-        parts = []
-        for msg in example["prompt"]:
-            parts.append(f"<|{msg['role']}|>\n{msg['content']}")
-        parts.append(f"<|assistant|>\n{example['completion']}")
-        return {"text": "\n".join(parts)}
+        msgs = example["prompt"]  # list of {"role":..., "content":...}
+        completion = example["completion"]
+        try:
+            # apply_chat_template adds_generation_prompt=False so we can append
+            # the assistant completion ourselves.
+            chat_str = tokenizer.apply_chat_template(
+                msgs,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            # Strip any trailing whitespace/newline then append completion + EOS
+            text = chat_str.rstrip() + completion + tokenizer.eos_token
+        except Exception:
+            # Fallback: plain role-tagged format
+            parts = []
+            for msg in msgs:
+                parts.append(f"<|{msg['role']}|>\n{msg['content']}")
+            parts.append(f"<|assistant|>\n{completion}")
+            text = "\n".join(parts) + tokenizer.eos_token
+        return {"text": text}
 
-    sft_data = sft_data.map(format_fn)
+    # num_proc=1: avoids Unsloth's multiprocess worker re-triggering _tokenize_pc
+    sft_data = raw_data.map(format_fn, num_proc=1)
+
+    # [FIX-SFT] Drop ALL columns except "text" so Unsloth's column-name heuristic
+    # cannot route to _tokenize_pc. After this the dataset has only {"text": str}.
+    cols_to_remove = [c for c in sft_data.column_names if c != "text"]
+    if cols_to_remove:
+        sft_data = sft_data.remove_columns(cols_to_remove)
+
+    print(f"[SFT] Dataset ready: {len(sft_data)} examples, "
+          f"columns={sft_data.column_names}", flush=True)
 
     sft_dir  = str(Path(output_dir) / "sft_warmup")
     sft_conf = SFTConfig(
@@ -1074,6 +1112,7 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
         dataset_text_field="text",
         max_seq_length=1024,
         report_to="none",
+        dataset_num_proc=1,   # [FIX-SFT] prevent multiprocess tokenization
         **SFT_CONFIG,
     )
     trainer = SFTTrainer(
