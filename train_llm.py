@@ -334,11 +334,20 @@ _VALID_ACTIONS = {"assign", "reassign", "reprioritize", "skip", "unblock"}
 _NULL_STRINGS  = {"null", "none", "None", "Null", "", "undefined", "N/A", "nil"}
 
 
-def _parse_action(text: str) -> dict:
+def _parse_action(text) -> dict:
     """
     Parse LLM completion → action dict.
     Takes the LAST JSON object in the text (handles chain-of-thought prefix).
+
+    FIX: TRL >=0.9 / Unsloth 2026.x passes completions as list[dict] in chat
+    message format instead of a plain str:
+      e.g. [{"role": "assistant", "content": '{"action_type":"assign"...}'}]
+    Extract the assistant content string before any string operations.
     """
+    if isinstance(text, list):
+        text = " ".join(
+            m.get("content", "") for m in text if m.get("role") == "assistant"
+        )
     text = text.strip()
     if "```" in text:
         text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
