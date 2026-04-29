@@ -1489,7 +1489,7 @@ def main():
             print("=" * 65, flush=True)
             print("  Unsloth handles multi-GPU internally. torchrun conflicts", flush=True)
             print("  with Unsloth's data-parallel and causes a NCCL crash.", flush=True)
-            print(), flush=True)
+            # print(), flush=True)
             print("  ✅ CORRECT command (Unsloth uses both GPUs automatically):", flush=True)
             print("     python train_llm.py --phase both --episodes 300 \\", flush=True)
             print("            --sft-epochs 2 --gpu-tier t4 \\", flush=True)
