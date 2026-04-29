@@ -1046,19 +1046,13 @@ def _load_hf_model(model_name: str):
 
 def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
     """
-    [FIX-T3] SFT warm-up: teach the model JSON format before GRPO exploration.
-    Uses TRL SFTTrainer with the rule-based (obs, action) pairs.
+    SFT warm-up: teach the model JSON format before GRPO exploration.
 
-    [FIX-SFT] Unsloth's patched SFTTrainer scans dataset column names at __init__
-    time. If it sees both "prompt" (list[dict]) and "completion" (str), it routes
-    to its internal _tokenize_pc path which calls tokenizer("prompt") directly —
-    treating the list-of-dicts as a string input → ValueError.
-
-    Fix: convert everything to a single "text" string column FIRST, then drop
-    "prompt" and "completion" so Unsloth only sees "text" and uses
-    dataset_text_field as intended. We also disable multiprocessing on the map
-    call (num_proc=1) because Unsloth's multiprocess pool re-triggers the same
-    bad tokenization path in worker processes.
+    [FIX-SFT] Unsloth's patched SFTTrainer scans column names at __init__ time.
+    If it sees both "prompt" (list[dict]) and "completion" (str), it routes to
+    _tokenize_pc which calls tokenizer("prompt") directly → TypeError/ValueError.
+    Fix: format to a single "text" column first, drop all other columns, and
+    set dataset_num_proc=1 to prevent multiprocess re-triggering the same path.
     """
     print(f"\n[SFT] Warm-up phase ({n_examples} examples)...", flush=True)
     try:
@@ -1069,36 +1063,23 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
 
     raw_data = build_sft_dataset(n_examples=n_examples, phase=phase)
 
-    # [FIX-SFT] Build the formatted text column.
-    # Uses the tokenizer's apply_chat_template if available (correct special tokens),
-    # falls back to a manual format that still works.
     def format_fn(example):
-        msgs = example["prompt"]  # list of {"role":..., "content":...}
+        msgs = example["prompt"]
         completion = example["completion"]
         try:
-            # apply_chat_template adds_generation_prompt=False so we can append
-            # the assistant completion ourselves.
             chat_str = tokenizer.apply_chat_template(
-                msgs,
-                tokenize=False,
-                add_generation_prompt=True,
+                msgs, tokenize=False, add_generation_prompt=True,
             )
-            # Strip any trailing whitespace/newline then append completion + EOS
             text = chat_str.rstrip() + completion + tokenizer.eos_token
         except Exception:
-            # Fallback: plain role-tagged format
-            parts = []
-            for msg in msgs:
-                parts.append(f"<|{msg['role']}|>\n{msg['content']}")
+            parts = [f"<|{m['role']}|>\n{m['content']}" for m in msgs]
             parts.append(f"<|assistant|>\n{completion}")
             text = "\n".join(parts) + tokenizer.eos_token
         return {"text": text}
 
-    # num_proc=1: avoids Unsloth's multiprocess worker re-triggering _tokenize_pc
+    # num_proc=1 prevents Unsloth multiprocess pool re-triggering _tokenize_pc
     sft_data = raw_data.map(format_fn, num_proc=1)
-
-    # [FIX-SFT] Drop ALL columns except "text" so Unsloth's column-name heuristic
-    # cannot route to _tokenize_pc. After this the dataset has only {"text": str}.
+    # Drop all columns except "text" so Unsloth column-name heuristic can't misroute
     cols_to_remove = [c for c in sft_data.column_names if c != "text"]
     if cols_to_remove:
         sft_data = sft_data.remove_columns(cols_to_remove)
@@ -1112,7 +1093,7 @@ def run_sft(model, tokenizer, phase: str, n_examples: int, output_dir: str):
         dataset_text_field="text",
         max_seq_length=1024,
         report_to="none",
-        dataset_num_proc=1,   # [FIX-SFT] prevent multiprocess tokenization
+        dataset_num_proc=1,
         **SFT_CONFIG,
     )
     trainer = SFTTrainer(
@@ -1142,8 +1123,8 @@ def train(
     print(f" Server: {ENV_BASE_URL}", flush=True)
     print(f" SFT warm-up epochs: {sft_epochs}", flush=True)
     if push_to_hub:
-        _resolved_repo = HF_REPO_ID or "(HF_REPO_ID not set — push will be skipped)"
-        print(f" Push to Hub: {_resolved_repo}", flush=True)
+        _repo = HF_REPO_ID or "(HF_REPO_ID not set — push will be skipped)"
+        print(f" Push to Hub: {_repo}", flush=True)
     print(f"{'='*60}\n", flush=True)
 
     # Adjust config for GPU tier
@@ -1157,19 +1138,15 @@ def train(
         cfg["gradient_accumulation_steps"] = 4
 
     # ── Dual-GPU support (Kaggle T4 × 2) ──────────────────────────────────────
-    # GRPOTrainer is DDP-compatible. When launched with torchrun --nproc_per_node=2
-    # each process handles per_device_train_batch_size=1 on its own GPU.
-    # The effective global batch = n_gpus × batch × accum_steps stays constant
-    # if we halve gradient_accumulation_steps as n_gpus doubles.
-    #
-    # RUN COMMAND for dual-T4 Kaggle:
+    # GRPOTrainer is DDP-compatible. Launch with:
     #   torchrun --nproc_per_node=2 train_llm.py --phase both --episodes 300 \
     #            --sft-epochs 2 --gpu-tier t4 --output results/trained_model --push
-    #
-    # Single GPU (no change): python train_llm.py ...
+    # Single-GPU: python train_llm.py ... (no change needed)
+    # We halve gradient_accumulation_steps so effective global batch stays constant:
+    #   1 GPU × 8 accum = 2 GPU × 4 accum = effective batch 8
     try:
-        import torch
-        _n_gpus = torch.cuda.device_count()
+        import torch as _torch
+        _n_gpus = _torch.cuda.device_count()
     except Exception:
         _n_gpus = 1
 
@@ -1180,10 +1157,10 @@ def train(
             1, cfg["gradient_accumulation_steps"] // _n_gpus
         )
         print(f"[INFO] gradient_accumulation_steps → {cfg['gradient_accumulation_steps']} "
-              f"(effective batch unchanged: {_n_gpus} × {cfg['per_device_train_batch_size']} "
-              f"× {cfg['gradient_accumulation_steps']})", flush=True)
+              f"(effective batch: {_n_gpus}×{cfg['per_device_train_batch_size']}"
+              f"×{cfg['gradient_accumulation_steps']})", flush=True)
     else:
-        print(f"[INFO] Single GPU detected — using standard config", flush=True)
+        print(f"[INFO] Single GPU — using standard config", flush=True)
 
     # 1. Load model
     model, tokenizer, backend = load_model_and_tokenizer(MODEL_NAME)
@@ -1266,120 +1243,95 @@ def train(
     print(f"[INFO] Model saved to {output_dir}", flush=True)
 
     # 8. Push to Hub
-    # [FIX-PUSH] The original code called model.merge_and_unload() directly on a
-    # 4-bit quantized model, which silently produces a broken 40-byte stub.
-    # The fix: dequantize to float16 first (via Unsloth's save_pretrained_merged),
-    # validate the output, then push the full-weight checkpoint.
-    # For the HF+PEFT backend, we merge the LoRA adapter via peft merge_and_unload
-    # only after casting to float16 to avoid the bitsandbytes quantized-merge bug.
+    # ROOT CAUSE OF PREVIOUS FAILURES:
+    # (a) merge_and_unload() on a 4-bit quantized model silently produces a 40-byte stub
+    # (b) delete_existing_files= was added to upload_folder but that kwarg doesn't exist
+    #     in the huggingface_hub version installed on Kaggle → TypeError → fallback to adapter
+    # FIX: use Unsloth's save_pretrained_merged (dequantizes to fp16 first, then merges),
+    #      validate size, then push with upload_folder WITHOUT delete_existing_files.
+    #      To overwrite old files we use the commit_message approach — files with the same
+    #      name are overwritten automatically by HF Hub on each upload_folder call.
     if push_to_hub and HF_REPO_ID:
         print(f"[INFO] Pushing to HF Hub: {HF_REPO_ID}", flush=True)
         merged_dir = str(Path(output_dir) / "merged_for_hub")
 
         if backend == "unsloth":
-            # [FIX-PUSH-A] Use Unsloth's save_pretrained_merged which handles
-            # dequantization internally before merging — avoids the bitsandbytes
-            # 4-bit merge bug that produced the 40-byte adapter_model.safetensors.
             try:
-                from unsloth import FastLanguageModel
                 print("[INFO] Saving merged model via Unsloth (dequantized fp16)...", flush=True)
                 model.save_pretrained_merged(
                     merged_dir,
                     tokenizer,
-                    save_method="merged_16bit",   # full weights in fp16, not 4-bit
+                    save_method="merged_16bit",
                 )
-                # Validate: merged checkpoint must have a real safetensors file (> 100 MB)
+                # Validate: real checkpoint must be >> 100 MB
                 merged_path = Path(merged_dir)
-                weight_files = list(merged_path.glob("*.safetensors")) + \
-                               list(merged_path.glob("*.bin"))
-                total_bytes  = sum(f.stat().st_size for f in weight_files)
+                weight_files = (list(merged_path.glob("*.safetensors")) +
+                                list(merged_path.glob("*.bin")))
+                total_bytes = sum(f.stat().st_size for f in weight_files)
                 print(f"[INFO] Merged checkpoint size: {total_bytes / 1e9:.2f} GB "
                       f"({len(weight_files)} weight file(s))", flush=True)
 
-                if total_bytes < 100 * 1024 * 1024:  # < 100 MB → broken merge
+                if total_bytes < 100 * 1024 * 1024:
                     raise RuntimeError(
-                        f"Merged checkpoint is suspiciously small ({total_bytes} bytes). "
-                        "This indicates a failed merge. Aborting push to prevent "
-                        "uploading a broken model."
+                        f"Merged checkpoint too small ({total_bytes} bytes) — "
+                        "merge likely failed. Aborting push."
                     )
 
-                # Push the validated merged directory — delete_existing_files=True
-                # ensures the old broken checkpoint is fully overwritten, not merged.
                 from huggingface_hub import HfApi
                 api = HfApi(token=HF_TOKEN)
                 api.create_repo(repo_id=HF_REPO_ID, exist_ok=True, private=False)
+                # Note: no delete_existing_files= kwarg — HF Hub overwrites files with
+                # the same name automatically. This avoids the TypeError on older versions.
                 api.upload_folder(
                     folder_path=merged_dir,
                     repo_id=HF_REPO_ID,
-                    commit_message="Upload merged fp16 model (SFT+GRPO trained) — full overwrite",
-                    delete_existing_files=True,   # ← overwrites old/broken checkpoint
+                    commit_message="Upload merged fp16 model (SFT+GRPO trained)",
                 )
                 tokenizer.push_to_hub(HF_REPO_ID, token=HF_TOKEN)
-                print(f"[INFO] ✅ Merged model pushed to https://huggingface.co/{HF_REPO_ID}",
-                      flush=True)
+                print(f"[INFO] ✅ Merged model pushed to "
+                      f"https://huggingface.co/{HF_REPO_ID}", flush=True)
 
             except Exception as e:
                 print(f"[ERROR] Merged push failed: {e}", flush=True)
-                print("[INFO] Falling back: saving LoRA adapter + base model card "
-                      "(NOT a standalone model — use with base + PEFT for inference)", flush=True)
-                # Push the LoRA adapter checkpoint so training isn't lost, but
-                # clearly mark it as an adapter-only upload so inference scripts
-                # don't mistake it for a full model.
+                print("[INFO] Saving LoRA adapter to separate repo as fallback.", flush=True)
                 adapter_repo = HF_REPO_ID + "-lora-adapter"
                 try:
                     model.push_to_hub(adapter_repo, token=HF_TOKEN)
                     tokenizer.push_to_hub(adapter_repo, token=HF_TOKEN)
                     print(f"[WARN] LoRA adapter saved to {adapter_repo} — "
-                          f"NOT usable directly; load with base model + peft.", flush=True)
+                          f"NOT directly loadable; needs base model + PEFT.", flush=True)
                 except Exception as e2:
                     print(f"[ERROR] Adapter push also failed: {e2}", flush=True)
 
         else:
-            # [FIX-PUSH-B] HF+PEFT backend: must cast to fp16 before merge because
-            # peft's merge_and_unload on a 4-bit model also produces broken weights.
+            # HF+PEFT: reload base in fp16, merge, then push
             try:
                 import torch
                 from peft import PeftModel
-                print("[INFO] Casting to fp16 and merging LoRA for HF+PEFT backend...",
-                      flush=True)
-                # Save the LoRA adapter locally first
+                from transformers import AutoModelForCausalLM
                 adapter_dir = str(Path(output_dir) / "lora_adapter")
                 model.save_pretrained(adapter_dir)
                 tokenizer.save_pretrained(adapter_dir)
-
-                # Reload base model in fp16 (without quantization) and merge
-                from transformers import AutoModelForCausalLM, AutoTokenizer
                 base_model = AutoModelForCausalLM.from_pretrained(
-                    MODEL_NAME,
-                    torch_dtype=torch.float16,
-                    device_map="auto",
-                    token=HF_TOKEN or None,
+                    MODEL_NAME, torch_dtype=torch.float16,
+                    device_map="auto", token=HF_TOKEN or None,
                 )
                 merged_model = PeftModel.from_pretrained(base_model, adapter_dir)
                 merged_model = merged_model.merge_and_unload()
-
-                # Validate
-                total_params = sum(p.numel() for p in merged_model.parameters())
-                print(f"[INFO] Merged model params: {total_params:,}", flush=True)
-                if total_params < 1_000_000:
-                    raise RuntimeError("Merged model has suspiciously few parameters.")
-
                 merged_model.save_pretrained(merged_dir, safe_serialization=True)
                 tokenizer.save_pretrained(merged_dir)
-
                 from huggingface_hub import HfApi
                 api = HfApi(token=HF_TOKEN)
                 api.create_repo(repo_id=HF_REPO_ID, exist_ok=True, private=False)
                 api.upload_folder(
                     folder_path=merged_dir,
                     repo_id=HF_REPO_ID,
-                    commit_message="Upload merged fp16 model (SFT+GRPO trained) — full overwrite",
-                    delete_existing_files=True,
+                    commit_message="Upload merged fp16 model (SFT+GRPO trained)",
                 )
-                print(f"[INFO] ✅ Merged model pushed to https://huggingface.co/{HF_REPO_ID}",
-                      flush=True)
+                print(f"[INFO] ✅ Merged model pushed to "
+                      f"https://huggingface.co/{HF_REPO_ID}", flush=True)
             except Exception as e:
-                print(f"[ERROR] HF+PEFT merged push failed: {e}", flush=True)
+                print(f"[ERROR] HF+PEFT push failed: {e}", flush=True)
 
     return output_dir
 
@@ -1541,10 +1493,6 @@ def main():
         model, tokenizer, _ = load_model_and_tokenizer(MODEL_NAME)
         run_sft(model, tokenizer, "both", 200, args.output)
         tokenizer.save_pretrained(args.output)
-        if args.push:
-            # Reuse the same push logic via train() with 0 GRPO steps
-            print("[INFO] --push with --phase sft: use --phase both --episodes 0 "
-                  "to push after SFT. Skipping push for SFT-only mode.", flush=True)
         return
 
     train(
