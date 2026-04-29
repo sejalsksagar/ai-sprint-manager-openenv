@@ -265,7 +265,55 @@ def parse_action(text: str) -> dict:
 
 # ── Rule-based fallback ───────────────────────────────────────────────────────
 
-def rule_based_fallback(obs: dict) -> dict:
+def _validate_action_against_obs(action: dict, obs: dict) -> tuple[bool, str]:
+    """
+    Hard semantic check against live observation state.
+    Returns (is_valid, reason). Invalid actions are sent to rule_based_fallback.
+    This guards against the trained model's reward-hacking patterns:
+    - 'unblock' on a task that isn't blocked
+    - 'assign'/'reassign' on a task that isn't backlog
+    - referencing nonexistent task/dev IDs
+    """
+    at  = action.get("action_type", "skip")
+    tid = action.get("task_id")
+    did = action.get("dev_id")
+
+    if at == "skip":
+        return True, "ok"
+
+    tasks_by_id = {t["id"]: t for t in obs.get("tasks", [])}
+    devs_by_id  = {d["id"]: d for d in obs.get("developers", [])}
+
+    if tid and tid not in tasks_by_id:
+        return False, f"unknown_task:{tid}"
+
+    task = tasks_by_id.get(tid) if tid else None
+
+    if at == "unblock":
+        if task is None:
+            return False, "unblock_no_task"
+        if task.get("status") != "blocked":
+            return False, f"unblock_not_blocked:{task.get('status')}"
+        return True, "ok"
+
+    if at in ("assign", "reassign"):
+        if task is None:
+            return False, "assign_no_task"
+        if task.get("status") != "backlog":
+            return False, f"assign_bad_status:{task.get('status')}"
+        if did and did not in devs_by_id:
+            return False, f"unknown_dev:{did}"
+        dev = devs_by_id.get(did) if did else None
+        if dev and not dev.get("is_available", False):
+            return False, "dev_unavailable"
+        return True, "ok"
+
+    if at == "reprioritize":
+        if task is None:
+            return False, "reprio_no_task"
+        return True, "ok"
+
+    return True, "ok"
     tasks   = obs.get("tasks", [])
     devs    = obs.get("developers", [])
     backlog = sorted(
@@ -325,13 +373,11 @@ def run_episode(task_name: str) -> float:
             raw = call_local_model(obs)
             if raw:
                 action = parse_action(raw)
-                # Sanity-check: if model produced an invalid assign, fall back
-                if action["action_type"] in ("assign", "reassign"):
-                    task_ids = {t["id"] for t in obs.get("tasks", [])}
-                    dev_ids  = {d["id"] for d in obs.get("developers", [])}
-                    if (action["task_id"] not in task_ids or
-                            action["dev_id"] not in dev_ids):
-                        action = rule_based_fallback(obs)
+                ok, reason = _validate_action_against_obs(action, obs)
+                if not ok:
+                    print(f"  [GUARD] model action invalid ({reason}) → fallback",
+                          flush=True)
+                    action = rule_based_fallback(obs)
             else:
                 action = rule_based_fallback(obs)
         else:

@@ -974,17 +974,43 @@ def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
 def load_model_and_tokenizer(model_name: str):
     """
     Load model with Unsloth 4-bit QLoRA. Falls back to HF+PEFT if unavailable.
-    [FIX-T5] Sets pad_token = eos_token for Llama/Qwen (they have no pad token by default).
+
+    [FIX-DDP] Unsloth uses device_map="auto" which can place layers on CPU when
+    VRAM is tight. When torchrun launches DDP (world_size > 1), PyTorch's DDP
+    sync tries to broadcast CPU tensors via NCCL → RuntimeError: No backend type
+    associated with device type cpu.
+
+    Fix: in a DDP context (LOCAL_RANK env var is set by torchrun), force the model
+    onto a single specific CUDA device instead of using device_map="auto". Each
+    rank gets its own GPU (local_rank 0 → cuda:0, local_rank 1 → cuda:1).
+    Unsloth's own data-parallel mechanism then handles cross-GPU coordination.
+    In single-GPU mode (plain `python` launch), behaviour is unchanged.
     """
+    import os as _os
     try:
         from unsloth import FastLanguageModel
         print(f"[INFO] Loading {model_name} with Unsloth 4-bit QLoRA...", flush=True)
+
+        # Detect DDP launch (torchrun sets LOCAL_RANK)
+        local_rank = int(_os.environ.get("LOCAL_RANK", -1))
+        if local_rank >= 0:
+            # DDP mode: pin this rank's model to its dedicated GPU.
+            # device_map must be a plain string like "cuda:0" — NOT "auto" —
+            # to prevent layers landing on CPU which NCCL cannot sync.
+            import torch as _torch
+            _torch.cuda.set_device(local_rank)
+            device_map = f"cuda:{local_rank}"
+            print(f"[INFO] DDP rank {local_rank} → device_map={device_map}", flush=True)
+        else:
+            device_map = "auto"
+
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
             token=HF_TOKEN or None,
+            device_map=device_map,
         )
         model = FastLanguageModel.get_peft_model(
             model,
@@ -997,7 +1023,6 @@ def load_model_and_tokenizer(model_name: str):
             use_gradient_checkpointing="unsloth",
             random_state=42,
         )
-        # [FIX-T5]
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
