@@ -985,12 +985,17 @@ def load_model_and_tokenizer(model_name: str):
     try:
         from unsloth import FastLanguageModel
         print(f"[INFO] Loading {model_name} with Unsloth 4-bit QLoRA...", flush=True)
+        import torch as _torch_load
+        _n = _torch_load.cuda.device_count() if _torch_load.cuda.is_available() else 1
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
             token=HF_TOKEN or None,
+            # Unsloth ≥2025.x: pass num_gpus to enable its internal data-parallel.
+            # On older versions this kwarg is silently ignored.
+            **( {"num_gpus": _n} if _n > 1 else {} ),
         )
         model = FastLanguageModel.get_peft_model(
             model,
@@ -1029,10 +1034,20 @@ def _load_hf_model(model_name: str):
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        import torch as _th
         model = AutoModelForCausalLM.from_pretrained(
             model_name, quantization_config=bnb, device_map="auto",
             token=HF_TOKEN or None,
         )
+        # Multi-GPU: wrap with DataParallel BEFORE moving to device.
+        # (Per Kaggle T4×2 thread: model = nn.DataParallel(model); model.to(device))
+        _n_gpus_hf = _th.cuda.device_count() if _th.cuda.is_available() else 1
+        if _n_gpus_hf > 1:
+            import torch.nn as _nn
+            _device_hf = _th.device("cuda")
+            model = _nn.DataParallel(model)
+            model.to(_device_hf)
+            print(f"[INFO] HF model wrapped with DataParallel ({_n_gpus_hf} GPUs)", flush=True)
         lora_cfg = LoraConfig(
             r=16, lora_alpha=32, lora_dropout=0.05,
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj",

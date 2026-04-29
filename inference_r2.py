@@ -36,17 +36,16 @@ import time
 from typing import Optional
 
 import requests
-from dotenv import load_dotenv
-from openai import OpenAI
-
-load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# inference_r2 loads the fine-tuned model LOCALLY via Unsloth (same as inference.py).
+# Root cause of BadRequestError: HF Router rejects fine-tuned private models.
+# Fix: load locally — same path as inference.py.
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "dummy")
-MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
-ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
+LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "sejal-k/multi-sprint-model")
+HF_TOKEN         = os.getenv("HF_TOKEN", "")
+MODEL_NAME       = os.getenv("MODEL_NAME", LOCAL_MODEL_PATH)
+ENV_BASE_URL     = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 
 MAX_STEPS    = 60        # full 60-day project
 TEMPERATURE  = 0.15     # low: we want deterministic JSON not creative writing
@@ -64,7 +63,9 @@ LLM_CALL_EVERY = 1  # call every step — adjust to 2 if rate limits are severe
 
 TASKS = ["project_easy", "project_medium", "project_hard"]
 
-client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+# Local model state (loaded once, shared across episodes)
+_local_model     = None
+_local_tokenizer = None
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 # Kept deliberately short. Every token in the system prompt burns quota.
@@ -313,52 +314,98 @@ def parse_action(text: str) -> dict:
 
 # ── LLM call with retry ────────────────────────────────────────────────────────
 
+def _patch_generation_config(model):
+    """Clear conflicting max_length from generation_config."""
+    try:
+        if hasattr(model, "generation_config"):
+            gc = model.generation_config
+            if getattr(gc, "max_length", None) is not None:
+                gc.max_length = None
+    except Exception:
+        pass
+
+
+def load_local_model(model_path: str) -> bool:
+    global _local_model, _local_tokenizer
+    if _local_model is not None:
+        return True
+    print(f"[INFO] Loading model locally: {model_path}", flush=True)
+    try:
+        from unsloth import FastLanguageModel
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_path, max_seq_length=2048,
+            dtype=None, load_in_4bit=True, token=HF_TOKEN or None,
+        )
+        FastLanguageModel.for_inference(model)
+        _patch_generation_config(model)
+        _local_model, _local_tokenizer = model, tokenizer
+        print("[INFO] ✅ Loaded via Unsloth (4-bit inference)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[WARN] Unsloth load failed: {e}", flush=True)
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path, token=HF_TOKEN or None)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.float16,
+            device_map="auto", token=HF_TOKEN or None,
+        )
+        model.eval()
+        _patch_generation_config(model)
+        _local_model, _local_tokenizer = model, tokenizer
+        print("[INFO] ✅ Loaded via HF Transformers (fp16)", flush=True)
+        return True
+    except Exception as e2:
+        print(f"[ERROR] Both loaders failed: {e2}", flush=True)
+        return False
+
+
+def call_local_model(obs: dict, assigned_this_episode: set) -> Optional[str]:
+    if _local_model is None:
+        return None
+    import torch
+    prompt = build_user_prompt(obs, assigned_this_episode)
+    messages = [
+        {"role": "system", "content": R2_SYSTEM_PROMPT},
+        {"role": "user",   "content": prompt},
+    ]
+    tok = _local_tokenizer
+    try:
+        prompt_text = (
+            tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            if hasattr(tok, "apply_chat_template")
+            else "\n".join(f"<|{m['role']}|>\n{m['content']}" for m in messages)
+               + "\n<|assistant|>\n"
+        )
+        inputs  = tok(prompt_text, return_tensors="pt").to(_local_model.device)
+        inp_len = inputs["input_ids"].shape[1]
+        with torch.no_grad():
+            outputs = _local_model.generate(
+                **inputs,
+                max_new_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                do_sample=True,
+                pad_token_id=tok.pad_token_id or tok.eos_token_id,
+            )
+        return tok.decode(outputs[0][inp_len:], skip_special_tokens=True).strip()
+    except Exception as e:
+        print(f"  [WARN] Local model inference error: {e}", flush=True)
+        return None
+
+
+# ── LLM call with retry ────────────────────────────────────────────────────────
+
 def call_llm(obs: dict, assigned_this_episode: set, step_num: int) -> tuple[str, bool]:
     """
     Call LLM with up to MAX_RETRIES retries and exponential backoff.
     Returns (response_text, used_llm: bool).
     If all retries fail, returns ("", False) — caller uses rule-based fallback.
     """
-    prompt = build_user_prompt(obs, assigned_this_episode)
-    messages_sys = [
-        {"role": "system", "content": R2_SYSTEM_PROMPT},
-        {"role": "user",   "content": prompt},
-    ]
-    messages_usr = [
-        {"role": "user", "content": f"{R2_SYSTEM_PROMPT}\n\n{prompt}"},
-    ]
-
-    last_err = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            # First attempt: system+user. Subsequent: merged (some endpoints reject system role)
-            msgs = messages_sys if attempt == 0 else messages_usr
-            completion = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=msgs,
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-            )
-            return completion.choices[0].message.content or "", True
-
-        except Exception as e:
-            last_err = e
-            err_name = type(e).__name__
-            if attempt < MAX_RETRIES - 1:
-                wait = RETRY_DELAYS[attempt]
-                print(
-                    f"[WARN] LLM attempt {attempt+1}/{MAX_RETRIES} failed "
-                    f"({err_name}), retrying in {wait}s...",
-                    flush=True,
-                )
-                time.sleep(wait)
-            else:
-                print(
-                    f"[WARN] LLM unavailable after {MAX_RETRIES} attempts "
-                    f"({err_name}), using rule-based fallback",
-                    flush=True,
-                )
-
+    raw = call_local_model(obs, assigned_this_episode)
+    if raw:
+        return raw, True
+    print("[WARN] LLM unavailable, using rule-based fallback", flush=True)
     return "", False
 
 
@@ -485,6 +532,9 @@ def run_episode(task_name: str) -> float:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    ok = load_local_model(LOCAL_MODEL_PATH)
+    if not ok:
+        print("[WARN] Local model load failed — running rule-based only.", flush=True)
     print(f"[INFO] model={MODEL_NAME} server={ENV_BASE_URL}", flush=True)
     print(f"[INFO] retry_config=max_retries={MAX_RETRIES} delays={RETRY_DELAYS} "
           f"llm_call_every={LLM_CALL_EVERY}", flush=True)

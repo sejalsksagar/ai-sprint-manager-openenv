@@ -314,6 +314,15 @@ def _validate_action_against_obs(action: dict, obs: dict) -> tuple[bool, str]:
         return True, "ok"
 
     return True, "ok"
+
+
+# ── Rule-based fallback ───────────────────────────────────────────────────────
+
+def rule_based_fallback(obs: dict) -> dict:
+    """
+    Deterministic fallback action: assign the highest-priority backlog task
+    to the best available developer. Returns skip if nothing is actionable.
+    """
     tasks   = obs.get("tasks", [])
     devs    = obs.get("developers", [])
     backlog = sorted(
