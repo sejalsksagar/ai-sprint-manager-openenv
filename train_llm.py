@@ -975,42 +975,22 @@ def load_model_and_tokenizer(model_name: str):
     """
     Load model with Unsloth 4-bit QLoRA. Falls back to HF+PEFT if unavailable.
 
-    [FIX-DDP] Unsloth uses device_map="auto" which can place layers on CPU when
-    VRAM is tight. When torchrun launches DDP (world_size > 1), PyTorch's DDP
-    sync tries to broadcast CPU tensors via NCCL → RuntimeError: No backend type
-    associated with device type cpu.
-
-    Fix: in a DDP context (LOCAL_RANK env var is set by torchrun), force the model
-    onto a single specific CUDA device instead of using device_map="auto". Each
-    rank gets its own GPU (local_rank 0 → cuda:0, local_rank 1 → cuda:1).
-    Unsloth's own data-parallel mechanism then handles cross-GPU coordination.
-    In single-GPU mode (plain `python` launch), behaviour is unchanged.
+    IMPORTANT — multi-GPU with Unsloth:
+    Unsloth handles multi-GPU via its own internal data-parallel mechanism.
+    Do NOT use torchrun/DDP — Unsloth ignores device_map overrides and
+    its internal MP conflicts with torch DDP, causing the NCCL CPU-tensor crash.
+    Simply run:  python train_llm.py ...
+    Unsloth auto-detects all GPUs and multiplies the effective batch size.
     """
-    import os as _os
     try:
         from unsloth import FastLanguageModel
         print(f"[INFO] Loading {model_name} with Unsloth 4-bit QLoRA...", flush=True)
-
-        # Detect DDP launch (torchrun sets LOCAL_RANK)
-        local_rank = int(_os.environ.get("LOCAL_RANK", -1))
-        if local_rank >= 0:
-            # DDP mode: pin this rank's model to its dedicated GPU.
-            # device_map must be a plain string like "cuda:0" — NOT "auto" —
-            # to prevent layers landing on CPU which NCCL cannot sync.
-            import torch as _torch
-            _torch.cuda.set_device(local_rank)
-            device_map = f"cuda:{local_rank}"
-            print(f"[INFO] DDP rank {local_rank} → device_map={device_map}", flush=True)
-        else:
-            device_map = "auto"
-
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
             token=HF_TOKEN or None,
-            device_map=device_map,
         )
         model = FastLanguageModel.get_peft_model(
             model,
@@ -1493,6 +1473,30 @@ def smoke_test():
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── CRITICAL: Unsloth is incompatible with torchrun/DDP ───────────────────
+    # Unsloth handles multi-GPU via its own internal data-parallel mechanism.
+    # When torchrun spawns multiple ranks, torch DDP wraps the model and tries
+    # to broadcast weights via NCCL — but Unsloth's 4-bit layers live on CPU
+    # offload buffers that NCCL cannot touch → RuntimeError: No backend type
+    # associated with device type cpu.
+    # Unsloth auto-detects all GPUs by itself when launched with plain python.
+    # The effective batch is automatically multiplied by the number of GPUs.
+    if os.environ.get("LOCAL_RANK") is not None:
+        rank = os.environ.get("LOCAL_RANK", "?")
+        if rank == "0":   # only rank 0 prints, to avoid duplicate messages
+            print("\n" + "=" * 65, flush=True)
+            print("  ERROR: Do NOT launch train_llm.py with torchrun!", flush=True)
+            print("=" * 65, flush=True)
+            print("  Unsloth handles multi-GPU internally. torchrun conflicts", flush=True)
+            print("  with Unsloth's data-parallel and causes a NCCL crash.", flush=True)
+            print(), flush=True)
+            print("  ✅ CORRECT command (Unsloth uses both GPUs automatically):", flush=True)
+            print("     python train_llm.py --phase both --episodes 300 \\", flush=True)
+            print("            --sft-epochs 2 --gpu-tier t4 \\", flush=True)
+            print("            --output results/trained_model --push", flush=True)
+            print("=" * 65 + "\n", flush=True)
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(description="SFT+GRPO training for AI Sprint Manager")
     parser.add_argument("--smoke-test",  action="store_true",
                         help="Run smoke test (no GPU). Do this locally first.")
