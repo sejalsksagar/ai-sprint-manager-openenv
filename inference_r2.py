@@ -33,9 +33,17 @@ import json
 import os
 import sys
 import time
+import warnings
 from typing import Optional
 
 import requests
+
+# ── Silence harmless deprecation warnings ────────────────────────────────────
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+warnings.filterwarnings("ignore", message=".*AttentionMaskConverter.*")
+warnings.filterwarnings("ignore", message=".*attention mask API.*")
+warnings.filterwarnings("ignore", message=".*max_new_tokens.*max_length.*")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # inference_r2 loads the fine-tuned model LOCALLY via Unsloth (same as inference.py).
@@ -47,19 +55,43 @@ HF_TOKEN         = os.getenv("HF_TOKEN", "")
 MODEL_NAME       = os.getenv("MODEL_NAME", LOCAL_MODEL_PATH)
 ENV_BASE_URL     = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 
+USE_LLM = os.getenv("USE_LLM", "1").strip().lower() not in ("0", "false", "no")
+
+# ── Llama baseline mode ───────────────────────────────────────────────────────
+# Set LLAMA_BASELINE=1 to run inference via the HuggingFace router using the
+# public meta-llama/Llama-3.1-8B-Instruct model (no local GPU required).
+# This reproduces the original Llama R2 baseline scores.
+#
+# Required env vars:
+#   LLAMA_BASELINE=1
+#   HF_TOKEN=hf_...
+#
+# Example:
+#   LLAMA_BASELINE=1 HF_TOKEN=hf_... python inference_r2.py
+_llama_raw     = os.getenv("LLAMA_BASELINE", "0").strip().lower()
+LLAMA_BASELINE = _llama_raw not in ("0", "false", "no", "off")
+LLAMA_MODEL    = os.getenv("LLAMA_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+HF_ROUTER_URL  = "https://router.huggingface.co/v1"
+
 MAX_STEPS    = 60        # full 60-day project
-TEMPERATURE  = 0.15     # low: we want deterministic JSON not creative writing
+# [FIX] Raised temperature from 0.15 → 0.5 to break repetitive greedy decoding.
+# Low temperature (0.15) causes the model to lock onto one token distribution
+# and repeat the same task assignment for many steps. 0.5 maintains coherent
+# JSON output while introducing enough diversity to escape local loops.
+TEMPERATURE  = 0.5
 MAX_TOKENS   = 80       # action JSON is tiny — 80 tokens is plenty
 
 # Retry / rate-limit config
-MAX_RETRIES  = 3        # attempts before falling back to rule-based
-RETRY_DELAYS = [1, 2, 4]  # seconds between retries (exponential-ish)
+MAX_RETRIES  = 3
+RETRY_DELAYS = [1, 2, 4]
 
-# LLM call batching: only call LLM every LLM_CALL_EVERY steps.
-# Between calls, repeat the last valid action if it worked, else fallback.
-# Set to 1 to call every step (best quality, most tokens).
-# Set to 2-3 to halve/third token usage (helps stay under HF free-tier quota).
-LLM_CALL_EVERY = 1  # call every step — adjust to 2 if rate limits are severe
+# LLM call batching (set to 1 to call every step)
+LLM_CALL_EVERY = 1
+
+# [FIX] Loop detection: if the model picks the same (action_type, task_id)
+# N times in a row, override with rule-based fallback to break the loop.
+# This directly addresses the core failure mode seen in the trained model logs.
+LOOP_DETECT_WINDOW = 3  # consecutive identical actions before forcing fallback
 
 TASKS = ["project_easy", "project_medium", "project_hard"]
 
@@ -361,6 +393,42 @@ def load_local_model(model_path: str) -> bool:
         return False
 
 
+def call_llama_router(obs: dict, assigned_this_episode: set) -> Optional[str]:
+    """
+    Call the HF router with meta-llama/Llama-3.1-8B-Instruct (or LLAMA_MODEL).
+    Reproduces the original Llama R2 baseline without a local GPU.
+    Requires LLAMA_BASELINE=1 and HF_TOKEN to be set.
+    """
+    if not HF_TOKEN:
+        print("[ERROR] LLAMA_BASELINE=1 requires HF_TOKEN to be set.", flush=True)
+        return None
+    prompt = build_user_prompt(obs, assigned_this_episode)
+    messages = [
+        {"role": "system", "content": R2_SYSTEM_PROMPT},
+        {"role": "user",   "content": prompt},
+    ]
+    try:
+        resp = requests.post(
+            f"{HF_ROUTER_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {HF_TOKEN}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":       LLAMA_MODEL,
+                "messages":    messages,
+                "max_tokens":  MAX_TOKENS,
+                "temperature": TEMPERATURE,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"  [WARN] Llama router call failed: {e}", flush=True)
+        return None
+
+
 def call_local_model(obs: dict, assigned_this_episode: set) -> Optional[str]:
     if _local_model is None:
         return None
@@ -399,10 +467,13 @@ def call_local_model(obs: dict, assigned_this_episode: set) -> Optional[str]:
 def call_llm(obs: dict, assigned_this_episode: set, step_num: int) -> tuple[str, bool]:
     """
     Call LLM with up to MAX_RETRIES retries and exponential backoff.
+    Routes to HF router (Llama baseline) or local model based on flags.
     Returns (response_text, used_llm: bool).
-    If all retries fail, returns ("", False) — caller uses rule-based fallback.
     """
-    raw = call_local_model(obs, assigned_this_episode)
+    if LLAMA_BASELINE:
+        raw = call_llama_router(obs, assigned_this_episode)
+    else:
+        raw = call_local_model(obs, assigned_this_episode)
     if raw:
         return raw, True
     print("[WARN] LLM unavailable, using rule-based fallback", flush=True)
@@ -437,6 +508,11 @@ def run_episode(task_name: str) -> float:
     llm_fail_streak: int            = 0       # consecutive LLM failures
     LLM_ABANDON_AFTER               = 5       # give up on LLM after this many consecutive failures
 
+    # [FIX] Loop detection: track last N (action_type, task_id) pairs.
+    # If the model picks the same action LOOP_DETECT_WINDOW times in a row,
+    # it has entered a degenerate loop — force rule-based fallback to break it.
+    action_history: list[tuple] = []
+
     step_num = 0
     for step_num in range(1, MAX_STEPS + 1):
         if obs.get("done", False):
@@ -466,6 +542,22 @@ def run_episode(task_name: str) -> float:
                         action = get_rule_based_action(
                             obs, assigned_this_episode, last_failed_task
                         )
+
+                # [FIX] Loop detection: if same (action_type, task_id) repeated
+                # LOOP_DETECT_WINDOW times in a row, force rule-based fallback.
+                action_key = (action.get("action_type"), action.get("task_id"))
+                action_history.append(action_key)
+                if len(action_history) > LOOP_DETECT_WINDOW:
+                    action_history.pop(0)
+                if (len(action_history) == LOOP_DETECT_WINDOW
+                        and len(set(action_history)) == 1
+                        and action_key[0] != "skip"):
+                    print(f"  [LOOP] Detected {LOOP_DETECT_WINDOW}× repeat of "
+                          f"{action_key} → forcing fallback", flush=True)
+                    action = get_rule_based_action(
+                        obs, assigned_this_episode, last_failed_task
+                    )
+                    action_history.clear()  # reset after breaking loop
             else:
                 llm_fail_streak += 1
                 action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
@@ -532,9 +624,16 @@ def run_episode(task_name: str) -> float:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    ok = load_local_model(LOCAL_MODEL_PATH)
-    if not ok:
-        print("[WARN] Local model load failed — running rule-based only.", flush=True)
+    if LLAMA_BASELINE:
+        print(f"[INFO] LLAMA_BASELINE=1 — using HF router ({LLAMA_MODEL})", flush=True)
+        if not HF_TOKEN:
+            print("[ERROR] HF_TOKEN not set — export HF_TOKEN=hf_... and retry.",
+                  flush=True)
+            sys.exit(1)
+    else:
+        ok = load_local_model(LOCAL_MODEL_PATH) if USE_LLM else False
+        if not ok:
+            print("[WARN] Local model load failed — running rule-based only.", flush=True)
     print(f"[INFO] model={MODEL_NAME} server={ENV_BASE_URL}", flush=True)
     print(f"[INFO] retry_config=max_retries={MAX_RETRIES} delays={RETRY_DELAYS} "
           f"llm_call_every={LLM_CALL_EVERY}", flush=True)
@@ -561,9 +660,10 @@ def main() -> None:
             scores[task] = 0.01
 
     elapsed = time.time() - start_time
+    label = "LLAMA BASELINE" if LLAMA_BASELINE else "RULE-BASED"
 
     print("\n" + "=" * 62, flush=True)
-    print(" ROUND 2 — SCORES", flush=True)
+    print(f" ROUND 2 — SCORES  [{label}]", flush=True)
     print("=" * 62, flush=True)
     for task, score in scores.items():
         bar = "█" * int(score * 20)

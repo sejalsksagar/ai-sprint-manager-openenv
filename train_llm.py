@@ -223,8 +223,17 @@ GRPO_CONFIG = {
     # max_completion_length causes the "Both max_new_tokens and max_length"
     # warning because TRL maps max_completion_length → max_new_tokens.
     "num_generations":             2,   # T4-safe; set 4 for A10G+
-    "temperature":                 0.8, # high: encourage diverse candidates
-    "beta":                        0.04,  # KL penalty — anti-reward-hacking
+    # [FIX-DIVERSITY] Temperature raised from 0.8 → 1.1 to increase completion
+    # diversity within each GRPO group. At 0.8 the model still tends to produce
+    # near-identical assign actions for all num_generations completions, which
+    # collapses reward_std and kills the GRPO gradient. 1.1 produces more varied
+    # candidates while still generating valid JSON (empirically stable up to 1.3).
+    "temperature":                 1.1,
+    # [FIX] beta raised from 0.04 → 0.05 to slightly strengthen the KL penalty
+    # now that we're using higher temperature. This prevents the policy from
+    # drifting too far from the reference model (Qwen2.5-1.5B-Instruct) which
+    # would cause incoherent JSON output.
+    "beta":                        0.05,
     "logging_steps":               5,
     "save_steps":                  50,
     "warmup_steps":                10,  # replaces deprecated warmup_ratio
@@ -684,32 +693,56 @@ def make_reward_fn(env_base_url: str, phase: str):
             reset_url = f"{env_base_url}/reset"
             step_url  = f"{env_base_url}/step"
 
-        for completion in completions:
-            # Normalise completion to plain string
-            if isinstance(completion, list):
-                if completion and isinstance(completion[0], str):
-                    completion = completion[0]
-                elif completion and isinstance(completion[0], dict):
-                    completion = completion[0].get("content", "")
-                else:
-                    completion = str(completion)
-            elif not isinstance(completion, str):
-                completion = str(completion)
+        # ── [FIX-REPEAT] Pre-parse all completions for group-level analysis ──────
+        # Normalise completions to strings and parse actions upfront so we can
+        # compute group diversity before issuing individual env rewards.
+        def _normalise(c):
+            if isinstance(c, list):
+                if c and isinstance(c[0], str):   return c[0]
+                if c and isinstance(c[0], dict):  return c[0].get("content", "")
+                return str(c)
+            return c if isinstance(c, str) else str(c)
 
-            action = _parse_action(completion)
+        norm_completions = [_normalise(c) for c in completions]
+        parsed_actions   = [_parse_action(c) for c in norm_completions]
+
+        # Compute group-level repetition: if every completion picks the same
+        # (action_type, task_id) assign action, the model is in a degenerate loop.
+        action_keys      = [(a["action_type"], a.get("task_id")) for a in parsed_actions]
+        n_unique         = len(set(action_keys))
+        n_total          = max(1, len(action_keys))
+        all_same_assign  = (n_unique == 1 and action_keys[0][0] == "assign")
+
+        # diversity_bonus: +0.05 when all completions differ, 0 when all same.
+        diversity_bonus  = 0.05 * (n_unique - 1) / max(1, n_total - 1)
+
+        # Repetition penalty: applied to every completion in an all-same-assign group.
+        # This creates a clear negative signal vs groups with diverse actions.
+        repeat_penalty   = -0.08 if all_same_assign else 0.0
+
+        # [FIX-DIVERSITY] Small bonus for using non-assign actions.
+        # unblock/reprioritize are never learned without explicit incentive because
+        # assign dominates SFT data. These bonuses make them marginally preferable
+        # to skip without overriding the main env step reward signal.
+        ACTION_DIVERSITY_BONUS = {
+            "unblock":      0.04,
+            "reprioritize": 0.03,
+            "reassign":     0.02,
+            "assign":       0.00,
+            "skip":         0.00,
+        }
+
+        for completion, action in zip(norm_completions, parsed_actions):
             r = 0.5  # neutral fallback
 
             try:
                 # Reset to the SAME state as when the prompt was collected.
-                # obs is the reset response (task/dev IDs match the prompt).
                 obs = _post(reset_url, {"task_name": task, "seed": seed})
 
-                # Adapt stale IDs from mid-episode prompt to step-0 obs.
                 adapted = _adapt_action_to_obs(action, obs)
                 if adapted is None:
-                    # Could not build a valid action — penalise below neutral.
-                    # This creates reward contrast vs completions with valid IDs.
-                    r = 0.35
+                    # Invalid action: penalise below neutral + repetition penalty.
+                    r = max(0.0, 0.35 + repeat_penalty)
                     rewards.append(float(r))
                     continue
 
@@ -717,19 +750,21 @@ def make_reward_fn(env_base_url: str, phase: str):
 
                 step_r    = float(result.get("reward", 0.0))
                 step_norm = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
+                act_bonus = ACTION_DIVERSITY_BONUS.get(action["action_type"], 0.0)
 
                 if not use_r2:
-                    r = step_norm
+                    r = step_norm + act_bonus + diversity_bonus + repeat_penalty
                 else:
                     obs2       = result.get("observation", {})
                     inst_score = float(obs2.get("instruction_following_score", 0.5))
-                    r = step_norm * 0.6 + inst_score * 0.4
+                    r = (step_norm * 0.6 + inst_score * 0.4
+                         + act_bonus + diversity_bonus + repeat_penalty)
 
             except Exception as e:
                 print(f"[WARN] reward_fn env call failed: {e}", flush=True)
                 r = 0.5
 
-            rewards.append(float(r))
+            rewards.append(float(max(0.0, min(1.0, r))))
         return rewards
 
     return reward_fn
@@ -965,7 +1000,54 @@ def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
             except Exception as e:
                 print(f"  [WARN] SFT R2 ep{ep} failed: {e}", flush=True)
 
-    print(f"  [SFT DATASET] Total examples: {len(examples)}", flush=True)
+    # [FIX-DIVERSITY] Inject synthetic unblock/reprioritize/skip SFT examples.
+    # The rule-based policy almost never emits these action types because
+    # blocked tasks and re-prioritisation opportunities are rare in the
+    # early steps sampled above. Without explicit examples the model never
+    # learns to use them, so GRPO can't reinforce them either.
+    # We synthesise minimal but valid examples for each action type so the
+    # model learns the correct JSON schema for all actions during SFT.
+    synthetic = [
+        # unblock: task T03 is blocked, deps now satisfied
+        {
+            "action_type": "unblock", "task_id": "T03",
+            "dev_id": None, "new_priority": None,
+        },
+        # reprioritize: bump a task to priority 1
+        {
+            "action_type": "reprioritize", "task_id": "T05",
+            "dev_id": None, "new_priority": 1,
+        },
+        # reassign: move in-progress task to different dev
+        {
+            "action_type": "reassign", "task_id": "T02",
+            "dev_id": "D2", "new_priority": None,
+        },
+        # skip: explicitly do nothing this step
+        {
+            "action_type": "skip", "task_id": None,
+            "dev_id": None, "new_priority": None,
+        },
+    ]
+    # Pair each synthetic action with a plausible prompt so SFT has context.
+    synthetic_prompts = [
+        "T03 is BLOCKED, all deps ✓. T05 is overdue priority 3. D2 available.",
+        "T05 P3 is overdue — must reprioritize to P1 to meet deadline.",
+        "T02 assigned to D1 who has burnout. D2 available with matching skill.",
+        "All high-priority backlog tasks have unmet deps. No safe assign this step.",
+    ]
+    for act, user_content in zip(synthetic, synthetic_prompts):
+        for _ in range(5):   # repeat each 5× so it's not drowned out
+            examples.append({
+                "prompt": [
+                    {"role": "system", "content": R1_SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_content},
+                ],
+                "completion": json.dumps(act),
+            })
+
+    print(f"  [SFT DATASET] Total examples: {len(examples)} "
+          f"(includes {len(synthetic)*5} synthetic diversity examples)", flush=True)
     return Dataset.from_list(examples)
 
 
@@ -987,15 +1069,15 @@ def load_model_and_tokenizer(model_name: str):
         print(f"[INFO] Loading {model_name} with Unsloth 4-bit QLoRA...", flush=True)
         import torch as _torch_load
         _n = _torch_load.cuda.device_count() if _torch_load.cuda.is_available() else 1
+        # [FIX] num_gpus was removed: Unsloth 2026.x forwards unknown kwargs to
+        # AutoModelForCausalLM which rejects them with TypeError. Unsloth
+        # auto-detects all GPUs internally — no kwarg needed.
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
             token=HF_TOKEN or None,
-            # Unsloth ≥2025.x: pass num_gpus to enable its internal data-parallel.
-            # On older versions this kwarg is silently ignored.
-            **( {"num_gpus": _n} if _n > 1 else {} ),
         )
         model = FastLanguageModel.get_peft_model(
             model,

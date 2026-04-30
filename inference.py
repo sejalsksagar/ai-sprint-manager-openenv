@@ -29,14 +29,34 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*max_new_token
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "sejal-k/multi-sprint-model")
 HF_TOKEN         = os.getenv("HF_TOKEN", "")
 ENV_BASE_URL     = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 
-_use_llm_raw = os.getenv("USE_LLM", "1").strip().lower()
-USE_LLM      = _use_llm_raw not in ("0", "false", "no", "off")
+_use_llm_raw     = os.getenv("USE_LLM", "1").strip().lower()
+USE_LLM          = _use_llm_raw not in ("0", "false", "no", "off")
+
+# ── Llama baseline mode ───────────────────────────────────────────────────────
+# Set LLAMA_BASELINE=1 to run inference via the HuggingFace router using the
+# public meta-llama/Llama-3.1-8B-Instruct model (no local GPU required).
+# This reproduces the original Llama baseline scores from the leaderboard.
+#
+# Required env vars in this mode:
+#   LLAMA_BASELINE=1
+#   HF_TOKEN=hf_...          (HF token with router access)
+#   LLAMA_MODEL=meta-llama/Llama-3.1-8B-Instruct   (or any router-compatible model)
+#
+# Example:
+#   LLAMA_BASELINE=1 HF_TOKEN=hf_... python inference.py
+_llama_raw    = os.getenv("LLAMA_BASELINE", "0").strip().lower()
+LLAMA_BASELINE = _llama_raw not in ("0", "false", "no", "off")
+LLAMA_MODEL   = os.getenv("LLAMA_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+HF_ROUTER_URL = "https://router.huggingface.co/v1"
 
 MAX_STEPS   = 12
 TEMPERATURE = 0.3
@@ -114,6 +134,44 @@ def load_local_model(model_path: str) -> bool:
     except Exception as e2:
         print(f"[ERROR] Both loaders failed. Last error: {e2}", flush=True)
         return False
+
+
+def call_llama_router(obs: dict) -> Optional[str]:
+    """
+    Call the HF router with meta-llama/Llama-3.1-8B-Instruct (or LLAMA_MODEL).
+    This reproduces the original Llama baseline scores without a local GPU.
+
+    Requires:
+      LLAMA_BASELINE=1
+      HF_TOKEN=hf_...
+    """
+    if not HF_TOKEN:
+        print("[ERROR] LLAMA_BASELINE=1 requires HF_TOKEN to be set.", flush=True)
+        return None
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": build_user_prompt(obs)},
+    ]
+    try:
+        resp = requests.post(
+            f"{HF_ROUTER_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {HF_TOKEN}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":       LLAMA_MODEL,
+                "messages":    messages,
+                "max_tokens":  MAX_TOKENS,
+                "temperature": TEMPERATURE,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"  [WARN] Llama router call failed: {e}", flush=True)
+        return None
 
 
 def call_local_model(obs: dict) -> Optional[str]:
@@ -389,6 +447,17 @@ def run_episode(task_name: str) -> float:
                     action = rule_based_fallback(obs)
             else:
                 action = rule_based_fallback(obs)
+        elif LLAMA_BASELINE:
+            raw = call_llama_router(obs)
+            if raw:
+                action = parse_action(raw)
+                ok, reason = _validate_action_against_obs(action, obs)
+                if not ok:
+                    print(f"  [GUARD] llama action invalid ({reason}) → fallback",
+                          flush=True)
+                    action = rule_based_fallback(obs)
+            else:
+                action = rule_based_fallback(obs)
         else:
             action = rule_based_fallback(obs)
 
@@ -428,7 +497,10 @@ def run_episode(task_name: str) -> float:
 
 def main():
     mode = "rule-based-only"
-    if USE_LLM:
+    if LLAMA_BASELINE:
+        mode = f"llama-baseline ({LLAMA_MODEL} via HF router)"
+        print(f"[INFO] LLAMA_BASELINE=1 — using HF router for Llama inference", flush=True)
+    elif USE_LLM:
         ok = load_local_model(LOCAL_MODEL_PATH)
         if ok:
             mode = f"local-model ({LOCAL_MODEL_PATH})"
@@ -457,8 +529,9 @@ def main():
             scores[task] = 0.01
 
     elapsed = time.time() - start_time
+    label = "LLAMA BASELINE" if LLAMA_BASELINE else ("RULE-BASED" if not USE_LLM else "TRAINED MODEL")
     print("\n" + "=" * 60, flush=True)
-    print("  R1 SCORES", flush=True)
+    print(f"  R1 SCORES  [{label}]", flush=True)
     print("=" * 60, flush=True)
     for task, score in scores.items():
         bar = "█" * int(score * 20)
