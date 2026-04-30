@@ -9,6 +9,22 @@ Key improvements over previous version:
   - Rate-limit-aware: exponential back-off (1s, 2s, 4s) between retries
   - Compact prompt: ~250 tokens (was ~350+), avoids hitting HF free-tier quota
 
+FIXES vs previous version (bugs identified from baseline run analysis):
+  [FIX-R2-1] was_rejected threshold lowered from < -0.3 → < 0.
+             The env returns -0.15 for assigning an already-in_progress task.
+             The old threshold missed this, causing T04/T05/T10 to be retried
+             4-5 times each (losing ~0.6-0.75 reward per task per episode).
+  [FIX-R2-2] Pre-block: task added to assigned_this_episode BEFORE calling env.
+             Guarantees the next step's fallback immediately sees the task as taken.
+  [FIX-R2-3] get_rule_based_action now includes REASSIGN logic: when a dev has
+             productivity < 0.6 (burnout) or is overloaded, their in-progress tasks
+             are reassigned to available devs with matching skill. The old fallback
+             had no reassign logic, causing inst_score to decay to 0.04 over 60 steps.
+  [FIX-R2-4] get_rule_based_action now includes REPRIORITIZE logic: backlog tasks
+             within 2 days of their deadline with priority > 2 are bumped to P1
+             before the next assign attempt. Prevents overdue tasks being ignored.
+  [FIX-R2-5] Unblock ordering preserved (step 4 in priority chain, after reassign).
+
 MANDATORY ENV VARS:
     API_BASE_URL  : LLM endpoint  (e.g. https://router.huggingface.co/v1)
     MODEL_NAME    : Model identifier
@@ -37,6 +53,9 @@ import warnings
 from typing import Optional
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Silence harmless deprecation warnings ────────────────────────────────────
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
@@ -55,7 +74,8 @@ HF_TOKEN         = os.getenv("HF_TOKEN", "")
 MODEL_NAME       = os.getenv("MODEL_NAME", LOCAL_MODEL_PATH)
 ENV_BASE_URL     = os.getenv("ENV_BASE_URL", "https://sejal-k-ai-sprint-manager.hf.space")
 
-USE_LLM = os.getenv("USE_LLM", "1").strip().lower() not in ("0", "false", "no")
+_use_llm_raw     = os.getenv("USE_LLM", "1").strip().lower()
+USE_LLM          = _use_llm_raw not in ("0", "false", "no", "off")
 
 # ── Llama baseline mode ───────────────────────────────────────────────────────
 # Set LLAMA_BASELINE=1 to run inference via the HuggingFace router using the
@@ -91,7 +111,7 @@ LLM_CALL_EVERY = 1
 # [FIX] Loop detection: if the model picks the same (action_type, task_id)
 # N times in a row, override with rule-based fallback to break the loop.
 # This directly addresses the core failure mode seen in the trained model logs.
-LOOP_DETECT_WINDOW = 3  # consecutive identical actions before forcing fallback
+LOOP_DETECT_WINDOW = 2  # consecutive identical actions before forcing fallback
 
 TASKS = ["project_easy", "project_medium", "project_hard"]
 
@@ -207,18 +227,24 @@ def call_env(endpoint: str, payload: Optional[dict] = None, method: str = "POST"
 # ── Rule-based fallback ────────────────────────────────────────────────────────
 
 def get_rule_based_action(obs: dict, assigned_this_episode: set,
-                          last_failed_task: Optional[str] = None) -> dict:
+                          last_failed_task: Optional[str] = None,
+                          reassigned_this_episode: set = None) -> dict:
     """
-    Deterministic fallback. Priority:
-    1. Active instruction's tasks (if deps met, not already assigned)
-    2. Highest-priority backlog (deps met, not already assigned, not last failed)
-    3. Unblock genuinely blocked tasks
-    4. Skip
+    Deterministic fallback. Priority order:
+    1. Active instruction tasks (deps met, not already assigned)
+    2. Highest-priority backlog (deps met, not assigned, not last failed)
+    3. Reassign in-progress tasks from burned-out / overloaded devs to available ones
+       [FIX] Skip tasks already in reassigned_this_episode to break reassign loops.
+    4. Unblock blocked tasks whose deps are now all done
+    5. Reprioritize: bump overdue high-effort tasks that are still backlog
+    6. Skip
     """
+    if reassigned_this_episode is None:
+        reassigned_this_episode = set()
     tasks     = obs.get("tasks", [])
     devs      = obs.get("developers", [])
     done_ids  = {t["id"] for t in tasks if t["status"] == "done"}
-    available = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"] * 2]
+    available = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"]]
 
     def best_dev(task: dict):
         skill_match = [d for d in available
@@ -263,13 +289,83 @@ def get_rule_based_action(obs: dict, assigned_this_episode: set,
                 return {"action_type": "assign", "task_id": task["id"],
                         "dev_id": dev["id"], "new_priority": None}
 
-    # 3. Unblock
+    # [FIX] 3. Reassign: move in-progress tasks from burned-out or overloaded devs
+    # to available devs with matching skill. This prevents the skip-lock that occurs
+    # once backlog is exhausted — the old code had no reassign logic at all.
+    #
+    # [FIX-R2-SKIP-LOCK] Two-pass reassign strategy:
+    # Pass 1 (strict): target devs at strict capacity (current_load < capacity).
+    # Pass 2 (relaxed): when ALL devs are full (available is empty), consider devs
+    #   at current_load == capacity as reassign targets (one-slot-at-limit slack).
+    #   This breaks the skip-lock in sprint 2+ once every dev slot fills: the old
+    #   code found no candidates and fell through to 40+ consecutive skips.
+    devs_by_id  = {d["id"]: d for d in devs}
+    in_progress = [t for t in tasks if t["status"] == "in_progress"]
+
+    for pass_num in (1, 2):
+        if pass_num == 1:
+            reassign_targets = available  # strict: current_load < capacity
+        else:
+            if available:                 # pass 1 already had candidates, skip pass 2
+                break
+            reassign_targets = [
+                d for d in devs
+                if d["is_available"]
+                and d["current_load"] <= d["capacity"]
+            ]
+
+        for task in in_progress:
+            if not task.get("assigned_to"):
+                continue
+            # [FIX-REASSIGN-LOOP] Skip tasks we've already reassigned this episode.
+            # Without this, the fallback loops on the same in-progress task every step
+            # (T25 steps 13-29, T21 steps 41-58 in project_hard/easy baselines).
+            if task["id"] in reassigned_this_episode:
+                continue
+            current_dev  = devs_by_id.get(task["assigned_to"])
+            if current_dev is None:
+                continue
+            productivity = current_dev.get("productivity", 1.0)
+            overloaded   = current_dev.get("current_load", 0) > current_dev.get("capacity", 5)
+            if productivity < 0.6 or overloaded:
+                skill = task.get("required_skill", "")
+                candidates = [
+                    d for d in reassign_targets
+                    if d["id"] != current_dev["id"]
+                    and (d["skill"] == skill or d["skill"] == "fullstack")
+                ]
+                if candidates:
+                    return {"action_type": "reassign", "task_id": task["id"],
+                            "dev_id": candidates[0]["id"], "new_priority": None}
+
+    # 4. Unblock blocked tasks whose deps are fully done
     for task in tasks:
         if task["status"] == "blocked":
             deps = task.get("metadata", {}).get("depends_on", [])
             if all(d in done_ids for d in deps):
                 return {"action_type": "unblock", "task_id": task["id"],
                         "dev_id": None, "new_priority": None}
+
+    # [FIX] 5. Reprioritize: if there are backlog tasks with deadline already past
+    # or within 2 days and priority > 2, bump them to priority 1 so they get picked
+    # up on the next assign opportunity. Without this the model ignores overdue tasks.
+    # [FIX-R2-REPRIO-STATUS] Guard: only reprioritize tasks that are still "backlog".
+    # The env rejects reprioritize on done/in_progress tasks with -0.70 penalty.
+    # The old code iterated `backlog` list (already filtered by status == "backlog")
+    # but only after the reassign block above, which doesn't mutate the list —
+    # safe. However, we add an explicit guard here as a belt-and-suspenders check
+    # in case `backlog` is ever populated from a different source path.
+    current_day = obs.get("current_day", 0)
+    for task in backlog:
+        if task.get("status") != "backlog":   # explicit guard against stale refs
+            continue
+        if task["id"] in assigned_this_episode:
+            continue
+        deadline = task.get("deadline", 999)
+        priority = task.get("priority", 5)
+        if deadline <= current_day + 2 and priority > 2:
+            return {"action_type": "reprioritize", "task_id": task["id"],
+                    "dev_id": None, "new_priority": 1}
 
     return skip
 
@@ -318,6 +414,36 @@ def parse_action(text: str) -> dict:
         if str(d.get(key, "")).strip() in _NULL_STRINGS:
             d[key] = None
 
+    # ── Sanitise task_id and dev_id ───────────────────────────────────────────
+    # The compact prompt uses "D{day}/60 S{sprint}/6" which causes the LLM to
+    # hallucinate task_ids like "D60/60", "D37/60", or dev_ids like "D31".
+    # Accept only canonical T\d+ for task_id and D\d+ (without slash) for dev_id.
+    import re as _re
+    def _clean_task_id(val):
+        if val is None:
+            return None
+        s = str(val).strip()
+        # Extract first T\d+ pattern (e.g. "T01", "T9")
+        m = _re.search(r"\b(T\d+)\b", s)
+        return m.group(1) if m else None
+
+    def _clean_dev_id(val):
+        if val is None:
+            return None
+        s = str(val).strip()
+        # Accept D\d+ only — reject "D60/60", "D37/60" etc (date leakage)
+        m = _re.fullmatch(r"D\d+", s)
+        if m:
+            return s
+        # Try to extract from longer string
+        m = _re.search(r"\b(D\d+)\b", s)
+        if m and "/" not in s:   # reject date-style D\d+/\d+
+            return m.group(1)
+        return None
+
+    d["task_id"] = _clean_task_id(d.get("task_id"))
+    d["dev_id"]  = _clean_dev_id(d.get("dev_id"))
+
     # new_priority → int
     if d.get("new_priority") is not None:
         try:
@@ -328,8 +454,12 @@ def parse_action(text: str) -> dict:
             d["new_priority"] = None
 
     # Demote invalid actions → skip
+    # assign: task_id required; dev_id optional (env auto-picks best dev)
+    # reassign: both required
     atype = d["action_type"]
-    if atype in ("assign", "reassign") and (not d.get("task_id") or not d.get("dev_id")):
+    if atype == "assign" and not d.get("task_id"):
+        d["action_type"] = "skip"
+    if atype == "reassign" and (not d.get("task_id") or not d.get("dev_id")):
         d["action_type"] = "skip"
     if atype == "reprioritize" and (not d.get("task_id") or not d.get("new_priority")):
         d["action_type"] = "skip"
@@ -504,6 +634,7 @@ def run_episode(task_name: str) -> float:
 
     # ── Episode memory ────────────────────────────────────────────────────────
     assigned_this_episode: set[str] = set()   # tasks we've sent assign for
+    reassigned_this_episode: set[str] = set() # tasks we've sent reassign for
     last_failed_task: Optional[str] = None    # last task that got negative reward
     llm_fail_streak: int            = 0       # consecutive LLM failures
     LLM_ABANDON_AFTER               = 5       # give up on LLM after this many consecutive failures
@@ -532,13 +663,43 @@ def run_episode(task_name: str) -> float:
                 action = parse_action(response_text)
 
                 # ── Validate LLM action and override if needed ────────────────
-                # If LLM tries to assign a task that's already in_progress or done,
-                # override with smart fallback
-                if action["action_type"] == "assign" and action.get("task_id"):
+                # Guard 1: task already assigned this episode or not in backlog → override
+                # Guard 1b: task already reassigned this episode → override
+                # Guard 2: task has unmet deps → override
+                # Guard 3: dev not available → override
+                # This is the primary fix for Llama repeatedly picking T04/T05.
+                if action["action_type"] in ("assign", "reassign") and action.get("task_id"):
                     tid    = action["task_id"]
+                    did    = action.get("dev_id")
                     t_info = next((t for t in obs["tasks"] if t["id"] == tid), None)
-                    if t_info and t_info["status"] != "backlog":
-                        # Task is in_progress/done — LLM is looping, override
+                    d_info = next((d for d in obs["developers"] if d["id"] == did), None) if did else None
+                    done_ids_guard = {t["id"] for t in obs["tasks"] if t["status"] == "done"}
+
+                    invalid_reason = None
+                    if tid in assigned_this_episode:
+                        invalid_reason = f"already_assigned:{tid}"
+                    elif action["action_type"] == "reassign" and tid in reassigned_this_episode:
+                        invalid_reason = f"already_reassigned:{tid}"
+                    elif t_info is None:
+                        invalid_reason = f"unknown_task:{tid}"
+                    elif action["action_type"] == "assign" and t_info["status"] != "backlog":
+                        invalid_reason = f"not_backlog:{t_info['status']}"
+                    elif d_info is not None and not d_info.get("is_available", True):
+                        invalid_reason = f"dev_busy:{did}"
+                    # [FIX-R2-CAPACITY] Reject assign when named dev is at capacity.
+                    # is_available can be True while current_load == capacity; the env
+                    # returns -0.05 and the task never goes in_progress, starving the
+                    # entire dep chain for the rest of the episode.
+                    elif (action["action_type"] == "assign" and d_info is not None
+                          and d_info.get("current_load", 0) >= d_info.get("capacity", 5)):
+                        invalid_reason = f"dev_at_capacity:{did}"
+                    else:
+                        deps = t_info.get("metadata", {}).get("depends_on", []) if t_info else []
+                        if deps and not all(d in done_ids_guard for d in deps):
+                            invalid_reason = f"unmet_deps:{deps}"
+
+                    if invalid_reason:
+                        print(f"  [GUARD] {invalid_reason} → fallback", flush=True)
                         action = get_rule_based_action(
                             obs, assigned_this_episode, last_failed_task
                         )
@@ -552,28 +713,76 @@ def run_episode(task_name: str) -> float:
                 if (len(action_history) == LOOP_DETECT_WINDOW
                         and len(set(action_history)) == 1
                         and action_key[0] != "skip"):
-                    print(f"  [LOOP] Detected {LOOP_DETECT_WINDOW}× repeat of "
+                    print(f"  [LOOP] Detected {len(action_history)}× repeat of "
                           f"{action_key} → forcing fallback", flush=True)
+                    # Block the repeated task so LLM cannot propose it again.
+                    # [FIX-LOOP-REASSIGN] Also add to reassigned_this_episode when
+                    # the loop is on a reassign action — otherwise get_rule_based_action
+                    # step 3 immediately picks the same task as a reassign candidate
+                    # and the loop continues through the fallback (T25, T30 loops).
+                    if action_key[1]:
+                        assigned_this_episode.add(action_key[1])
+                        if action_key[0] == "reassign":
+                            reassigned_this_episode.add(action_key[1])
                     action = get_rule_based_action(
-                        obs, assigned_this_episode, last_failed_task
+                        obs, assigned_this_episode, last_failed_task,
+                        reassigned_this_episode
                     )
                     action_history.clear()  # reset after breaking loop
             else:
                 llm_fail_streak += 1
-                action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
+                action = get_rule_based_action(obs, assigned_this_episode, last_failed_task, reassigned_this_episode)
         else:
             # Either LLM abandoned or between batch intervals
-            action = get_rule_based_action(obs, assigned_this_episode, last_failed_task)
-
-        # Track assigned tasks to avoid re-assigning
-        if action["action_type"] == "assign" and action.get("task_id"):
-            assigned_this_episode.add(action["task_id"])
+            action = get_rule_based_action(obs, assigned_this_episode, last_failed_task, reassigned_this_episode)
 
         # ── Call environment ──────────────────────────────────────────────────
+        # [FIX-PREBLOCK] Block task BEFORE calling env so the next step's fallback
+        # immediately sees it as unavailable. This is the primary fix for the
+        # 4-5× repeat-assign loops (T04, T05, T10) observed in baselines.
+        #
+        # [FIX-R2-SOFT-REJECT] Refined pre-block for R2's 60-step episodes:
+        # Only pre-block if the chosen dev is confirmed under capacity right now.
+        # If no dev_id is specified, or the dev is at capacity, skip the pre-block
+        # and let the post-env block handle it based on the actual reward signal.
+        # This allows the fallback to retry a task once a dev slot opens after a
+        # soft -0.05 capacity-full reject, instead of permanently blocking it.
+        if action["action_type"] == "assign" and action.get("task_id"):
+            _pre_did = action.get("dev_id")
+            _pre_dev = next((d for d in obs.get("developers", []) if d["id"] == _pre_did), None) if _pre_did else None
+            _dev_has_room = _pre_dev is None or _pre_dev.get("current_load", 0) < _pre_dev.get("capacity", 5)
+            if _dev_has_room:
+                assigned_this_episode.add(action["task_id"])
+
+        # [FIX-R2-REASSIGN-BLOCK] Mirror pre-block for reassign.
+        # Add task to reassigned_this_episode immediately so guard/fallback on
+        # the very next step cannot emit the same reassign before env responds.
+        if action["action_type"] == "reassign" and action.get("task_id"):
+            reassigned_this_episode.add(action["task_id"])
+
         result = call_env("step", {"action": action})
         obs    = result["observation"]
         reward = result["reward"]
         done   = result["done"]
+
+        # Update assigned_this_episode AFTER env responds.
+        # Block task permanently if env accepted (in_progress) or hard-rejected it.
+        # [FIX-SOFT-BOUNCE] Do NOT permanently block on a -0.05 soft bounce.
+        # Instead, discard the task from assigned_this_episode so it's retryable
+        # once a dev slot opens. This breaks the dep-chain freeze: T01 bounces
+        # -0.05 in step 1 (dev at capacity), gets stuck in assigned_this_episode,
+        # its downstream dep chain never starts, and everything skips for 50 steps.
+        if action["action_type"] == "assign" and action.get("task_id"):
+            tid = action["task_id"]
+            task_after = next((t for t in obs.get("tasks", []) if t["id"] == tid), None)
+            was_accepted    = task_after and task_after.get("status") == "in_progress"
+            was_hard_reject = reward < -0.05   # -0.15 skill/already-in-progress → block
+            is_soft_bounce  = -0.06 < reward < 0  # -0.05 capacity-full → allow retry
+            if was_accepted or was_hard_reject:
+                assigned_this_episode.add(tid)
+            elif is_soft_bounce and task_after and task_after.get("status") == "backlog":
+                # Soft bounce: task still backlog, unblock so fallback retries later
+                assigned_this_episode.discard(tid)
 
         # Track which task just failed (for fallback to avoid)
         if reward < -0.5 and action.get("task_id"):
@@ -597,15 +806,22 @@ def run_episode(task_name: str) -> float:
         )
 
         if done:
-            tasks_total   = len(obs.get("tasks", [])) or 1
-            tasks_done    = obs.get("tasks_completed", 0)
-            inst_score    = obs.get("instruction_following_score", 0.01)
-            delivery_rate = tasks_done / tasks_total
-            debt_count    = len(obs.get("tech_debt", []))
-            team_health   = max(0.01, 1.0 - debt_count * 0.02)
-            # Weighted: delivery 55%, inst 30%, health 15%
-            raw = delivery_rate * 0.55 + inst_score * 0.30 + team_health * 0.15
-            final_score = max(0.01, min(0.99, raw))
+            # Prefer the env's own final_score if present in info — it uses the
+            # full internal formula including streak bonuses and penalties that
+            # our local approximation cannot replicate accurately.
+            info = result.get("info", {})
+            if "final_score" in info:
+                final_score = max(0.01, min(0.99, float(info["final_score"])))
+            else:
+                # Fallback formula when env doesn't supply final_score
+                tasks_total   = len(obs.get("tasks", [])) or 1
+                tasks_done    = obs.get("tasks_completed", 0)
+                inst_score    = obs.get("instruction_following_score", 0.01)
+                delivery_rate = tasks_done / tasks_total
+                debt_count    = len(obs.get("tech_debt", []))
+                team_health   = max(0.01, 1.0 - debt_count * 0.02)
+                raw = delivery_rate * 0.55 + inst_score * 0.30 + team_health * 0.15
+                final_score = max(0.01, min(0.99, raw))
             break
 
     # ── [END] ─────────────────────────────────────────────────────────────────

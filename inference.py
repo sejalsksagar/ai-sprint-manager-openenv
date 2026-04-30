@@ -9,6 +9,17 @@ Environment variables:
   LOCAL_MODEL_PATH  : HF repo ID or local path. Default: sejal-k/multi-sprint-model
   ENV_BASE_URL      : Sprint env server. Default: HF Space URL.
   USE_LLM           : "0" to run rule-based only (default "1").
+
+FIXES vs original:
+  [FIX-R1-1] was_rejected threshold lowered from < -0.3 → < 0.
+             The env returns -0.15 for assigning an already-in_progress or
+             skill-mismatch task. The old threshold missed this, causing the same
+             task to be retried 3-5 times per episode (T4 double-assign in hard sprint).
+  [FIX-R1-2] Pre-block: task added to assigned_this_episode BEFORE calling the env,
+             not just after. This guarantees the fallback on the very next step
+             cannot re-suggest the same task even if the env response is slow/missing.
+  [FIX-R1-3] _validate_action_against_obs already checks assigned_this_episode before
+             the env call — this remains correct and works with FIX-R1-2.
 """
 from __future__ import annotations
 
@@ -304,7 +315,11 @@ def parse_action(text: str) -> dict:
     task_id = _clean_id(d.get("task_id"))
     dev_id  = _clean_id(d.get("dev_id"))
 
-    if action_type in ("assign", "reassign") and (not task_id or not dev_id):
+    # For assign: task_id is required; dev_id is optional (env auto-picks best dev).
+    # For reassign: both task_id and dev_id are required.
+    if action_type == "assign" and not task_id:
+        action_type = "skip"
+    if action_type == "reassign" and (not task_id or not dev_id):
         action_type = "skip"
     if action_type == "unblock" and not task_id:
         action_type = "skip"
@@ -323,15 +338,31 @@ def parse_action(text: str) -> dict:
 
 # ── Rule-based fallback ───────────────────────────────────────────────────────
 
-def _validate_action_against_obs(action: dict, obs: dict) -> tuple[bool, str]:
+def _validate_action_against_obs(
+    action: dict, obs: dict,
+    assigned_this_episode: set = None,
+    reassigned_this_episode: set = None,
+) -> tuple[bool, str]:
     """
-    Hard semantic check against live observation state.
-    Returns (is_valid, reason). Invalid actions are sent to rule_based_fallback.
-    This guards against the trained model's reward-hacking patterns:
-    - 'unblock' on a task that isn't blocked
-    - 'assign'/'reassign' on a task that isn't backlog
-    - referencing nonexistent task/dev IDs
+    Hard semantic check against live observation state AND episode memory.
+    Returns (is_valid, reason). Invalid actions go to rule_based_fallback.
+
+    Checks (in order):
+      1. Task already assigned this episode → reject even if still "backlog".
+         This is the key fix: env returns -0.15 for re-assigning a task it
+         already rejected (e.g. skill mismatch, overloaded dev). The obs status
+         may still show "backlog" but the attempt already failed.
+      1b. Task already reassigned this episode → reject reassign to avoid loops.
+      2. Unknown task/dev ID → reject.
+      3. assign on non-backlog task → reject.
+      4. Dev unavailable → reject.
+      5. unblock on non-blocked task → reject.
     """
+    if assigned_this_episode is None:
+        assigned_this_episode = set()
+    if reassigned_this_episode is None:
+        reassigned_this_episode = set()
+
     at  = action.get("action_type", "skip")
     tid = action.get("task_id")
     did = action.get("dev_id")
@@ -341,6 +372,14 @@ def _validate_action_against_obs(action: dict, obs: dict) -> tuple[bool, str]:
 
     tasks_by_id = {t["id"]: t for t in obs.get("tasks", [])}
     devs_by_id  = {d["id"]: d for d in obs.get("developers", [])}
+
+    # Check 1: already attempted assign this episode → always reject to avoid env -0.15
+    if tid and tid in assigned_this_episode:
+        return False, f"already_assigned_this_episode:{tid}"
+
+    # Check 1b: already attempted reassign this episode → reject to avoid reassign loops
+    if at == "reassign" and tid and tid in reassigned_this_episode:
+        return False, f"already_reassigned_this_episode:{tid}"
 
     if tid and tid not in tasks_by_id:
         return False, f"unknown_task:{tid}"
@@ -357,13 +396,18 @@ def _validate_action_against_obs(action: dict, obs: dict) -> tuple[bool, str]:
     if at in ("assign", "reassign"):
         if task is None:
             return False, "assign_no_task"
-        if task.get("status") != "backlog":
+        if at == "assign" and task.get("status") != "backlog":
             return False, f"assign_bad_status:{task.get('status')}"
         if did and did not in devs_by_id:
             return False, f"unknown_dev:{did}"
         dev = devs_by_id.get(did) if did else None
         if dev and not dev.get("is_available", False):
             return False, "dev_unavailable"
+        # [FIX-R1-CAPACITY-GUARD] Reject assign when named dev is at capacity.
+        # is_available can be True while current_load == capacity; the env penalises
+        # these with -0.05 and the task never goes in_progress.
+        if at == "assign" and dev and dev.get("current_load", 0) >= dev.get("capacity", 5):
+            return False, f"dev_at_capacity:{did}"
         return True, "ok"
 
     if at == "reprioritize":
@@ -376,21 +420,33 @@ def _validate_action_against_obs(action: dict, obs: dict) -> tuple[bool, str]:
 
 # ── Rule-based fallback ───────────────────────────────────────────────────────
 
-def rule_based_fallback(obs: dict) -> dict:
+def rule_based_fallback(obs: dict, assigned_this_episode: set = None) -> dict:
     """
     Deterministic fallback action: assign the highest-priority backlog task
-    to the best available developer. Returns skip if nothing is actionable.
+    to the best available developer. Skips tasks already assigned this episode
+    so we never re-assign an in_progress task. Returns skip if nothing actionable.
     """
+    if assigned_this_episode is None:
+        assigned_this_episode = set()
     tasks   = obs.get("tasks", [])
     devs    = obs.get("developers", [])
     backlog = sorted(
-        [t for t in tasks if t.get("status") == "backlog"],
+        [t for t in tasks
+         if t.get("status") == "backlog"
+         and t.get("id") not in assigned_this_episode],
         key=lambda t: (t.get("priority", 9), t.get("deadline", 99))
     )
     if not backlog:
         return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
     task  = backlog[0]
     skill = task.get("required_skill", "")
+    # [FIX-R1-CAPACITY] Use strict < capacity (not < capacity * 2).
+    # Hard sprint exhausts dev capacity partway through an episode; the old
+    # check (< capacity * 2) allowed overloaded devs to receive new tasks,
+    # which the env penalises heavily (T5: -2.80, T7: -3.50).  Now that the
+    # pre-block guard stops re-assigns from eating the steps, the fallback
+    # reaches these overloaded assignments much faster, making the strict
+    # check critical to avoid score collapse (0.286 → 0.010).
     avail = [d for d in devs
              if d.get("is_available", False)
              and d.get("current_load", 0) < d.get("capacity", 5)]
@@ -432,6 +488,15 @@ def run_episode(task_name: str) -> float:
     final_score = 0.01
     step_num    = 0
 
+    # Track tasks assigned this episode so fallback never re-assigns them.
+    # This is critical for Llama baseline: after T3 is assigned (in_progress),
+    # the fallback must not pick T3 again — it would cost -0.15 every step.
+    assigned_this_episode: set = set()
+    # [FIX-R1-REASSIGN-BLOCK] Track tasks we've already attempted a reassign on.
+    # Mirrors the assign pre-block logic: once we emit a reassign for a task,
+    # block it immediately so we can't loop on the same reassign next step.
+    reassigned_this_episode: set = set()
+
     for step_num in range(1, MAX_STEPS + 1):
         if obs.get("done", False):
             break
@@ -440,32 +505,68 @@ def run_episode(task_name: str) -> float:
             raw = call_local_model(obs)
             if raw:
                 action = parse_action(raw)
-                ok, reason = _validate_action_against_obs(action, obs)
+                ok, reason = _validate_action_against_obs(
+                    action, obs, assigned_this_episode, reassigned_this_episode
+                )
                 if not ok:
                     print(f"  [GUARD] model action invalid ({reason}) → fallback",
                           flush=True)
-                    action = rule_based_fallback(obs)
+                    action = rule_based_fallback(obs, assigned_this_episode)
             else:
-                action = rule_based_fallback(obs)
+                action = rule_based_fallback(obs, assigned_this_episode)
         elif LLAMA_BASELINE:
             raw = call_llama_router(obs)
             if raw:
                 action = parse_action(raw)
-                ok, reason = _validate_action_against_obs(action, obs)
+                ok, reason = _validate_action_against_obs(
+                    action, obs, assigned_this_episode, reassigned_this_episode
+                )
                 if not ok:
                     print(f"  [GUARD] llama action invalid ({reason}) → fallback",
                           flush=True)
-                    action = rule_based_fallback(obs)
+                    action = rule_based_fallback(obs, assigned_this_episode)
             else:
-                action = rule_based_fallback(obs)
+                action = rule_based_fallback(obs, assigned_this_episode)
         else:
-            action = rule_based_fallback(obs)
+            action = rule_based_fallback(obs, assigned_this_episode)
+
+        # [FIX-PREBLOCK] Block task immediately when we choose to assign it, BEFORE
+        # calling the env. This prevents the env call from being the only opportunity
+        # to block — in the old code a -0.15 penalty (below the -0.3 threshold) would
+        # not trigger a block, so the same task could be retried on the next step.
+        if action.get("action_type") == "assign" and action.get("task_id"):
+            assigned_this_episode.add(action["task_id"])
+
+        # [FIX-R1-REASSIGN-BLOCK] Mirror pre-block for reassign: add the task to
+        # reassigned_this_episode immediately so the next step's guard/fallback
+        # cannot emit the same reassign again before the env has even responded.
+        if action.get("action_type") == "reassign" and action.get("task_id"):
+            reassigned_this_episode.add(action["task_id"])
 
         result = call_env("step", {"action": action})
         obs    = result.get("observation", result)
         reward = result.get("reward", 0.0)
         done   = result.get("done", False)
         info   = result.get("info", {})
+
+        # Update episode memory AFTER env responds.
+        # Block a task permanently if env accepted (in_progress) or hard-rejected it.
+        # [FIX-SOFT-BOUNCE] Do NOT permanently block on a -0.05 soft bounce (capacity
+        # full). Instead, remove the task from assigned_this_episode so the fallback
+        # can retry it once a dev slot opens. This is the root cause of the dep-chain
+        # freeze: T01 bounces -0.05 in step 1, gets pre-blocked, its dep chain never
+        # starts, and all downstream tasks skip for the rest of the episode.
+        if action.get("action_type") == "assign" and action.get("task_id"):
+            tid = action["task_id"]
+            task_after = next((t for t in obs.get("tasks", []) if t["id"] == tid), None)
+            was_accepted     = task_after and task_after.get("status") == "in_progress"
+            was_hard_reject  = reward < -0.05   # -0.15 skill/already-in-progress → block
+            is_soft_bounce   = -0.06 < reward < 0  # -0.05 capacity-full → allow retry
+            if was_accepted or was_hard_reject:
+                assigned_this_episode.add(tid)
+            elif is_soft_bounce and task_after and task_after.get("status") == "backlog":
+                # Soft bounce: task still backlog, unblock so fallback can retry later
+                assigned_this_episode.discard(tid)
 
         print(
             f"[STEP] task={task_name} step={step_num} "

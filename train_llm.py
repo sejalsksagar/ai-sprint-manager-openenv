@@ -459,6 +459,10 @@ def _parse_action(text: str) -> dict:
     # Normalise null-like strings to Python None
     for key in ("task_id", "dev_id", "new_priority"):
         val = d.get(key)
+        # [FIX-LIST] LLM sometimes outputs "task_id": ["T01"] — unwrap to scalar
+        if isinstance(val, list):
+            val = val[0] if val else None
+            d[key] = val
         if val is not None and str(val).strip() in _NULL_STRINGS:
             d[key] = None
 
@@ -669,6 +673,24 @@ def make_reward_fn(env_base_url: str, phase: str):
     def reward_fn(prompts, completions,
                   meta_task=None, meta_seed=None, meta_r2=None,
                   **kwargs) -> list[float]:
+        # [FIX-SAFETY] Outer guard: any totally unexpected exception (e.g. network
+        # outage, serialization bug) returns neutral rewards rather than crashing
+        # the entire training run.
+        try:
+            return _reward_fn_inner(prompts, completions,
+                                    meta_task=meta_task, meta_seed=meta_seed,
+                                    meta_r2=meta_r2, **kwargs)
+        except Exception as _outer_err:
+            print(f"[ERROR] reward_fn outer guard caught unexpected exception: "
+                  f"{_outer_err} — returning neutral rewards", flush=True)
+            import traceback
+            traceback.print_exc()
+            n = len(completions) if hasattr(completions, '__len__') else 1
+            return [0.5] * n
+
+    def _reward_fn_inner(prompts, completions,
+                  meta_task=None, meta_seed=None, meta_r2=None,
+                  **kwargs) -> list[float]:
         rewards = []
 
         # ── Recover task context injected by build_grpo_dataset ───────────────
@@ -708,7 +730,15 @@ def make_reward_fn(env_base_url: str, phase: str):
 
         # Compute group-level repetition: if every completion picks the same
         # (action_type, task_id) assign action, the model is in a degenerate loop.
-        action_keys      = [(a["action_type"], a.get("task_id")) for a in parsed_actions]
+        # [FIX-HASH] task_id can be a list if the LLM outputs ["T01"] — lists are
+        # unhashable and crash set(). Coerce every value to str before hashing.
+        def _hashable_key(a: dict) -> tuple:
+            tid = a.get("task_id")
+            if isinstance(tid, list):
+                tid = tid[0] if tid else None
+            return (str(a.get("action_type", "skip")), str(tid))
+
+        action_keys      = [_hashable_key(a) for a in parsed_actions]
         n_unique         = len(set(action_keys))
         n_total          = max(1, len(action_keys))
         all_same_assign  = (n_unique == 1 and action_keys[0][0] == "assign")
@@ -1069,16 +1099,26 @@ def load_model_and_tokenizer(model_name: str):
         print(f"[INFO] Loading {model_name} with Unsloth 4-bit QLoRA...", flush=True)
         import torch as _torch_load
         _n = _torch_load.cuda.device_count() if _torch_load.cuda.is_available() else 1
-        # [FIX] num_gpus was removed: Unsloth 2026.x forwards unknown kwargs to
-        # AutoModelForCausalLM which rejects them with TypeError. Unsloth
-        # auto-detects all GPUs internally — no kwarg needed.
-        model, tokenizer = FastLanguageModel.from_pretrained(
+        print(f"[INFO] GPUs visible to Unsloth: {_n}", flush=True)
+        # [FIX-MULTIGPU] Try passing num_gpus first (supported by some Unsloth builds).
+        # If the kwarg is rejected, fall back silently — Unsloth auto-detects GPUs anyway.
+        _load_kwargs: dict = dict(
             model_name=model_name,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
             token=HF_TOKEN or None,
         )
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                **_load_kwargs, num_gpus=_n
+            )
+            print(f"[INFO] Unsloth loaded with num_gpus={_n}", flush=True)
+        except TypeError:
+            # num_gpus not supported in this Unsloth version — auto-detection is used
+            model, tokenizer = FastLanguageModel.from_pretrained(**_load_kwargs)
+            print(f"[INFO] Unsloth loaded (num_gpus kwarg not supported; "
+                  "auto-detection active)", flush=True)
         model = FastLanguageModel.get_peft_model(
             model,
             r=16,
@@ -1258,6 +1298,16 @@ def train(
         cfg["gradient_accumulation_steps"] = max(
             1, cfg["gradient_accumulation_steps"] // _n_gpus
         )
+        # [FIX-MULTIGPU] On Kaggle T4×2, Unsloth needs all GPU indices visible.
+        # Set CUDA_VISIBLE_DEVICES if not already set so both GPUs are used.
+        if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+            cv = ",".join(str(i) for i in range(_n_gpus))
+            os.environ["CUDA_VISIBLE_DEVICES"] = cv
+            print(f"[INFO] Set CUDA_VISIBLE_DEVICES={cv}", flush=True)
+        # With 2 T4s we can safely double num_generations (T4 has 16GB each)
+        if gpu_tier == "t4" and _n_gpus == 2 and cfg.get("num_generations", 2) < 4:
+            cfg["num_generations"] = 4
+            print("[INFO] Dual T4: num_generations raised to 4", flush=True)
         print(f"[INFO] gradient_accumulation_steps → {cfg['gradient_accumulation_steps']} "
               f"(effective batch: {_n_gpus}×{cfg['per_device_train_batch_size']}"
               f"×{cfg['gradient_accumulation_steps']})", flush=True)
@@ -1334,15 +1384,42 @@ def train(
     # 6. Train
     print("[INFO] Starting GRPO training...", flush=True)
     t0 = time.time()
-    trainer.train()
+    _training_crashed = False
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        print("\n[WARN] Training interrupted by user (KeyboardInterrupt). Saving checkpoint...",
+              flush=True)
+        _training_crashed = True
+    except Exception as _train_err:
+        print(f"\n[ERROR] Training crashed at step "
+              f"{getattr(trainer.state, 'global_step', '?')}: {_train_err}",
+              flush=True)
+        import traceback
+        traceback.print_exc()
+        _training_crashed = True
     elapsed = time.time() - t0
-    print(f"\n[INFO] Training complete in {elapsed/60:.1f} min", flush=True)
+    print(f"\n[INFO] Training {'interrupted' if _training_crashed else 'complete'} "
+          f"in {elapsed/60:.1f} min", flush=True)
 
-    # 7. Save
+    # 7. Save — always runs, even after a crash/interrupt
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    trainer.save_model(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    print(f"[INFO] Model saved to {output_dir}", flush=True)
+    print(f"[INFO] Saving model to {output_dir} ...", flush=True)
+    try:
+        trainer.save_model(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        print(f"[INFO] ✅ Model saved to {output_dir}"
+              f"{' (partial — training was interrupted)' if _training_crashed else ''}",
+              flush=True)
+    except Exception as _save_err:
+        print(f"[ERROR] trainer.save_model failed: {_save_err}. "
+              "Trying model.save_pretrained as fallback...", flush=True)
+        try:
+            model.save_pretrained(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            print(f"[INFO] ✅ Model saved via fallback to {output_dir}", flush=True)
+        except Exception as _save_err2:
+            print(f"[ERROR] Fallback save also failed: {_save_err2}", flush=True)
 
     # 8. Push to Hub
     # ROOT CAUSE OF PREVIOUS FAILURES:
