@@ -847,7 +847,7 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
 
     SKIP_STEPS_R1 = 1   # skip first step (trivial full-backlog state)
     SKIP_STEPS_R2 = 2   # skip first 2 steps (instructions not yet released)
-    SAMPLE_PER_EP = 4   # states to sample per episode
+    SAMPLE_PER_EP = 2   # states to sample per episode
 
     # ── Collect R1 snapshots ──────────────────────────────────────────────────
     for task_name in tasks_r1:
@@ -1099,9 +1099,13 @@ def load_model_and_tokenizer(model_name: str):
         print(f"[INFO] Loading {model_name} with Unsloth 4-bit QLoRA...", flush=True)
         import torch as _torch_load
         _n = _torch_load.cuda.device_count() if _torch_load.cuda.is_available() else 1
-        print(f"[INFO] GPUs visible to Unsloth: {_n}", flush=True)
-        # [FIX-MULTIGPU] Try passing num_gpus first (supported by some Unsloth builds).
-        # If the kwarg is rejected, fall back silently — Unsloth auto-detects GPUs anyway.
+        print(f"[INFO] GPUs visible to Unsloth: {_n} (using 1)", flush=True)
+        # [SINGLE-GPU] Always load on exactly 1 GPU (GPU 0).
+        # Kaggle T4×2: Unsloth's internal multi-GPU data-parallel can cause
+        # memory imbalance and NCCL issues with QLoRA. Pinning to 1 GPU is
+        # more stable and avoids the "Both max_new_tokens and max_length" /
+        # NCCL CPU-tensor crash. CUDA_VISIBLE_DEVICES=0 is set in main() so
+        # only GPU 0 is visible here, but we also pass num_gpus=1 explicitly.
         _load_kwargs: dict = dict(
             model_name=model_name,
             max_seq_length=2048,
@@ -1111,14 +1115,15 @@ def load_model_and_tokenizer(model_name: str):
         )
         try:
             model, tokenizer = FastLanguageModel.from_pretrained(
-                **_load_kwargs, num_gpus=_n
+                **_load_kwargs, num_gpus=1
             )
-            print(f"[INFO] Unsloth loaded with num_gpus={_n}", flush=True)
+            print(f"[INFO] Unsloth loaded with num_gpus=1", flush=True)
         except TypeError:
-            # num_gpus not supported in this Unsloth version — auto-detection is used
+            # num_gpus not supported in this Unsloth version — single GPU via
+            # CUDA_VISIBLE_DEVICES=0 set in main() ensures only GPU 0 is used.
             model, tokenizer = FastLanguageModel.from_pretrained(**_load_kwargs)
             print(f"[INFO] Unsloth loaded (num_gpus kwarg not supported; "
-                  "auto-detection active)", flush=True)
+                  "single-GPU via CUDA_VISIBLE_DEVICES=0)", flush=True)
         model = FastLanguageModel.get_peft_model(
             model,
             r=16,
@@ -1161,15 +1166,9 @@ def _load_hf_model(model_name: str):
             model_name, quantization_config=bnb, device_map="auto",
             token=HF_TOKEN or None,
         )
-        # Multi-GPU: wrap with DataParallel BEFORE moving to device.
-        # (Per Kaggle T4×2 thread: model = nn.DataParallel(model); model.to(device))
-        _n_gpus_hf = _th.cuda.device_count() if _th.cuda.is_available() else 1
-        if _n_gpus_hf > 1:
-            import torch.nn as _nn
-            _device_hf = _th.device("cuda")
-            model = _nn.DataParallel(model)
-            model.to(_device_hf)
-            print(f"[INFO] HF model wrapped with DataParallel ({_n_gpus_hf} GPUs)", flush=True)
+        # [SINGLE-GPU] Do NOT wrap with DataParallel — CUDA_VISIBLE_DEVICES=0
+        # (set in main) ensures only GPU 0 is used. DataParallel + QLoRA on
+        # Kaggle T4×2 causes tensor device mismatches and NCCL crashes.
         lora_cfg = LoraConfig(
             r=16, lora_alpha=32, lora_dropout=0.05,
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
@@ -1647,6 +1646,16 @@ def smoke_test():
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── SINGLE-GPU: pin to GPU 0 only ─────────────────────────────────────────
+    # Kaggle provides 2× T4 GPUs but Unsloth's QLoRA multi-GPU path is
+    # unreliable (NCCL CPU-tensor crash, memory imbalance). Setting
+    # CUDA_VISIBLE_DEVICES=0 before any CUDA context is created ensures that
+    # only GPU 0 is ever visible to PyTorch, Unsloth, and TRL/GRPO.
+    # This must be done BEFORE importing torch.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        print("[INFO] Pinned to single GPU (CUDA_VISIBLE_DEVICES=0)", flush=True)
+
     # ── CRITICAL: Unsloth is incompatible with torchrun/DDP ───────────────────
     # Unsloth handles multi-GPU via its own internal data-parallel mechanism.
     # When torchrun spawns multiple ranks, torch DDP wraps the model and tries
