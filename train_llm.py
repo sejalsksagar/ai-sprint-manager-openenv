@@ -214,7 +214,7 @@ HF_REPO_ID   = os.getenv("HF_REPO_ID", "sejal-k/multi-sprint-model")
 # max_length absent lets TRL/Unsloth pick the correct generation config.
 GRPO_CONFIG = {
     "learning_rate":               5e-6,
-    "num_train_epochs":            1,
+    "num_train_epochs":            3,
     "per_device_train_batch_size": 1,   # T4-safe default; double for A10G+
     "gradient_accumulation_steps": 8,   # effective batch=8 even with bs=1
     "max_prompt_length":           1024,
@@ -222,7 +222,7 @@ GRPO_CONFIG = {
     # max_length is intentionally omitted — setting it alongside
     # max_completion_length causes the "Both max_new_tokens and max_length"
     # warning because TRL maps max_completion_length → max_new_tokens.
-    "num_generations":             2,   # T4-safe; set 4 for A10G+
+    "num_generations":             8,   # T4-safe; set 4 for A10G+
     # [FIX-DIVERSITY] Temperature raised from 0.8 → 1.1 to increase completion
     # diversity within each GRPO group. At 0.8 the model still tends to produce
     # near-identical assign actions for all num_generations completions, which
@@ -771,8 +771,16 @@ def make_reward_fn(env_base_url: str, phase: str):
 
                 adapted = _adapt_action_to_obs(action, obs)
                 if adapted is None:
-                    # Invalid action: penalise below neutral + repetition penalty.
-                    r = max(0.0, 0.35 + repeat_penalty)
+                    # [FIX-VALIDITY] Graduated penalty by failure type so invalid completions
+                    # always contrast with valid ones in the same group (reduces zero-std batches).
+                    atype = action.get("action_type", "skip")
+                    if atype == "assign" and (not action.get("task_id") or not action.get("dev_id")):
+                        invalid_penalty = 0.30   # missing required fields — worst
+                    elif atype in ("reassign", "unblock") and not action.get("task_id"):
+                        invalid_penalty = 0.32   # missing task_id
+                    else:
+                        invalid_penalty = 0.35   # stale/unresolvable ID — mildest
+                    r = max(0.0, invalid_penalty + repeat_penalty)
                     rewards.append(float(r))
                     continue
 
@@ -781,14 +789,18 @@ def make_reward_fn(env_base_url: str, phase: str):
                 step_r    = float(result.get("reward", 0.0))
                 step_norm = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
                 act_bonus = ACTION_DIVERSITY_BONUS.get(action["action_type"], 0.0)
+                # [FIX-VALIDITY] Small bonus for producing a clean, parseable, valid action.
+                # This ensures valid completions always score above the 0.30-0.35 invalid band,
+                # creating guaranteed within-group variance to reduce frac_reward_zero_std.
+                validity_bonus = 0.03
 
                 if not use_r2:
-                    r = step_norm + act_bonus + diversity_bonus + repeat_penalty
+                    r = step_norm + act_bonus + diversity_bonus + repeat_penalty + validity_bonus
                 else:
                     obs2       = result.get("observation", {})
                     inst_score = float(obs2.get("instruction_following_score", 0.5))
                     r = (step_norm * 0.6 + inst_score * 0.4
-                         + act_bonus + diversity_bonus + repeat_penalty)
+                        + act_bonus + diversity_bonus + repeat_penalty + validity_bonus)
 
             except Exception as e:
                 print(f"[WARN] reward_fn env call failed: {e}", flush=True)
@@ -1066,6 +1078,71 @@ def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
         "T02 assigned to D1 who has burnout. D2 available with matching skill.",
         "All high-priority backlog tasks have unmet deps. No safe assign this step.",
     ]
+
+    # [FIX-DEP] Dependency-aware SFT examples.
+    # The model falls into unmet_deps loops because it was never shown the
+    # reasoning pattern: "task X has unmet deps → skip X, assign its blocker first."
+    dep_aware_examples = [
+        # Pattern 1: task has unmet dep → assign the dep instead
+        {
+            "prompt": (
+                "Tasks: T05 [backlog, P1, deps:none, skill:backend], "
+                "T18 [backlog, P1, deps:[T05], skill:frontend]. "
+                "T18 has unmet dep T05. Dev D1 available (backend). "
+                "What is the correct action?"
+            ),
+            "completion": json.dumps({
+                "action_type": "assign", "task_id": "T05",
+                "dev_id": "D1", "new_priority": None,
+            }),
+        },
+        # Pattern 2: all backlog tasks have unmet deps → skip
+        {
+            "prompt": (
+                "Tasks: T10 [backlog, P2, deps:[T03]], T11 [backlog, P2, deps:[T04]]. "
+                "T03 and T04 are both in_progress (not done). "
+                "No deps are satisfied. Dev D2 available. What is the correct action?"
+            ),
+            "completion": json.dumps({
+                "action_type": "skip", "task_id": None,
+                "dev_id": None, "new_priority": None,
+            }),
+        },
+        # Pattern 3: dep is done → assign the dependent task
+        {
+            "prompt": (
+                "Tasks: T07 [done], T14 [backlog, P1, deps:[T07], skill:backend]. "
+                "T07 is done so T14's dep is satisfied. Dev D3 available (backend). "
+                "What is the correct action?"
+            ),
+            "completion": json.dumps({
+                "action_type": "assign", "task_id": "T14",
+                "dev_id": "D3", "new_priority": None,
+            }),
+        },
+        # Pattern 4: R2 multi-sprint dep chain — assign root first
+        {
+            "prompt": (
+                "Sprint 2. T01 [done], T02 [backlog, deps:[T01]], "
+                "T05 [backlog, deps:none, P1], T18 [backlog, deps:[T05]]. "
+                "T05 has no deps and blocks T18. D1 available. What is the correct action?"
+            ),
+            "completion": json.dumps({
+                "action_type": "assign", "task_id": "T05",
+                "dev_id": "D1", "new_priority": None,
+            }),
+        },
+    ]
+    for dep_ex in dep_aware_examples:
+        for _ in range(8):   # repeat 8× — more than other synthetics because this is the key gap
+            examples.append({
+                "prompt": [
+                    {"role": "system", "content": R2_SYSTEM_PROMPT},
+                    {"role": "user",   "content": dep_ex["prompt"]},
+                ],
+                "completion": dep_ex["completion"],
+            })
+            
     for act, user_content in zip(synthetic, synthetic_prompts):
         for _ in range(5):   # repeat each 5× so it's not drowned out
             examples.append({
@@ -1130,7 +1207,7 @@ def load_model_and_tokenizer(model_name: str):
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
             lora_alpha=32,
-            lora_dropout=0.05,
+            lora_dropout=0.0,
             bias="none",
             use_gradient_checkpointing="unsloth",
             random_state=42,
