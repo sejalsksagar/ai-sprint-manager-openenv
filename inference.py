@@ -28,14 +28,20 @@ FIXES vs original:
              The inline check produced a cascade of bad fallbacks, collapsing
              hard_sprint from 0.286 -> 0.010. hard_rejected_tasks is now used
              ONLY inside rule_based_fallback via _dep_ok.
-  [FIX-R1-5] Do not discard from assigned_this_episode on the first soft bounce.
-             The old code discarded the task so it could be retried once a slot
-             opened — reasonable intent, but in R1's 12-step episodes the LLM
-             proposes the same task again on the very next step before
-             soft_bounce_count reaches 2, triggering a hard reject (T4: −0.05
-             then −4.15, collapsing hard_sprint to 0.010). Fix: leave the task
-             blocked in assigned_this_episode after the first soft bounce; only
-             escalate to hard_rejected after 2 bounces as before.
+  [FIX-R1-5] Graduated soft-bounce handling (3-stage: discard/block/escalate).
+             Bounce 1: discard so a different dev/slot can retry.
+             Bounce 2: keep blocked (no discard) to prevent immediate re-proposal.
+             Bounce 3: escalate to hard_rejected_tasks.
+  [FIX-R1-6] Removed assign pre-block before env call. The pre-block fought
+             with the bounce-1 discard: step N+1's pre-block re-added the task
+             to assigned_this_episode before the discard from step N took effect,
+             causing the guard to fire repeatedly (T3 steps 4+7) and
+             rule_based_fallback to re-assign bounced tasks for hard rejects
+             (T4 step 6: -4.15, hard_sprint 0.010). R1 is synchronous so no
+             pre-block is needed; post-env update handles all blocking.
+  [FIX-R1-7] rule_based_fallback now receives soft_bounce_count and excludes
+             any task that has bounced at least once. Prevents the fallback
+             from re-assigning a discarded-after-bounce task on the same step.
 """
 from __future__ import annotations
 
@@ -448,7 +454,8 @@ def _hard_rejected_dep_check(task_id: str, obs: dict, hard_rejected_tasks: set) 
 # ── Rule-based fallback ───────────────────────────────────────────────────────
 
 def rule_based_fallback(obs: dict, assigned_this_episode: set = None,
-                        hard_rejected_tasks: set = None) -> dict:
+                        hard_rejected_tasks: set = None,
+                        soft_bounce_count: dict = None) -> dict:
     """
     Deterministic fallback action: assign the highest-priority backlog task
     to the best available developer. Skips tasks already assigned this episode
@@ -458,6 +465,8 @@ def rule_based_fallback(obs: dict, assigned_this_episode: set = None,
         assigned_this_episode = set()
     if hard_rejected_tasks is None:
         hard_rejected_tasks = set()
+    if soft_bounce_count is None:
+        soft_bounce_count = {}
     tasks   = obs.get("tasks", [])
     devs    = obs.get("developers", [])
     done_ids = {t["id"] for t in tasks if t.get("status") == "done"}
@@ -477,6 +486,12 @@ def rule_based_fallback(obs: dict, assigned_this_episode: set = None,
         [t for t in tasks
          if t.get("status") == "backlog"
          and t.get("id") not in assigned_this_episode
+         # [FIX-R1-BOUNCE-FALLBACK] Also exclude tasks that soft-bounced at least once.
+         # After a soft bounce the task is discarded from assigned_this_episode to allow
+         # a retry, but rule_based_fallback must not immediately re-assign the same task
+         # (T4 step 6: -4.15). Any task in soft_bounce_count has already been attempted
+         # and rejected this episode; skip it until the bounce clears or it escalates.
+         and t.get("id") not in soft_bounce_count
          and _dep_ok(t)],
         key=lambda t: (t.get("priority", 9), t.get("deadline", 99))
     )
@@ -560,9 +575,9 @@ def run_episode(task_name: str) -> float:
                 if not ok:
                     print(f"  [GUARD] model action invalid ({reason}) → fallback",
                           flush=True)
-                    action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks)
+                    action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks, soft_bounce_count)
             else:
-                action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks)
+                action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks, soft_bounce_count)
         elif LLAMA_BASELINE:
             raw = call_llama_router(obs)
             if raw:
@@ -578,22 +593,25 @@ def run_episode(task_name: str) -> float:
                 if not ok:
                     print(f"  [GUARD] llama action invalid ({reason}) → fallback",
                           flush=True)
-                    action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks)
+                    action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks, soft_bounce_count)
             else:
-                action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks)
+                action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks, soft_bounce_count)
         else:
-            action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks)
+            action = rule_based_fallback(obs, assigned_this_episode, hard_rejected_tasks, soft_bounce_count)
 
-        # [FIX-PREBLOCK] Block task immediately when we choose to assign it, BEFORE
-        # calling the env. This prevents the env call from being the only opportunity
-        # to block — in the old code a -0.15 penalty (below the -0.3 threshold) would
-        # not trigger a block, so the same task could be retried on the next step.
-        if action.get("action_type") == "assign" and action.get("task_id"):
-            assigned_this_episode.add(action["task_id"])
+        # [FIX-R1-NO-ASSIGN-PREBLOCK] Assign pre-block removed. It fought with the
+        # post-env soft-bounce discard: when the LLM proposed the same task twice in
+        # a row, the pre-block on step N+1 re-added the task to assigned_this_episode
+        # before the discard from step N's bounce handler could take effect, immediately
+        # overriding the retry window. This caused the guard to burn steps with fallbacks
+        # (T3 steps 4+7) or rule_based_fallback to re-assign a bounced task for a hard
+        # reject (T4 step 6: -4.15). R1 is a synchronous HTTP loop so there is no async
+        # gap that requires a pre-block; the post-env update handles all blocking.
 
-        # [FIX-R1-REASSIGN-BLOCK] Mirror pre-block for reassign: add the task to
-        # reassigned_this_episode immediately so the next step's guard/fallback
-        # cannot emit the same reassign again before the env has even responded.
+        # [FIX-R1-REASSIGN-BLOCK] Keep pre-block for reassign only: add to
+        # reassigned_this_episode immediately so the guard on the very next step
+        # cannot emit the same reassign. Reassign loops are more damaging than
+        # assign loops so this pre-block is retained.
         if action.get("action_type") == "reassign" and action.get("task_id"):
             reassigned_this_episode.add(action["task_id"])
 
@@ -608,8 +626,8 @@ def run_episode(task_name: str) -> float:
             tid = action["task_id"]
             task_after = next((t for t in obs.get("tasks", []) if t["id"] == tid), None)
             was_accepted    = task_after and task_after.get("status") == "in_progress"
-            was_hard_reject = reward < -0.05
-            is_soft_bounce  = -0.06 < reward < 0
+            was_hard_reject = reward < -0.20
+            is_soft_bounce  = -0.20 < reward < 0
 
             if was_accepted or was_hard_reject:
                 assigned_this_episode.add(tid)
@@ -619,24 +637,32 @@ def run_episode(task_name: str) -> float:
                     hard_rejected_tasks.add(tid)
                     soft_bounce_count.pop(tid, None)
             elif is_soft_bounce and task_after and task_after.get("status") == "backlog":
-                # [FIX-R1-SOFTBOUNCE] In R1's 12-step episodes, discarding from
-                # assigned_this_episode on a soft bounce lets the LLM propose the same
-                # task again on the very next step before soft_bounce_count reaches 2.
-                # That second attempt then gets a hard reject (e.g. T4: −0.05 then −4.15)
-                # collapsing hard_sprint. Fix: leave the task in assigned_this_episode on
-                # the first bounce so the guard blocks it immediately. Only escalate to
-                # hard_rejected after 2 bounces (same threshold), but never unblock between
-                # bounces. The pre-block at the top of the loop already added it; we just
-                # must not discard it here.
+                # [FIX-R1-SOFTBOUNCE] Graduated soft-bounce handling:
+                #
+                # First bounce (count 0→1): discard from assigned_this_episode so a
+                # DIFFERENT dev / later step can retry the task. This is correct for
+                # easy/medium where the bounce is a temporary capacity miss on a healthy
+                # task. Permanently blocking on the first bounce prevented retries and
+                # regressed easy_sprint from 0.990 → 0.600.
+                #
+                # Second bounce (count 1→2): do NOT discard. The task has now failed
+                # twice; keeping it blocked stops the LLM from immediately re-proposing
+                # it before soft_bounce_count reaches the escalation threshold, which
+                # was the root cause of the T4 (−0.05 then −4.15) collapse in hard_sprint.
+                #
+                # Third bounce (count 2→3): escalate to hard_rejected_tasks so
+                # rule_based_fallback also skips it via _dep_ok.
                 soft_bounce_count[tid] = soft_bounce_count.get(tid, 0) + 1
-                if soft_bounce_count[tid] >= 2:
+                if soft_bounce_count[tid] >= 3:
                     hard_rejected_tasks.add(tid)
-                    assigned_this_episode.add(tid)  # belt-and-suspenders
+                    assigned_this_episode.add(tid)
                     print(f"  [ESCALATE] {tid} soft-bounced {soft_bounce_count[tid]}× → hard_rejected",
                           flush=True)
-                # NOTE: do NOT discard tid from assigned_this_episode here.
-                # The pre-block already added it; keeping it blocked prevents the
-                # T4-style double-assign pattern in hard_sprint.
+                elif soft_bounce_count[tid] == 1:
+                    # First bounce: allow retry from a different dev/slot.
+                    assigned_this_episode.discard(tid)
+                # Second bounce (count == 2): leave in assigned_this_episode (blocked)
+                # until escalation fires on the third.
 
         print(
             f"[STEP] task={task_name} step={step_num} "

@@ -35,6 +35,19 @@ FIXES vs previous version (bugs identified from baseline run analysis):
              has been running longer than max(5, effort*1.5) days. If so, reassign it
              to a higher-productivity dev. This unblocks the dep chain without
              introducing reassign loops (reassigned_this_episode guards against that).
+  [FIX-R2-7] Stall detection guard against missing assigned_day.
+             When the env does not expose assigned_day or start_day, the fallback
+             value of 0 made running_days == current_day, flagging every in-progress
+             task as stalled from day 1 and causing spurious reassigns in project_hard
+             (regression 0.168 → 0.105). Fix: skip tasks where assigned_day is None
+             or <= 0, disabling stall detection gracefully when the field is absent.
+  [FIX-R2-8] Raise soft-bounce escalation threshold from 2 → 3 bounces.
+             At threshold 2, root tasks like T01 that soft-bounce twice before a
+             dev slot opens get escalated to hard_rejected_tasks, permanently killing
+             their entire dep chain for the remaining 57 steps (project_easy Llama:
+             0 tasks completed, score 0.153 vs 0.229). Three bounces is sufficient
+             signal that a task is truly stuck while still catching the T04-style
+             spiral (−0.05, −0.05, −2.05).
 
 MANDATORY ENV VARS:
     API_BASE_URL  : LLM endpoint  (e.g. https://router.huggingface.co/v1)
@@ -99,7 +112,7 @@ USE_LLM          = _use_llm_raw not in ("0", "false", "no", "off")
 #
 # Example:
 #   LLAMA_BASELINE=1 HF_TOKEN=hf_... python inference_r2.py
-_llama_raw     = os.getenv("LLAMA_BASELINE", "0").strip().lower()
+_llama_raw     = os.getenv("LLAMA_BASELINE", "1").strip().lower()
 LLAMA_BASELINE = _llama_raw not in ("0", "false", "no", "off")
 LLAMA_MODEL    = os.getenv("LLAMA_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 HF_ROUTER_URL  = "https://router.huggingface.co/v1"
@@ -413,7 +426,14 @@ def get_rule_based_action(obs: dict, assigned_this_episode: set,
                 continue
             if not task.get("assigned_to"):
                 continue
-            assigned_day = task.get("assigned_day") or task.get("start_day") or 0
+            # [FIX-R2-STALL-GUARD] Only run stall detection when the env exposes
+            # assigned_day (or start_day). If neither field is present the fallback
+            # value of 0 makes running_days == current_day, flagging every in-progress
+            # task as stalled from day 1 and causing bad early reassigns in project_hard
+            # (regression 0.168 → 0.105). Skip the task when the day cannot be known.
+            assigned_day = task.get("assigned_day") or task.get("start_day")
+            if not assigned_day or assigned_day <= 0:
+                continue
             effort       = task.get("effort", 3)
             # Consider stalled if running longer than effort * 1.5 days or > stale_threshold
             running_days = current_day - assigned_day
@@ -884,13 +904,18 @@ def run_episode(task_name: str) -> float:
             elif is_soft_bounce and task_after and task_after.get("status") == "backlog":
                 # Soft bounce: unblock so fallback can retry once a slot opens.
                 assigned_this_episode.discard(tid)
-                # [FIX-SOFT-BOUNCE-ESCALATE] Count bounces per task. After 2 soft
+                # [FIX-SOFT-BOUNCE-ESCALATE] Count bounces per task. After 3 soft
                 # bounces on the same task, escalate to hard_rejected_tasks — the
                 # task is not going to succeed (skill mismatch appearing as capacity
-                # issue, or truly no slot will ever open). This prevents the
-                # T04 pattern: -0.05, -0.05, -2.05 over 3 consecutive steps.
+                # issue, or truly no slot will ever open).
+                # Threshold raised from 2 → 3: in R2's 60-step episodes, root tasks
+                # like T01 can legitimately soft-bounce twice (dev slot not yet open)
+                # before succeeding. Escalating at bounce 2 permanently killed T01's
+                # entire dep chain for the remaining 57 steps (project_easy: 0 tasks
+                # completed). 3 bounces is enough signal that a task is truly stuck
+                # while still catching the T04-style spiral (-0.05, -0.05, -2.05).
                 soft_bounce_count[tid] = soft_bounce_count.get(tid, 0) + 1
-                if soft_bounce_count[tid] >= 2:
+                if soft_bounce_count[tid] >= 3:
                     hard_rejected_tasks.add(tid)
                     assigned_this_episode.add(tid)  # also block from retrying
                     print(f"  [ESCALATE] {tid} soft-bounced {soft_bounce_count[tid]}× → hard_rejected",
