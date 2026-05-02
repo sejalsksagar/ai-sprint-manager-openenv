@@ -988,7 +988,7 @@ def main() -> None:
             scores[task] = 0.01
 
     elapsed = time.time() - start_time
-    label = "LLAMA BASELINE" if LLAMA_BASELINE else "RULE-BASED"
+    label = "LLAMA BASELINE" if LLAMA_BASELINE else ("RULE-BASED" if not USE_LLM else "TRAINED MODEL")
 
     print("\n" + "=" * 62, flush=True)
     print(f" ROUND 2 — SCORES  [{label}]", flush=True)
