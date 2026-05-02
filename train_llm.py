@@ -222,7 +222,7 @@ GRPO_CONFIG = {
     # max_length is intentionally omitted — setting it alongside
     # max_completion_length causes the "Both max_new_tokens and max_length"
     # warning because TRL maps max_completion_length → max_new_tokens.
-    "num_generations":             8,   # T4-safe; set 4 for A10G+
+    "num_generations":             4,   # T4-safe; set 4 for A10G+
     # [FIX-DIVERSITY] Temperature raised from 0.8 → 1.1 to increase completion
     # diversity within each GRPO group. At 0.8 the model still tends to produce
     # near-identical assign actions for all num_generations completions, which
@@ -859,7 +859,7 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
 
     SKIP_STEPS_R1 = 1   # skip first step (trivial full-backlog state)
     SKIP_STEPS_R2 = 2   # skip first 2 steps (instructions not yet released)
-    SAMPLE_PER_EP = 2   # states to sample per episode
+    SAMPLE_PER_EP = 4   # states to sample per episode
 
     # ── Collect R1 snapshots ──────────────────────────────────────────────────
     for task_name in tasks_r1:
@@ -1142,7 +1142,7 @@ def build_sft_dataset(n_examples: int = 100, phase: str = "both"):
                 ],
                 "completion": dep_ex["completion"],
             })
-            
+
     for act, user_content in zip(synthetic, synthetic_prompts):
         for _ in range(5):   # repeat each 5× so it's not drowned out
             examples.append({
