@@ -563,8 +563,13 @@ def _build_r1_prompt(obs: dict) -> str:
     )
 
 
-def _build_r2_prompt(obs: dict) -> str:
-    """Compact R2 prompt matching inference_r2.py format."""
+def _build_r2_prompt(obs: dict, assigned_set: Optional[set] = None) -> str:
+    """Compact R2 prompt matching inference_r2.py format.
+
+    [FIX-ASSIGNED] accepts assigned_set so the model can see which tasks have
+    already been assigned this episode.  Without this the model loops T01 every
+    step because it has no memory of its own prior actions.
+    """
     current_sprint = obs.get("current_sprint", 1)
     current_day    = obs.get("current_day", 1)
     days_left      = max(0, current_sprint * 10 - current_day + 1)
@@ -597,11 +602,19 @@ def _build_r2_prompt(obs: dict) -> str:
         for d in avail_devs
     )
 
+    # [FIX-ASSIGNED] Show tasks already assigned this episode so the model does
+    # not keep proposing the same task ID on every step.
+    if assigned_set:
+        assigned_str = " ".join(sorted(assigned_set))
+    else:
+        assigned_str = "none"
+
     return (
         f"D{current_day}/60 S{current_sprint}/6 {days_left}d "
         f"done={obs.get('tasks_completed',0)} miss={obs.get('tasks_missed',0)} "
         f"inst={obs.get('instruction_following_score',0):.2f} debt={debt_count}\n"
         f"{inst_section}\n"
+        f"ASSIGNED_THIS_EP: {assigned_str}\n"
         f"BACKLOG(✓=deps_ok): {backlog_str}\n"
         f"IN_PROG: {inprog_str}\n"
         f"DEVS(avail): {devs_str}\n"
@@ -771,15 +784,19 @@ def make_reward_fn(env_base_url: str, phase: str):
 
                 adapted = _adapt_action_to_obs(action, obs)
                 if adapted is None:
-                    # [FIX-VALIDITY] Graduated penalty by failure type so invalid completions
-                    # always contrast with valid ones in the same group (reduces zero-std batches).
+                    # [FIX-VALIDITY] Widened invalid penalty band (was 0.30-0.35, now
+                    # 0.20-0.25) and raised validity_bonus below (was 0.03, now 0.07).
+                    # The old 0.05-wide gap between invalid and valid rewards caused
+                    # frac_reward_zero_std to sit at 0.4-0.8 — GRPO had almost no
+                    # gradient signal.  A wider gap (~0.35) ensures within-group
+                    # variance even when most completions are near-identical.
                     atype = action.get("action_type", "skip")
                     if atype == "assign" and (not action.get("task_id") or not action.get("dev_id")):
-                        invalid_penalty = 0.30   # missing required fields — worst
+                        invalid_penalty = 0.20   # missing required fields — worst
                     elif atype in ("reassign", "unblock") and not action.get("task_id"):
-                        invalid_penalty = 0.32   # missing task_id
+                        invalid_penalty = 0.22   # missing task_id
                     else:
-                        invalid_penalty = 0.35   # stale/unresolvable ID — mildest
+                        invalid_penalty = 0.25   # stale/unresolvable ID — mildest
                     r = max(0.0, invalid_penalty + repeat_penalty)
                     rewards.append(float(r))
                     continue
@@ -789,17 +806,22 @@ def make_reward_fn(env_base_url: str, phase: str):
                 step_r    = float(result.get("reward", 0.0))
                 step_norm = max(0.0, min(1.0, (step_r + 3.0) / 5.0))
                 act_bonus = ACTION_DIVERSITY_BONUS.get(action["action_type"], 0.0)
-                # [FIX-VALIDITY] Small bonus for producing a clean, parseable, valid action.
-                # This ensures valid completions always score above the 0.30-0.35 invalid band,
-                # creating guaranteed within-group variance to reduce frac_reward_zero_std.
-                validity_bonus = 0.03
+                # [FIX-VALIDITY] Raised validity_bonus 0.03 → 0.07 to widen the
+                # gap between valid completions (≥0.57 floor) and invalid ones
+                # (≤0.25 ceiling), ensuring GRPO always sees within-group variance.
+                validity_bonus = 0.07
 
                 if not use_r2:
                     r = step_norm + act_bonus + diversity_bonus + repeat_penalty + validity_bonus
                 else:
                     obs2       = result.get("observation", {})
                     inst_score = float(obs2.get("instruction_following_score", 0.5))
-                    r = (step_norm * 0.6 + inst_score * 0.4
+                    # [FIX-INST] Raised inst_score weight 0.4 → 0.55, lowered step_norm
+                    # 0.6 → 0.45.  In the previous run inst_score ended at 0.12 on
+                    # project_hard — the model was ignoring instructions because step_norm
+                    # alone gave it enough reward.  Flipping the weights makes instruction
+                    # following the primary training signal for R2.
+                    r = (step_norm * 0.45 + inst_score * 0.55
                         + act_bonus + diversity_bonus + repeat_penalty + validity_bonus)
 
             except Exception as e:
@@ -924,7 +946,9 @@ def build_grpo_dataset(n_examples: int = 200, phase: str = "both"):
                 for step in range(SAMPLE_PER_EP):
                     if obs.get("done", False):
                         break
-                    prompt = _build_r2_prompt(obs)
+                    # [FIX-ASSIGNED] pass assigned_set so the prompt shows which
+                    # tasks have already been assigned this episode.
+                    prompt = _build_r2_prompt(obs, assigned_set)
                     examples.append({
                         "prompt": [
                             {"role": "system", "content": R2_SYSTEM_PROMPT},
@@ -1771,6 +1795,14 @@ def main():
     parser.add_argument("--output",      type=str, default="results/trained_model")
     parser.add_argument("--push",        action="store_true",
                         help="Push trained model to HF Hub (requires HF_REPO_ID)")
+    # [FIX-CHECKPOINT] Allow resuming from an existing checkpoint / HF repo instead
+    # of the base Qwen model.  Pass your HF repo ID or a local path:
+    #   --checkpoint sejal-k/multi-sprint-model
+    #   --checkpoint results/trained_model/checkpoint-300
+    # This overrides MODEL_NAME for this run only.
+    parser.add_argument("--checkpoint",  type=str, default=None,
+                        help="Start GRPO from this HF repo ID or local checkpoint path "
+                             "instead of the base model. Skips SFT automatically.")
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -1784,12 +1816,24 @@ def main():
         tokenizer.save_pretrained(args.output)
         return
 
+    # [FIX-CHECKPOINT] If --checkpoint is given, override MODEL_NAME globally so
+    # load_model_and_tokenizer picks it up.  Also force sft_epochs=0 — the
+    # checkpoint already knows the JSON format, re-running SFT would overwrite
+    # reward-learned weights with supervised imitation.
+    sft_epochs = args.sft_epochs
+    if args.checkpoint:
+        global MODEL_NAME
+        MODEL_NAME = args.checkpoint
+        sft_epochs = 0
+        print(f"[INFO] --checkpoint set: loading from '{MODEL_NAME}', "
+              f"SFT skipped (sft_epochs forced to 0)", flush=True)
+
     train(
         phase=args.phase,
         n_dataset_examples=args.episodes,
         output_dir=args.output,
         push_to_hub=args.push,
-        sft_epochs=args.sft_epochs,
+        sft_epochs=sft_epochs,
         gpu_tier=args.gpu_tier,
     )
 
