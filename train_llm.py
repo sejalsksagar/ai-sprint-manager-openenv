@@ -1822,7 +1822,7 @@ def main():
     # reward-learned weights with supervised imitation.
     sft_epochs = args.sft_epochs
     if args.checkpoint:
-        global MODEL_NAME
+        #global MODEL_NAME
         MODEL_NAME = args.checkpoint
         sft_epochs = 0
         print(f"[INFO] --checkpoint set: loading from '{MODEL_NAME}', "
