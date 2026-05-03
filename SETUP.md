@@ -230,31 +230,6 @@ openenv validate
 
 ---
 
-## 💡 Suggested Improvements for Teammates
-
-### 🟢 Easy (Good for getting started)
-
-1. **Better skill matching UI** — Show a skill-to-dev mapping table in the Gradio UI so users know which dev to pick
-2. **Sprint history chart** — Add a reward-over-time line chart using `gr.Plot`
-3. **Add more tasks** — Expand `tasks.py` with more realistic task names and types
-4. **Auto-assign button** — Add a Gradio button that automatically assigns all backlog tasks using a simple rule (best skill match)
-
-### 🟡 Medium
-
-5. **Session isolation** — Currently all users share one env instance. Add session IDs so multiple users can use the UI simultaneously
-6. **Sprint replay** — Save the full episode history and add a "replay" feature to the UI
-7. **Better reward visualization** — Add a bar chart showing per-task completion status
-8. **Configurable sprint length** — Let users set sprint length (5/10/15 days) in the UI
-
-### 🔴 Hard (Advanced)
-
-9. **Real RL training loop** — Add a `train.py` script using Stable-Baselines3 or TRL+GRPO to actually train a policy
-10. **Multi-agent support** — Let multiple AI agents collaborate on sprint management
-11. **WebSocket support** — Upgrade from HTTP to WebSocket for real-time updates per OpenEnv spec
-12. **Custom sprint builder** — Let users define their own tasks and team in the UI
-
----
-
 ## 📤 Submit Your Changes
 
 ```bash
