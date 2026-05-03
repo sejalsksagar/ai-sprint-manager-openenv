@@ -59,86 +59,49 @@ HF_TOKEN         = os.getenv("HF_TOKEN", "")
 # Trained model — loaded once, lazily, in a thread-safe way
 # ══════════════════════════════════════════════════════════════════════════════
 
-_model_lock           = threading.Lock()
-_local_model          = None
-_local_tokenizer      = None
-_model_load_attempted = False
-_model_source         = "none"  # "unsloth" | "transformers" | "none"
+# ── Local model disabled: always use HF Router ───────────────────────────────
+# Unsloth and HF Transformers loading are skipped intentionally.
+# All LLM calls go through the HF Inference Router (OpenAI-compatible API).
+
+_local_model     = None   # always None — local loading disabled
+_local_tokenizer = None
+_model_source    = "hf_router"
+
+HF_ROUTER_MODEL  = os.getenv("HF_ROUTER_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+HF_ROUTER_BASE   = os.getenv("API_BASE_URL",     "https://router.huggingface.co/v1")
 
 
 def _load_trained_model() -> bool:
-    """Load fine-tuned model once. Returns True if ready."""
-    global _local_model, _local_tokenizer, _model_load_attempted, _model_source
-    with _model_lock:
-        if _local_model is not None:
-            return True
-        if _model_load_attempted:
-            return False
-        _model_load_attempted = True
-
-        try:
-            from unsloth import FastLanguageModel
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=LOCAL_MODEL_PATH,
-                max_seq_length=2048,
-                dtype=None,
-                load_in_4bit=True,
-                token=HF_TOKEN or None,
-            )
-            FastLanguageModel.for_inference(model)
-            if hasattr(model, "generation_config") and hasattr(model.generation_config, "max_length"):
-                model.generation_config.max_length = None
-            _local_model, _local_tokenizer = model, tokenizer
-            _model_source = "unsloth"
-            print(f"[MODEL] Loaded via Unsloth 4-bit: {LOCAL_MODEL_PATH}", flush=True)
-            return True
-        except Exception as e:
-            print(f"[MODEL] Unsloth failed ({e}), trying HF Transformers…", flush=True)
-
-        try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, trust_remote_code=True, token=HF_TOKEN or None)
-            # AFTER — force CPU, use float32 (float16 is not well-supported on CPU)
-            model = AutoModelForCausalLM.from_pretrained(
-                LOCAL_MODEL_PATH, torch_dtype=torch.float32,
-                device_map=None,   # or device_map="cpu"
-                low_cpu_mem_usage=False,
-                trust_remote_code=True,
-                token=HF_TOKEN or None,
-            )
-            model = model.to("cpu")
-            model.eval()
-            _local_model, _local_tokenizer = model, tokenizer
-            _model_source = "transformers"
-            print(f"[MODEL] Loaded via HF Transformers fp16: {LOCAL_MODEL_PATH}", flush=True)
-            return True
-        except Exception as e:
-            print(f"[MODEL] Transformers failed ({e}). Will use HF router or rule-based.", flush=True)
-            return False
+    """Local model loading disabled. Always delegate to HF Router."""
+    print("[MODEL] Local model loading skipped — using HF Router.", flush=True)
+    return False
 
 
-def _generate_action(system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str:
-    """Call the locally loaded model. Returns raw string."""
-    if _local_model is None:
+def _hf_router_call(system_prompt: str, user_prompt: str,
+                    temperature: float = 0.3, max_tokens: int = 96) -> str:
+    """Call HF Router (OpenAI-compatible). Returns raw text or empty string."""
+    if not HF_TOKEN:
         return ""
     try:
-        messages = [{"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_prompt}]
-        text = _local_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        inputs = _local_tokenizer(text, return_tensors="pt").to(_local_model.device)
-        import torch
-        with torch.no_grad():
-            out = _local_model.generate(
-                **inputs, max_new_tokens=96,
-                temperature=temperature, do_sample=(temperature > 0),
-                pad_token_id=_local_tokenizer.eos_token_id,
-            )
-        gen = out[0][inputs["input_ids"].shape[1]:]
-        return _local_tokenizer.decode(gen, skip_special_tokens=True).strip()
+        import requests as _req
+        resp = _req.post(
+            f"{HF_ROUTER_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {HF_TOKEN}"},
+            json={
+                "model": HF_ROUTER_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print(f"[MODEL] generate error: {e}", flush=True)
+        print(f"[MODEL] HF Router error: {e}", flush=True)
         return ""
 
 
@@ -483,9 +446,7 @@ def _r1_llm_action(obs_dict: dict, assigned_ids: set) -> tuple[SprintAction, str
       "llm_api_err" — API/network error → fallback used
       "rule_based"  — no model available, rule-based used directly
     """
-    model_ready = _local_model is not None
-
-    if not model_ready and not HF_TOKEN:
+    if not HF_TOKEN:
         return _r1_rule_based(obs_dict, assigned_ids), "rule_based"
 
     tasks_s = "\n".join(
@@ -504,23 +465,9 @@ def _r1_llm_action(obs_dict: dict, assigned_ids: set) -> tuple[SprintAction, str
         f"TASKS:\n{tasks_s}\nDEVS:\n{devs_s}\nOutput JSON action:"
     )
 
-    raw = ""
-    if model_ready:
-        raw = _generate_action(R1_SYSTEM, user_msg, temperature=0.3)
-    else:
-        # HF router fallback
-        try:
-            import requests as _req
-            api_base = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-            resp = _req.post(f"{api_base}/chat/completions",
-                headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                json={"model": "Qwen/Qwen2.5-1.5B-Instruct",
-                      "messages": [{"role": "system", "content": R1_SYSTEM},
-                                   {"role": "user",   "content": user_msg}],
-                      "max_tokens": 80, "temperature": 0.3}, timeout=15)
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
-            return _r1_rule_based(obs_dict, assigned_ids), "llm_api_err"
+    raw = _hf_router_call(R1_SYSTEM, user_msg, temperature=0.3, max_tokens=80)
+    if not raw:
+        return _r1_rule_based(obs_dict, assigned_ids), "llm_api_err"
 
     d = _parse_json(raw)
     if d["action_type"] == "skip" and not raw:
@@ -545,15 +492,10 @@ def r1_run_trained_agent(task_name: str, sess: dict) -> tuple:
     if not sess or "env" not in sess:
         sess = _new_r1_session()
 
-    _load_trained_model()
-    model_ready = _local_model is not None
-
-    if model_ready:
-        mode_label = f"🤖 LOCAL trained model ({LOCAL_MODEL_PATH} via {_model_source})"
-    elif HF_TOKEN:
-        mode_label = "🌐 HF router (Qwen/Qwen2.5-1.5B-Instruct) — base model, NOT fine-tuned"
+    if HF_TOKEN:
+        mode_label = f"🌐 HF Router ({HF_ROUTER_MODEL}) via {HF_ROUTER_BASE}"
     else:
-        mode_label = "🔧 Rule-based only (set HF_TOKEN or LOCAL_MODEL_PATH for model)"
+        mode_label = "🔧 Rule-based only (set HF_TOKEN to enable HF Router)"
 
     sess["reward_history"] = []
     obs = sess["env"].reset(task_name=task_name, seed=42)
@@ -914,8 +856,7 @@ def _r2_rule_based(obs: dict, assigned: set) -> dict:
 
 def _r2_llm_action(obs: dict, assigned: set) -> tuple[dict, str]:
     """Same attribution tagging as R1. Returns (action_dict, source)."""
-    model_ready = _local_model is not None
-    if not model_ready and not HF_TOKEN:
+    if not HF_TOKEN:
         return _r2_rule_based(obs, assigned), "rule_based"
 
     active  = [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)]
@@ -938,22 +879,9 @@ def _r2_llm_action(obs: dict, assigned: set) -> tuple[dict, str]:
         f"Backlog:\n{tasks_s}\nDevs:\n{devs_s}\nOutput JSON:"
     )
 
-    raw = ""
-    if model_ready:
-        raw = _generate_action(R2_SYSTEM, user_msg, temperature=0.5)
-    else:
-        try:
-            import requests as _req
-            api_base = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-            resp = _req.post(f"{api_base}/chat/completions",
-                headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                json={"model": "Qwen/Qwen2.5-1.5B-Instruct",
-                      "messages": [{"role": "system", "content": R2_SYSTEM},
-                                   {"role": "user",   "content": user_msg}],
-                      "max_tokens": 80, "temperature": 0.5}, timeout=20)
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
-            return _r2_rule_based(obs, assigned), "llm_api_err"
+    raw = _hf_router_call(R2_SYSTEM, user_msg, temperature=0.5, max_tokens=80)
+    if not raw:
+        return _r2_rule_based(obs, assigned), "llm_api_err"
 
     d = _parse_json(raw)
     if not raw:
@@ -967,15 +895,10 @@ def r2_run_trained_agent(task_name: str, sess: dict) -> tuple:
     if not sess or "env" not in sess:
         sess = _new_r2_session()
 
-    _load_trained_model()
-    model_ready = _local_model is not None
-
-    if model_ready:
-        mode_label = f"🤖 LOCAL trained model ({LOCAL_MODEL_PATH} via {_model_source})"
-    elif HF_TOKEN:
-        mode_label = "🌐 HF router (base Qwen2.5-1.5B) — NOT the fine-tuned weights"
+    if HF_TOKEN:
+        mode_label = f"🌐 HF Router ({HF_ROUTER_MODEL}) via {HF_ROUTER_BASE}"
     else:
-        mode_label = "🔧 Rule-based only (set LOCAL_MODEL_PATH + HF_TOKEN for model)"
+        mode_label = "🔧 Rule-based only (set HF_TOKEN to enable HF Router)"
 
     sess["reward_history"] = []
     obs = sess["env"].reset(task_name=task_name, seed=42)
