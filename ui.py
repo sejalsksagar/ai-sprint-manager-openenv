@@ -98,12 +98,13 @@ def _load_trained_model() -> bool:
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, token=HF_TOKEN or None)
+            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, trust_remote_code=True, token=HF_TOKEN or None)
             # AFTER — force CPU, use float32 (float16 is not well-supported on CPU)
             model = AutoModelForCausalLM.from_pretrained(
                 LOCAL_MODEL_PATH, torch_dtype=torch.float32,
                 device_map=None,   # or device_map="cpu"
                 low_cpu_mem_usage=False,
+                trust_remote_code=True,
                 token=HF_TOKEN or None,
             )
             model = model.to("cpu")
