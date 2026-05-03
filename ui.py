@@ -3,26 +3,18 @@ AI Sprint Manager — Gradio UI + FastAPI
 Round 1: single-sprint environment
 Round 2: long-horizon multi-sprint project environment
 
-KEY CHANGES:
   [SESSION]  Per-user isolation. Every browser session gets its own
              SprintManagerEnv / ProjectManagerEnv + reward history stored
-             inside gr.State. No shared global env. One user's reset or
-             agent run cannot corrupt another user's board.
+             inside gr.State. No shared global env.
 
-  [MODEL]    Trained model (sejal-k/multi-sprint-model) loaded ONCE at
-             startup via Unsloth 4-bit. Falls back to HF router API if
-             Unsloth unavailable, then to rule-based if no token.
-
-  [ATTRIBUTION] Every agent step is tagged [LLM] or [FB] (fallback) in
-             the log. Guard fires, loop fires, and fallback triggers are
-             counted separately. The final summary line shows:
-               LLM actions: N/total  |  LLM valid rate: X%
-               Fallback actions: M/total  (guard/loop/parse)
-             This lets you audit exactly how much of the score came from
-             the trained model vs the rule-based fallback.
-
-  [API]      FastAPI /reset + /step are now stateless per-call with
+  [API]      FastAPI /reset + /step are stateless per-call with
              optional episode_id for multi-step clients. No shared env.
+
+  [MODEL]    The fine-tuned agent (sejal-k/multi-sprint-model) is not
+             included in this UI — HF Spaces has no GPU and dedicated
+             inference endpoints require paid hosting. The demo supports
+             manual actions and rule-based auto-assign. See blog post
+             "Future Improvements" for the integration plan.
 """
 
 from __future__ import annotations
@@ -52,57 +44,10 @@ from server.project_app             import project_router
 SCENARIO_NAMES = get_scenario_names()
 _sprint_data   = load_sprint_data()
 
-LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "sejal-k/multi-sprint-model")
-HF_TOKEN         = os.getenv("HF_TOKEN", "")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Trained model — loaded once, lazily, in a thread-safe way
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── Local model disabled: always use HF Router ───────────────────────────────
-# Unsloth and HF Transformers loading are skipped intentionally.
-# All LLM calls go through the HF Inference Router (OpenAI-compatible API).
-
-_local_model     = None   # always None — local loading disabled
-_local_tokenizer = None
-_model_source    = "hf_router"
-
-HF_ROUTER_MODEL  = os.getenv("HF_ROUTER_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
-HF_ROUTER_BASE   = os.getenv("API_BASE_URL",     "https://router.huggingface.co/v1")
-
-
-def _load_trained_model() -> bool:
-    """Local model loading disabled. Always delegate to HF Router."""
-    print("[MODEL] Local model loading skipped — using HF Router.", flush=True)
-    return False
-
-
-def _hf_router_call(system_prompt: str, user_prompt: str,
-                    temperature: float = 0.3, max_tokens: int = 96) -> str:
-    """Call HF Router (OpenAI-compatible). Returns raw text or empty string."""
-    if not HF_TOKEN:
-        return ""
-    try:
-        import requests as _req
-        resp = _req.post(
-            f"{HF_ROUTER_BASE}/chat/completions",
-            headers={"Authorization": f"Bearer {HF_TOKEN}"},
-            json={
-                "model": HF_ROUTER_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_prompt},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"[MODEL] HF Router error: {e}", flush=True)
-        return ""
+# Note: The trained LLM agent (sejal-k/multi-sprint-model) is not served in
+# this UI — HF Spaces has no GPU and HF Inference Endpoints require paid hosting.
+# The interactive demo uses manual actions and auto-assign only.
+# See blog post "Future Improvements" for the plan to integrate the trained model.
 
 
 def _parse_json(raw: str) -> dict:
@@ -428,148 +373,6 @@ def _r1_rule_based(obs_dict: dict, assigned_ids: set) -> SprintAction:
     return SprintAction(action_type="skip")
 
 
-R1_SYSTEM = (
-    "You are an expert Tech Lead. Output ONLY a single JSON action:\n"
-    '{"action_type":"<assign|reassign|reprioritize|unblock|skip>",'
-    '"task_id":"<id or null>","dev_id":"<id or null>","new_priority":<1-5 or null>}\n'
-    "Rules: assign only BACKLOG tasks to AVAILABLE developers with matching skill. "
-    "Never assign a task already assigned this episode. No markdown, no explanation."
-)
-
-
-def _r1_llm_action(obs_dict: dict, assigned_ids: set) -> tuple[SprintAction, str]:
-    """
-    Returns (action, source) where source is one of:
-      "llm_valid"   — model output parsed and passed guard checks
-      "llm_guard"   — model output parsed but failed guard → fallback used
-      "llm_parse"   — model output could not be parsed → fallback used
-      "llm_api_err" — API/network error → fallback used
-      "rule_based"  — no model available, rule-based used directly
-    """
-    if not HF_TOKEN:
-        return _r1_rule_based(obs_dict, assigned_ids), "rule_based"
-
-    tasks_s = "\n".join(
-        f"[{t['id']}] {t['name']} P{t['priority']} {t['status']} "
-        f"skill={t['required_skill']} assigned={t['assigned_to'] or '-'}"
-        for t in obs_dict["tasks"])
-    devs_s = "\n".join(
-        f"[{d['id']}] {d['name']} skill={d['skill']} "
-        f"load={d['current_load']}/{d['capacity']} avail={d['is_available']}"
-        for d in obs_dict["developers"])
-    user_msg = (
-        f"Day {obs_dict['current_day']}/{obs_dict['sprint_length']} "
-        f"done={obs_dict['tasks_completed']} missed={obs_dict['tasks_missed']}\n"
-        f"Already assigned this episode (DO NOT assign again): "
-        f"{', '.join(assigned_ids) or 'none'}\n"
-        f"TASKS:\n{tasks_s}\nDEVS:\n{devs_s}\nOutput JSON action:"
-    )
-
-    raw = _hf_router_call(R1_SYSTEM, user_msg, temperature=0.3, max_tokens=80)
-    if not raw:
-        return _r1_rule_based(obs_dict, assigned_ids), "llm_api_err"
-
-    d = _parse_json(raw)
-    if d["action_type"] == "skip" and not raw:
-        return _r1_rule_based(obs_dict, assigned_ids), "llm_parse"
-
-    # Guard: don't re-assign same task this episode
-    if d["action_type"] == "assign" and d.get("task_id") in assigned_ids:
-        return _r1_rule_based(obs_dict, assigned_ids), "llm_guard"
-
-    try:
-        action = SprintAction(**d)
-        return action, "llm_valid"
-    except Exception:
-        return _r1_rule_based(obs_dict, assigned_ids), "llm_guard"
-
-
-def r1_run_trained_agent(task_name: str, sess: dict) -> tuple:
-    """
-    Run the trained model for a full R1 episode. Each step is tagged [LLM] or [FB].
-    Final summary shows LLM valid rate so you can see actual model contribution.
-    """
-    if not sess or "env" not in sess:
-        sess = _new_r1_session()
-
-    if HF_TOKEN:
-        mode_label = f"🌐 HF Router ({HF_ROUTER_MODEL}) via {HF_ROUTER_BASE}"
-    else:
-        mode_label = "🔧 Rule-based only (set HF_TOKEN to enable HF Router)"
-
-    sess["reward_history"] = []
-    obs = sess["env"].reset(task_name=task_name, seed=42)
-    sess["obs"] = obs.model_dump()
-    sess["reward_history"].append({"step": 0, "reward": 0.0, "cumulative": 0.0})
-
-    step_logs      = [mode_label, f"Scenario: {task_name}", "─" * 52]
-    assigned_ids: set = set()
-    last_key          = None
-    loop_count        = 0
-
-    # Attribution counters
-    counts = {"llm_valid": 0, "llm_guard": 0, "llm_parse": 0, "llm_api_err": 0, "rule_based": 0}
-
-    for step in range(12):
-        if sess["obs"].get("done"):
-            break
-
-        # Loop detection: same (action_type, task_id) twice in a row → force fallback
-        action, source = _r1_llm_action(sess["obs"], assigned_ids)
-        key = (action.action_type, action.task_id)
-        if key == last_key and source == "llm_valid":
-            # Model is looping — override
-            action = _r1_rule_based(sess["obs"], assigned_ids)
-            source = "llm_guard"
-            loop_count += 1
-        else:
-            loop_count = 0
-        last_key = key
-
-        counts[source] += 1
-        if action.action_type == "assign" and action.task_id:
-            assigned_ids.add(action.task_id)
-
-        obs, reward, done, info = sess["env"].step(action)
-        sess["obs"] = obs.model_dump()
-        sess["reward_history"].append({"step": step + 1, "reward": reward,
-                                       "cumulative": sess["obs"]["cumulative_reward"]})
-
-        tag       = "[LLM]" if source == "llm_valid" else "[FB] "
-        guard_tag = {"llm_guard": "guard", "llm_parse": "parse",
-                     "llm_api_err": "api_err", "rule_based": "rule"}.get(source, "")
-        fb_note   = f" ← {guard_tag}" if guard_tag else ""
-        t_part    = f"→ {action.task_id}" if action.task_id else "      "
-        d_part    = f"/ {action.dev_id}" if action.dev_id else ""
-        step_logs.append(
-            f"{tag} Day {sess['obs']['current_day']:02d}: "
-            f"{action.action_type:<11} {t_part} {d_part} "
-            f"r={reward:+.2f} cumul={sess['obs']['cumulative_reward']:+.2f}{fb_note}"
-        )
-        if done:
-            score = info.get("final_score", 0.01)
-            step_logs.append(f"\n🏁 Sprint done! Score: {score:.4f}/0.99")
-            break
-
-    # Attribution summary
-    total = sum(counts.values())
-    llm_v = counts["llm_valid"]
-    fb_total = total - llm_v
-    llm_pct  = llm_v / total * 100 if total else 0
-    step_logs += [
-        "─" * 52,
-        "📊 ATTRIBUTION SUMMARY",
-        f"  [LLM] Valid model actions : {llm_v}/{total}  ({llm_pct:.0f}% of steps)",
-        f"  [FB]  Fallback actions     : {fb_total}/{total}  ({100-llm_pct:.0f}% of steps)",
-        f"        breakdown → guard:{counts['llm_guard']}  parse:{counts['llm_parse']}  "
-        f"api_err:{counts['llm_api_err']}  pure_rule:{counts['rule_based']}",
-        "",
-        "  If LLM% is low, the score is mostly from the rule-based fallback,",
-        "  not the trained model. Raise temperature or fix guard issues.",
-    ]
-    return _make_r1_outputs(sess, "\n".join(step_logs))
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # R2 — formatters
 # ══════════════════════════════════════════════════════════════════════════════
@@ -815,20 +618,6 @@ def r2_advance_day(sess: dict) -> tuple:
     return _make_r2_outputs(sess, ev or f"⏩ Day advanced. r={reward:+.2f}")
 
 
-R2_SYSTEM = (
-    "You are an Engineering Manager. Output ONLY a JSON action each step.\n"
-    '{"action_type":"<assign|reassign|reprioritize|unblock|skip>",'
-    '"task_id":"<id or null>","dev_id":"<id or null>","new_priority":<1-5 or null>}\n'
-    "Rules:\n"
-    "- Follow ACTIVE INSTRUCTIONS first — assign their named tasks immediately\n"
-    "- Only assign tasks in BACKLOG status (not in_progress, not done)\n"
-    "- Only assign if all dependencies are done and developer is available\n"
-    "- Never assign a task already assigned this episode\n"
-    "- skip only as last resort\n"
-    "Output ONLY the JSON. No explanation."
-)
-
-
 def _r2_rule_based(obs: dict, assigned: set) -> dict:
     tasks    = obs.get("tasks", [])
     devs     = obs.get("developers", [])
@@ -852,131 +641,6 @@ def _r2_rule_based(obs: dict, assigned: set) -> dict:
             if dev:
                 return {"action_type": "assign", "task_id": t["id"], "dev_id": dev["id"], "new_priority": None}
     return {"action_type": "skip", "task_id": None, "dev_id": None, "new_priority": None}
-
-
-def _r2_llm_action(obs: dict, assigned: set) -> tuple[dict, str]:
-    """Same attribution tagging as R1. Returns (action_dict, source)."""
-    if not HF_TOKEN:
-        return _r2_rule_based(obs, assigned), "rule_based"
-
-    active  = [i for i in obs.get("instruction_queue", []) if not i.get("followed", False)]
-    inst_s  = "\n".join(f"[{i['id']}] {i['text'][:60]}" for i in active[:3]) or "None"
-    done_ids = {t["id"] for t in obs.get("tasks", []) if t["status"] == "done"}
-    backlog  = sorted([t for t in obs.get("tasks", []) if t["status"] == "backlog" and t["id"] not in assigned],
-                      key=lambda t: (t["priority"], t["deadline"]))
-    tasks_s  = "\n".join(
-        f"[{t['id']}] {t['name']} P{t['priority']} skill={t['required_skill']} "
-        f"deps_ok={all(d in done_ids for d in t.get('metadata',{}).get('depends_on',[]))}"
-        for t in backlog[:8])
-    devs_s = "\n".join(
-        f"[{d['id']}] {d['name']} {d['skill']} load={d['current_load']}/{d['capacity']} "
-        f"avail={'Y' if d['is_available'] else 'N'}"
-        for d in obs.get("developers", []))
-    user_msg = (
-        f"Day {obs['current_day']}/60 Sprint {obs.get('current_sprint',1)}/6\n"
-        f"Active instructions:\n{inst_s}\n"
-        f"Already assigned this episode (skip): {', '.join(assigned) or 'none'}\n"
-        f"Backlog:\n{tasks_s}\nDevs:\n{devs_s}\nOutput JSON:"
-    )
-
-    raw = _hf_router_call(R2_SYSTEM, user_msg, temperature=0.5, max_tokens=80)
-    if not raw:
-        return _r2_rule_based(obs, assigned), "llm_api_err"
-
-    d = _parse_json(raw)
-    if not raw:
-        return _r2_rule_based(obs, assigned), "llm_parse"
-    if d["action_type"] == "assign" and d.get("task_id") in assigned:
-        return _r2_rule_based(obs, assigned), "llm_guard"
-    return d, "llm_valid"
-
-
-def r2_run_trained_agent(task_name: str, sess: dict) -> tuple:
-    if not sess or "env" not in sess:
-        sess = _new_r2_session()
-
-    if HF_TOKEN:
-        mode_label = f"🌐 HF Router ({HF_ROUTER_MODEL}) via {HF_ROUTER_BASE}"
-    else:
-        mode_label = "🔧 Rule-based only (set HF_TOKEN to enable HF Router)"
-
-    sess["reward_history"] = []
-    obs = sess["env"].reset(task_name=task_name, seed=42)
-    sess["obs"] = obs if isinstance(obs, dict) else obs
-    sess["reward_history"].append({"step": 0, "reward": 0.0, "cumulative": 0.0})
-
-    logs = [mode_label, f"Scenario: {task_name}  |  60 steps max", "─" * 56]
-    assigned: set = set()
-    last_key      = None
-    loop_count    = 0
-    counts = {"llm_valid": 0, "llm_guard": 0, "llm_parse": 0, "llm_api_err": 0, "rule_based": 0}
-
-    for step in range(60):
-        obs_dict = sess["obs"]
-        if obs_dict.get("done", False):
-            break
-
-        action_dict, source = _r2_llm_action(obs_dict, assigned)
-
-        # Loop detection
-        key = (action_dict.get("action_type"), action_dict.get("task_id"))
-        if key == last_key and source == "llm_valid":
-            loop_count += 1
-            if loop_count >= 2:
-                action_dict = _r2_rule_based(obs_dict, assigned)
-                source = "llm_guard"
-                loop_count = 0
-        else:
-            loop_count = 0
-        last_key = key
-
-        counts[source] += 1
-        try:
-            action = ProjectAction(**action_dict)
-        except Exception:
-            action = ProjectAction(action_type="skip")
-            source = "llm_guard"
-            counts["llm_guard"] += 1
-
-        if action.action_type == "assign" and action.task_id:
-            assigned.add(action.task_id)
-
-        obs, reward, done, info = sess["env"].step(action)
-        sess["obs"] = obs if isinstance(obs, dict) else obs
-        obs_dict    = sess["obs"]
-        sess["reward_history"].append({"step": step + 1, "reward": reward,
-                                       "cumulative": obs_dict.get("cumulative_reward", 0)})
-
-        tag      = "[LLM]" if source == "llm_valid" else "[FB] "
-        fb_note  = {"llm_guard": "guard", "llm_parse": "parse",
-                    "llm_api_err": "api_err", "rule_based": "rule"}.get(source, "")
-        fb_annot = f" ←{fb_note}" if fb_note else ""
-        logs.append(
-            f"{tag} D{obs_dict.get('current_day',0)-1:02d}|S{obs_dict.get('current_sprint',1)}: "
-            f"{action.action_type:<11} {action.task_id or '':>4} "
-            f"r={reward:+.2f} inst={obs_dict.get('instruction_following_score',0):.2f} "
-            f"debt={len(obs_dict.get('tech_debt',[]))}{fb_annot}"
-        )
-        if done:
-            logs.append(f"\n🏁 Project complete! Cumul: {obs_dict.get('cumulative_reward', 0):.2f}")
-            break
-
-    total   = sum(counts.values())
-    llm_v   = counts["llm_valid"]
-    fb_total = total - llm_v
-    llm_pct  = llm_v / total * 100 if total else 0
-    logs += [
-        "─" * 56,
-        "📊 ATTRIBUTION SUMMARY",
-        f"  [LLM] Valid model actions : {llm_v}/{total}  ({llm_pct:.0f}% of steps)",
-        f"  [FB]  Fallback actions     : {fb_total}/{total}  ({100-llm_pct:.0f}% of steps)",
-        f"        breakdown → guard:{counts['llm_guard']}  parse:{counts['llm_parse']}  "
-        f"api_err:{counts['llm_api_err']}  pure_rule:{counts['rule_based']}",
-        "",
-        "  Score is trustworthy when LLM% > 70%. Below that, fallback is",
-        "  doing most of the work — check guard fire reasons above.",
-    ]
-    return _make_r2_outputs(sess, "\n".join(logs))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1023,23 +687,6 @@ with gr.Blocks(title="🤖 AI Sprint Manager", css=CSS) as demo:
                 r1_rchart = gr.Textbox(label="📈 Reward History", lines=14, interactive=False)
                 r1_tchart = gr.Textbox(label="📊 Task Status",    lines=14, interactive=False)
 
-            gr.Markdown("### 🤖 Run Trained LLM Agent")
-            with gr.Row():
-                r1_agent_btn = gr.Button("▶️ Run LLM Agent (sejal-k/multi-sprint-model)",
-                                          variant="primary", scale=1)
-                r1_agent_log = gr.Textbox(
-                    label="🤖 Agent Log  —  [LLM] = trained model acted  |  [FB] = fallback fired",
-                    lines=20, interactive=False, scale=3,
-                    value=(
-                        "Click ▶️ to run the fine-tuned Qwen2.5-1.5B model.\n\n"
-                        "Each line is tagged [LLM] (trained model action) or [FB] (fallback).\n"
-                        "The ATTRIBUTION SUMMARY at the end shows what % of steps the model\n"
-                        "actually drove vs the rule-based fallback — so you can judge the score.\n\n"
-                        "Set LOCAL_MODEL_PATH env var to override the model path.\n"
-                        "Requires HF_TOKEN to download from Hub on first run."
-                    )
-                )
-
             gr.Markdown("### 🎮 Manual Action")
             with gr.Row():
                 r1_at  = gr.Dropdown(choices=["assign","reassign","reprioritize","unblock","skip"],
@@ -1065,12 +712,10 @@ with gr.Blocks(title="🤖 AI Sprint Manager", css=CSS) as demo:
             """)
 
             R1_OUT       = [r1_board, r1_dev, r1_skill, r1_elog,      r1_metr, r1_rchart, r1_tchart, r1_sess]
-            R1_AGENT_OUT = [r1_board, r1_dev, r1_skill, r1_agent_log, r1_metr, r1_rchart, r1_tchart, r1_sess]
 
             r1_reset_btn.click(fn=r1_reset_env,         inputs=[r1_task_sel, r1_sess],                           outputs=R1_OUT)
             r1_auto_btn.click( fn=r1_auto_assign,       inputs=[r1_sess],                                        outputs=R1_OUT)
             r1_act.click(      fn=r1_take_action,       inputs=[r1_at, r1_tid, r1_did, r1_pri, r1_sess],         outputs=R1_OUT)
-            r1_agent_btn.click(fn=r1_run_trained_agent, inputs=[r1_task_sel, r1_sess],                           outputs=R1_AGENT_OUT)
 
         # ── TAB 2 — ROUND 2 ───────────────────────────────────────────────────
         with gr.TabItem("🚀 Round 2 — Project Manager"):
@@ -1106,21 +751,6 @@ with gr.Blocks(title="🤖 AI Sprint Manager", css=CSS) as demo:
 
             r2_rchart = gr.Textbox(label="📈 Cross-Sprint Reward Chart", lines=12, interactive=False)
 
-            gr.Markdown("### 🤖 Run Trained LLM Agent (Round 2)")
-            with gr.Row():
-                r2_agent_btn = gr.Button("▶️ Run LLM Agent (60-day project)", variant="primary", scale=1)
-                r2_agent_log = gr.Textbox(
-                    label="🤖 R2 Agent Log  —  [LLM] = model acted  |  [FB] = fallback  |  attribution at end",
-                    lines=20, interactive=False, scale=3,
-                    value=(
-                        "Click ▶️ to run the trained model on the full 60-day project.\n\n"
-                        "Format: [LLM/FB] D{day}|S{sprint}: {action} {task}  r={reward}  inst={score}  debt={n}\n"
-                        "Fallback tags: ←guard (invalid action), ←parse (bad JSON), ←rule (no model)\n\n"
-                        "ATTRIBUTION SUMMARY at the end shows the LLM valid rate —\n"
-                        "the only reliable way to know if the score came from the model."
-                    )
-                )
-
             gr.Markdown("### 🎮 Manual Action")
             with gr.Row():
                 r2_at   = gr.Dropdown(
@@ -1152,13 +782,11 @@ with gr.Blocks(title="🤖 AI Sprint Manager", css=CSS) as demo:
             """)
 
             R2_OUT       = [r2_timeline, r2_board, r2_devs, r2_inst, r2_debt, r2_metr, r2_rchart, r2_elog,      r2_sess]
-            R2_AGENT_OUT = [r2_timeline, r2_board, r2_devs, r2_inst, r2_debt, r2_metr, r2_rchart, r2_agent_log, r2_sess]
 
             r2_reset_btn.click(fn=r2_reset_project,     inputs=[r2_task_sel, r2_sess],                                    outputs=R2_OUT)
             r2_auto_btn.click( fn=r2_auto_sprint,       inputs=[r2_sess],                                                 outputs=R2_OUT)
             r2_adv_btn.click(  fn=r2_advance_day,       inputs=[r2_sess],                                                 outputs=R2_OUT)
             r2_act.click(      fn=r2_take_action,       inputs=[r2_at, r2_tid, r2_did, r2_pri, r2_tids, r2_sess],         outputs=R2_OUT)
-            r2_agent_btn.click(fn=r2_run_trained_agent, inputs=[r2_task_sel, r2_sess],                                    outputs=R2_AGENT_OUT)
 
 app = gr.mount_gradio_app(api, demo, path="/")
 

@@ -113,23 +113,6 @@ Each task card shows: type emoji | task ID | name | priority | effort (story poi
 
 **📊 Task Status** — visual breakdown of task counts: done / in progress / backlog / missed / blocked. Includes a completion percentage bar.
 
-### Agent Section
-
-```
-[▶️ Run LLM Agent (sejal-k/multi-sprint-model)]
-┌──────────────────────────────────────────────────────────┐
-│ 🤖 Agent Log  —  [LLM] = trained model  |  [FB] = fallback │
-│                                                            │
-│ Each step line:                                            │
-│   [LLM] Day 03: assign → T2 / dev2  r=+1.30 cumul=+3.80   │
-│   [FB]  Day 04: assign → T3 / dev1  r=+1.10 cumul=+4.90 ←guard │
-│                                                            │
-│ ATTRIBUTION SUMMARY at the bottom                          │
-└──────────────────────────────────────────────────────────┘
-```
-
-This is the most important section for evaluating the trained model. See the [Attribution section](#-understanding-attribution-llm-vs-fallback) below for full details.
-
 ### Manual Action Row
 
 ```
@@ -207,84 +190,12 @@ These are the instruction-following tasks that feed the `inst_score` metric. Ign
 
 Shows per-sprint score bars (✅/⚠️/❌ thresholds) plus a cumulative sparkline across all 60 steps.
 
-### R2 Agent Section
-
-Same [LLM] / [FB] tagging as R1, with additional columns:
-```
-[LLM] D05|S1: assign       T03  r=+1.30 inst=0.99 debt=0
-[FB]  D06|S1: assign       T04  r=+1.10 inst=0.99 debt=0 ←guard
-[LLM] D07|S1: skip              r=-0.05 inst=0.99 debt=0
-```
-
-- `D05` = project day 5
-- `S1` = sprint 1
-- `inst` = instruction following score at this step
-- `debt` = number of tech debt tasks at this step
-- `←guard` / `←parse` / `←rule` = why fallback fired
 
 ### R2 Manual Action Row
 
 Same as R1, plus two new fields:
 - **sprint_plan** action: batch-plan multiple tasks for the sprint in one call
 - **Task IDs (sprint_plan)**: comma-separated list, e.g. `T01,T02,T03`
-
----
-
-## 🔍 Understanding Attribution: LLM vs Fallback
-
-This is the most important section if you want to know whether the trained model's score is real.
-
-### The problem
-
-The inference layer has three defence mechanisms that fire when the model produces invalid actions:
-
-| Mechanism | Fires when | Action taken |
-|-----------|-----------|-------------|
-| **GUARD** | Model tries to assign an already-assigned task, or assigns a task with unmet dependencies | Discard model output, run rule-based instead |
-| **LOOP** | Same `(action_type, task_id)` pair appears twice in a row | Override with rule-based |
-| **PARSE** | Model output is not valid JSON | Fall back to rule-based |
-
-Every time one of these fires, the **rule-based fallback** executes instead of the trained model. The reward for that step comes from the fallback, not the model.
-
-### How to read the attribution summary
-
-After every agent run (R1 or R2), the log ends with:
-
-```
-──────────────────────────────────────────────────────
-📊 ATTRIBUTION SUMMARY
-  [LLM] Valid model actions : 5/10  (50% of steps)
-  [FB]  Fallback actions     : 5/10  (50% of steps)
-        breakdown → guard:3  parse:1  api_err:0  pure_rule:1
-
-  Score is trustworthy when LLM% > 70%. Below that, fallback is
-  doing most of the work — check guard fire reasons above.
-```
-
-**What the tags mean:**
-
-| Tag | Meaning |
-|-----|---------|
-| `[LLM]` | Trained model produced valid JSON, passed all guard checks, action was executed |
-| `[FB] ←guard` | Model produced valid JSON but action was invalid (wrong task, unmet dep) |
-| `[FB] ←parse` | Model output could not be parsed as JSON at all |
-| `[FB] ←api_err` | Network/API error reaching the model |
-| `[FB] ←rule` | No model loaded — rule-based ran directly |
-
-### Interpreting the LLM valid rate
-
-| LLM% | What it means |
-|------|--------------|
-| **>80%** | Model is driving the episode. Score is attributable to trained model behaviour. |
-| **50–80%** | Mixed. Look at which steps were [LLM] and which were [FB] to understand the pattern. |
-| **<50%** | Fallback is doing most of the work. Score comparison vs rule-based is misleading. The model may be looping or producing consistently invalid actions. |
-
-### What to do if LLM% is low
-
-1. **Check guard fire reasons** in the step log. If most are `←guard` with `already_assigned`, the model is trying to re-assign completed tasks — a context window or prompt issue.
-2. **Raise temperature** (currently 0.3 for R1, 0.5 for R2). Too-low temperature causes greedy repetition → loop fires.
-3. **Check model loading** — if `←rule` appears, the model never loaded. Check `LOCAL_MODEL_PATH` and `HF_TOKEN` env vars.
-4. **Re-run** — a single run has variance. Attribution should be consistent across 3+ runs before drawing conclusions.
 
 ---
 
@@ -340,16 +251,7 @@ Each browser session gets its own environment instance stored in `gr.State`. No 
 # If they interfere: global env bug (not fixed)
 ```
 
-### Test 2: Agent run in one tab doesn't reset another
-
-```bash
-# Tab A: Reset easy_sprint, manually assign T1 → dev1
-# Tab B: Click "Run LLM Agent" on medium_sprint
-# Expected: Tab A still shows your manual assignment unchanged
-# If Tab A resets: session state bug
-```
-
-### Test 3: API sessions are independent
+### Test 2: API sessions are independent
 
 ```bash
 # Terminal 1 — start a session
@@ -440,101 +342,6 @@ python inference.py
 openenv validate
 # Expected: [OK] ai-sprint-manager: Ready
 ```
-
-### Full test checklist
-
-| # | Test | How | Pass Condition |
-|---|------|-----|---------------|
-| 1 | Server health | `GET /health` | `{"status":"ok"}` |
-| 2 | Reset with episode_id | `POST /reset` | Returns `episode_id`, day=1 |
-| 3 | Assign works | `/step` assign T1→dev1 with episode_id | reward +1.2, T1 in_progress |
-| 4 | Skill mismatch | Assign backend task to frontend dev | reward negative, error message |
-| 5 | Sprint ends | 10 skip steps | `done: true` |
-| 6 | Grader runs | Check final_score in info | value 0.0 – 1.0 |
-| 7 | OpenEnv valid | `openenv validate` | `[OK]` message |
-| 8 | Attribution log | `python inference.py` | `[LLM]`/`[FB]` tags + summary |
-| 9 | LLM% meaningful | Check attribution summary | LLM% > 50% if model loaded |
-| 10 | Session isolation | Two tabs test (above) | Boards don't interfere |
-| 11 | API concurrency | Concurrent test script | Days increment independently |
-| 12 | Docker build | `docker build .` | Exit code 0 |
-| 13 | Docker run | `docker run -p 7860:7860 ...` then health | `{"status":"ok"}` |
-| 14 | Live Space | `curl https://sejal-k-ai-sprint-manager.hf.space/health` | `{"status":"ok"}` |
-| 15 | UI loads | Open http://localhost:7860 | Gradio UI visible, two tabs |
-| 16 | UI reset | Click Reset Sprint | Sprint board populates |
-| 17 | Auto-assign | Click Auto-Assign All | Tasks move to in_progress |
-| 18 | Reward chart | Take 3+ actions | Sparklines appear |
-| 19 | R2 timeline | Reset project_easy | 6-sprint timeline visible |
-| 20 | R2 instructions | Advance 10+ days | Instructions appear in queue |
-
----
-
-## 🎤 Project Demo Script (10 minutes)
-
-### Before Demo
-```bash
-python ui.py
-# Open http://localhost:7860 — full screen
-# Have terminal with inference.py output ready
-```
-
-### [0:00 — 1:30] The Problem
-> "Software teams waste hours every sprint on planning. Which developer gets which task? What happens when someone goes sick? What if a critical bug appears on day 5?"
-
-> "We built an RL environment that simulates exactly this — and trained a 1.5B model to make these decisions better than a zero-shot 8B model."
-
-### [1:30 — 3:00] Show the UI
-- Select `easy_sprint` → **🔄 Reset Sprint**
-- Point to sprint board: *"5 tasks in backlog, 3 developers, 10-day sprint"*
-- Point to Skill Guide: *"This tells you which dev is right for which task"*
-
-### [3:00 — 4:30] Manual Play
-- Assign T3 (frontend) → dev1 (backend): *"Wrong skill — negative reward"*
-- Assign T3 (frontend) → dev2 (frontend): *"Correct match — positive reward"*
-- Point to reward sparkline: *"This is exactly what the model learns from"*
-
-### [4:30 — 6:00] Run the Trained Agent
-- Click **▶️ Run LLM Agent**
-- Point to `[LLM]` and `[FB]` tags: *"Every line tells you whether the trained model or the fallback made that decision"*
-- Point to attribution summary: *"70% of steps were clean model actions — so this score is the model's, not the fallback's"*
-
-### [6:00 — 7:30] Round 2 — Project Manager Tab
-- Switch to Round 2 tab, select `project_medium` → **🔄 Reset Project**
-- *"Same environment but across 6 sprints, 60 days"*
-- Point to Instruction Queue: *"Stakeholder instructions drip-feed. Miss them and lose 30% of your score"*
-- Point to Tech Debt: *"Every missed task slows the whole team for the rest of the project"*
-
-### [7:30 — 9:00] Run R2 Agent
-- Click **▶️ Run LLM Agent (60-day project)**
-- *"Watch the D{day}|S{sprint} format — you can track exactly where the model is in the project"*
-- Point to `inst` column: *"Instruction following score climbing — that's the auxiliary reward signal working"*
-
-### [9:00 — 10:00] Technical Highlights
-> "What makes this stand out:"
-
-- **Per-session isolation** — every user gets their own environment, no shared state
-- **Attribution tracking** — [LLM] vs [FB] tags tell you exactly how much the model contributed
-- **Real-world domain** — not CartPole, actual engineering management decisions
-- **Trained model beats 5× larger zero-shot model** — RL training provides real lift
-
----
-
-## 🐛 Common Issues & Fixes
-
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| `ModuleNotFoundError` | Missing package | `pip install -r requirements.txt` |
-| Port 7860 in use | Other process | Kill it or change port in ui.py |
-| `401 Unauthorized` | Bad HF token | Regenerate at hf.co/settings/tokens |
-| Model never loads | Missing env vars | Set `LOCAL_MODEL_PATH` and `HF_TOKEN` |
-| All steps show `[FB] ←rule` | Model not loaded | Check model loading log at startup |
-| LLM% always 0 | Token missing | Set `HF_TOKEN` env var |
-| Episode_id not found | /step without /reset | Always call /reset first, use returned episode_id |
-| Session boards interfere | Old global env code | Make sure you're running the updated ui.py |
-| Tasks not progressing | No devs assigned | Auto-Assign or assign manually |
-| Score always 0.0 | All tasks missed | Assign earlier, prioritize urgent tasks |
-| Docker timeout | venv in context | Check `.dockerignore` has `venv/` |
-
----
 
 ## 🔬 Is This a Real RL Environment?
 
