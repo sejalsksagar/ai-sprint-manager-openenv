@@ -49,16 +49,22 @@ GRADIO UI  (ui.py)
 | `server/app.py` | OpenEnv HTTP API entry point | Add new endpoints |
 | `client.py` | Typed Python client for RL training | Use in training scripts |
 | `ui.py` | Gradio UI + combined server | Change UI layout |
-| `inference.py` | R1 LLM agent script | Change model/strategy |
-| `inference_r2.py` | R2 LLM agent script (60-day) | Change model/strategy |
+| `inference.py` | R1 LLM agent script (Kaggle/local) | Change model/strategy |
+| `inference_r2.py` | R2 LLM agent script (Kaggle/local) | Change model/strategy |
 | `train_llm.py` | SFT + GRPO training pipeline | Change hyperparameters |
 | `openenv.yaml` | OpenEnv spec metadata | Update task list |
+
+> **Note:** The trained LLM agent (`sejal-k/multi-sprint-model`) is not served in the live HF Spaces UI as of now. The demo supports manual actions and rule-based auto-assign.
+
+---
+
+## 🖥️ UI Overview
+
+The UI has two tabs served at `http://localhost:7860` (or your HF Space URL). There is **no LLM agent button** in the deployed UI — all interaction is via manual actions or the rule-based Auto-Assign button.
 
 ---
 
 ## 🖥️ UI Components — Round 1 (Sprint Manager Tab)
-
-The UI has two main tabs. Here is every component explained.
 
 ### Top Controls Row
 
@@ -68,9 +74,9 @@ The UI has two main tabs. Here is every component explained.
 
 | Component | What it does |
 |-----------|-------------|
-| **Sprint Scenario dropdown** | Choose `easy_sprint` (3 devs, 5 tasks), `medium_sprint` (4 devs, 8 tasks, random events), or `hard_sprint` (5 devs, 12 tasks, urgent bugs). Always reset after changing. |
-| **🔄 Reset Sprint** | Starts a new fresh episode. Clears the board, resets reward history, sets day to 1. Click this first before anything else. |
-| **🤖 Auto-Assign All** | Runs the rule-based heuristic (skill-match + priority sort) to auto-assign every backlog task in one click. Useful to see what a decent baseline looks like. |
+| **🎯 Sprint Scenario** | Choose `easy_sprint` (3 devs, 5 tasks), `medium_sprint` (4 devs, 8 tasks, random events), or `hard_sprint` (5 devs, 12 tasks, urgent bugs). Always reset after changing scenario. |
+| **🔄 Reset Sprint** | Starts a fresh episode. Clears the board, resets reward history, sets day to 1. Click this first before anything else. |
+| **🤖 Auto-Assign All** | Runs the rule-based heuristic (skill-match + priority sort) to assign every backlog task in one click. Assigns all remaining sprints too — useful as a strong baseline. |
 
 ### Main Board Row
 
@@ -124,7 +130,7 @@ Each task card shows: type emoji | task ID | name | priority | effort (story poi
 | **Action** | `assign`, `reassign`, `reprioritize`, `unblock`, or `skip` |
 | **Task ID** | e.g. `T1`, `T3` — must match a task on the board |
 | **Dev ID** | e.g. `dev1`, `dev2` — must match a developer |
-| **Priority** | 1–5 only for `reprioritize` action, leave blank otherwise |
+| **Priority** | 1–5, only for `reprioritize` action — leave blank otherwise |
 
 **📜 Event Log** below the action row shows what just happened — task completions, dev absences, bugs, reward amount.
 
@@ -140,9 +146,9 @@ Each task card shows: type emoji | task ID | name | priority | effort (story poi
 
 | Component | What it does |
 |-----------|-------------|
-| **Project Scenario dropdown** | `project_easy` (25 tasks / 6 sprints), `project_medium` (30 tasks), `project_hard` (40 tasks). |
-| **🔄 Reset Project** | Starts fresh 60-day project. Always click this first. |
-| **🤖 Auto-Assign Sprint** | Assigns all backlog tasks for the *current sprint only* using skill-match heuristic. Does NOT advance the day. |
+| **🎯 Project Scenario** | `project_easy` (25 tasks / 6 sprints), `project_medium` (30 tasks), `project_hard` (40 tasks). |
+| **🔄 Reset Project** | Starts a fresh 60-day project. Always click this first. |
+| **🤖 Auto-Assign Sprint** | Assigns all backlog tasks for the *current sprint only* using skill-match heuristic. Does **not** advance the day — use ⏩ after to progress. |
 | **⏩ Advance Day** | Sends a `skip` action — advances one day without assigning. Use to let the day tick forward, release scheduled instructions, and let in-progress tasks make progress. |
 
 ### Three-Column Board Row
@@ -180,9 +186,9 @@ Also shows the overall project delivery bar (all 6 sprints combined).
 - ✅ = already followed
 - Release day and target sprint
 
-These are the instruction-following tasks that feed the `inst_score` metric. Ignoring them costs you 30% of the final score.
+These feed the `inst_score` metric. Ignoring them costs 30% of the final score.
 
-**🔴 Tech Debt Tracker** — lists every task that was missed at a sprint boundary. Each missed task permanently reduces team productivity by 2%. This is how cascade failures happen — miss 5 tasks in sprint 1 and every developer is 10% slower for the rest of the project.
+**🔴 Tech Debt Tracker** — lists every task that was missed at a sprint boundary. Each missed task permanently reduces team productivity by 2%. Miss 5 tasks in sprint 1 and every developer is 10% slower for the rest of the project.
 
 **📊 Project Metrics** — all key numbers: cumulative reward, team balance, instruction-following score (0–1), tech debt count, average sprint score, task counts.
 
@@ -190,12 +196,108 @@ These are the instruction-following tasks that feed the `inst_score` metric. Ign
 
 Shows per-sprint score bars (✅/⚠️/❌ thresholds) plus a cumulative sparkline across all 60 steps.
 
-
 ### R2 Manual Action Row
 
-Same as R1, plus two new fields:
-- **sprint_plan** action: batch-plan multiple tasks for the sprint in one call
+Same fields as R1, plus two new additions:
+- **`sprint_plan`** action: batch-plans multiple tasks for the sprint in one call
 - **Task IDs (sprint_plan)**: comma-separated list, e.g. `T01,T02,T03`
+
+---
+
+## 🧪 Testing Checklist — Round 1 (Sprint Manager)
+
+Follow these steps in order to confirm Round 1 is working correctly.
+
+### Step 1 — Basic reset and board load
+
+1. Open the **🏃 Round 1 — Sprint Manager** tab
+2. Select `easy_sprint` from the scenario dropdown
+3. Click **🔄 Reset Sprint**
+4. ✅ **Expected:** Sprint Board populates with tasks in `BACKLOG`, Team Workload shows all devs as 🟢FREE, Metrics shows Day 1, reward 0.0
+
+### Step 2 — Manual assign
+
+1. Set Action = `assign`, Task ID = `T1`, Dev ID = `dev1`
+2. Click **▶️ Take Action**
+3. ✅ **Expected:** T1 moves to `IN PROGRESS` on the board, dev1 shows 🟡BUSY, Event Log shows the assignment and a positive reward (~+1.0 to +1.5), Reward History updates
+
+### Step 3 — Auto-Assign All
+
+1. Click **🔄 Reset Sprint** to start fresh
+2. Click **🤖 Auto-Assign All**
+3. ✅ **Expected:** All assignable backlog tasks move to `IN PROGRESS` in one click, Team Workload bars fill up, Sprint Metrics shows increased reward, Reward History shows multiple steps
+
+### Step 4 — Skip to advance days
+
+1. After Auto-Assign, click **▶️ Take Action** with Action = `skip` several times
+2. ✅ **Expected:** Day counter increments each step, progress bars on IN PROGRESS tasks fill, tasks eventually move to `DONE` when complete
+
+### Step 5 — Invalid action guard
+
+1. Try to assign a task to the wrong skill dev (e.g. a backend task to a frontend-only dev)
+2. ✅ **Expected:** Event Log shows a guard/invalid message, reward is 0 or negative, board does not change incorrectly
+
+### Step 6 — All three scenarios
+
+Repeat Steps 1–3 for `medium_sprint` and `hard_sprint`:
+- `medium_sprint`: More tasks (8), random events may fire (dev sick, bug appears mid-sprint). Check that Event Log shows random event messages.
+- `hard_sprint`: 12 tasks, urgent bugs. Some tasks will have very short deadlines — check that MISSED tasks appear in the board if you skip too many days.
+
+---
+
+## 🧪 Testing Checklist — Round 2 (Project Manager)
+
+Follow these steps in order to confirm Round 2 is working correctly.
+
+### Step 1 — Basic reset and timeline load
+
+1. Open the **🚀 Round 2 — Project Manager** tab
+2. Select `project_easy` from the scenario dropdown
+3. Click **🔄 Reset Project**
+4. ✅ **Expected:** Sprint Timeline shows Sprint 1 as 🏃 (current), sprints 2–6 as ⏳, Sprint Board shows Sprint 1 tasks in BACKLOG, Instruction Queue is empty (instructions release later), Tech Debt shows none
+
+### Step 2 — Auto-Assign Sprint (Sprint 1)
+
+1. Click **🤖 Auto-Assign Sprint**
+2. ✅ **Expected:** All Sprint 1 backlog tasks move to IN PROGRESS, Team Workload bars fill, Project Metrics reward increases. The Sprint Timeline and Cross-Sprint Reward Chart also update.
+
+### Step 3 — Advance days through Sprint 1
+
+1. Click **⏩ Advance Day** repeatedly (or use Action = `skip` in the manual row) until Sprint 1 ends (Day 10)
+2. ✅ **Expected:**
+   - Tasks complete and move to DONE as the days pass
+   - Instruction Queue starts populating as instructions are released on their scheduled days
+   - At Day 10, Sprint Timeline updates Sprint 1 to ✅ / ⚠️ / ❌ depending on delivery rate
+   - Sprint Board switches to Sprint 2 tasks
+   - Cross-Sprint Reward Chart shows Sprint 1 bar
+
+### Step 4 — Auto-Assign Sprint for all remaining sprints
+
+Repeat for each sprint (2 through 6):
+1. Click **🤖 Auto-Assign Sprint** at the start of each sprint
+2. Click **⏩ Advance Day** through the 10 days of that sprint
+3. ✅ **Expected per sprint:**
+   - Sprint Timeline updates each sprint's status icon after it completes
+   - If tasks were missed in a previous sprint, Tech Debt Tracker lists them and Team Workload shows `⚠️prod=X.XX` warnings
+   - Instruction Queue items get ✅ when followed, ⚠️ when ignored
+   - Cross-Sprint Reward Chart grows one bar per sprint
+
+### Step 5 — Follow an instruction
+
+1. When the Instruction Queue shows a ⚠️ item, read the target task
+2. Manually assign or reprioritize that task as instructed
+3. ✅ **Expected:** The ⚠️ in the Instruction Queue changes to ✅, Event Log shows instruction-following reward, Project Metrics `inst_score` increases
+
+### Step 6 — Full project completion
+
+After Day 60 (Sprint 6 ends):
+1. ✅ **Expected:** All 6 sprints show a status icon in the Timeline, Project Metrics shows a final delivery score, overall project delivery bar reflects total completion
+
+### Step 7 — All three scenarios
+
+Repeat Steps 1–6 for `project_medium` and `project_hard`:
+- `project_medium` (30 tasks): More complex dependency chains — some tasks will be BLOCKED until dependencies are done. Use `unblock` after resolving them.
+- `project_hard` (40 tasks): Aggressive deadlines. Expect tech debt to accumulate. Watch the `⚠️prod` warnings grow and observe the productivity penalty in the Reward Chart.
 
 ---
 
@@ -248,7 +350,7 @@ Each browser session gets its own environment instance stored in `gr.State`. No 
 # Tab A: Select easy_sprint → Reset Sprint → click Auto-Assign All
 # Tab B: Select hard_sprint → Reset Sprint
 # Expected: Tab B shows hard_sprint board, Tab A still shows easy_sprint board
-# If they interfere: global env bug (not fixed)
+# If they interfere: global env bug
 ```
 
 ### Test 2: API sessions are independent
@@ -266,7 +368,7 @@ curl -X POST http://localhost:7860/reset \
   -d '{"task_name":"hard_sprint","seed":99}'
 # Copy that episode_id too
 
-# Now step each session independently using their episode_ids
+# Step each session independently using their episode_ids
 curl -X POST http://localhost:7860/step \
   -H "Content-Type: application/json" \
   -d '{"episode_id":"<id_from_terminal_1>","action":{"action_type":"assign","task_id":"T1","dev_id":"dev1"}}'
@@ -278,7 +380,7 @@ curl -X POST http://localhost:7860/step \
 # Expected: each returns state from its own episode, no cross-contamination
 ```
 
-### Test 4: Concurrent UI users (load test)
+### Test 3: Concurrent UI users (load test)
 
 ```python
 # run_concurrent_test.py
@@ -310,9 +412,7 @@ for t in threads: t.join()
 
 ---
 
-## ✅ How To Know Everything Is Working
-
-### Quick 60-second check
+## ✅ Quick Smoke Test — 60 Seconds
 
 ```bash
 # 1. Start server
@@ -334,14 +434,12 @@ curl -X POST http://localhost:7860/step \
   -d '{"episode_id":"<your-id>","action":{"action_type":"assign","task_id":"T1","dev_id":"dev1"}}'
 # Expected: reward around +1.2, T1 now in_progress
 
-# 5. Run trained agent
-python inference.py
-# Expected: [LLM] and [FB] tagged lines, attribution summary at end
-
-# 6. Validate
+# 5. Validate
 openenv validate
 # Expected: [OK] ai-sprint-manager: Ready
 ```
+
+---
 
 ## 🔬 Is This a Real RL Environment?
 
@@ -356,24 +454,5 @@ openenv validate
 | Partial observability | ✅ Agent can't predict future events |
 | Trainable with RL | ✅ GRPO / PPO / any policy gradient |
 | Per-session isolation | ✅ Each UI user has independent env |
-| Attribution-transparent | ✅ [LLM] / [FB] tags on every agent step |
 
 ---
-
-## 📊 Actual Benchmark Scores
-
-```
-Round 1 — Single Sprint (10 steps)
-  easy_sprint   : Rule-based 0.99 | Llama-8B 0.99 | Trained-1.5B 0.99
-  medium_sprint : Rule-based 0.67 | Llama-8B 0.50 | Trained-1.5B 0.67
-  hard_sprint   : Rule-based 0.37 | Llama-8B 0.29 | Trained-1.5B 0.29
-  average       : Rule-based 0.68 | Llama-8B 0.59 | Trained-1.5B 0.65
-
-Round 2 — 60-Day Project (6 sprints)
-  project_easy   : Rule-based 0.23 | Llama-8B 0.26 | Trained-1.5B 0.26
-  project_medium : Rule-based 0.17 | Llama-8B 0.16 | Trained-1.5B 0.20 ← best
-  project_hard   : Rule-based 0.10 | Llama-8B 0.09 | Trained-1.5B 0.08
-  average        : Rule-based 0.17 | Llama-8B 0.17 | Trained-1.5B 0.18 ← best overall
-```
-
-The trained 1.5B model achieves the highest R2 average. `project_medium` is the clearest win (+19.7% over rule-based, +23.1% over Llama). To understand how much of this is the trained model vs the fallback, check the [LLM%] in the attribution summary when you run the agent.

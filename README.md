@@ -69,7 +69,7 @@ The agent plays the role of a Tech Lead. Each step it observes the full sprint s
 4. Or click **🤖 Auto-Assign All** to let the system decide
 5. Watch the reward history and task status update in real time
 
-The **Round 2 tab** shows the full 60-day project view: sprint timeline, instruction queue, tech debt tracker, and live LLM agent log.
+The **Round 2 tab** shows the full 60-day project view: sprint timeline, instruction queue and tech debt tracker.
 
 ---
 
@@ -125,23 +125,43 @@ The **Round 2 tab** shows the full 60-day project view: sprint timeline, instruc
 
 ## 📈 Benchmark Scores
 
+> ⚠️ **Important context:** All three models share the same Guard/Loop/Stall inference wrapper — when the wrapper overrides an invalid model action, the rule-based fallback agent executes that step instead. Fallback rates differ by model and scenario and affect how much of each score is attributable to the LLM vs. the fallback. See the fallback rate tables below.
+
 ### Round 1
 
 | Model | easy_sprint | medium_sprint | hard_sprint | Average |
 |---|---|---|---|---|
-| Rule-Based | 0.9900 | 0.6667 | 0.3716 | **0.6761** |
+| Rule-Based | 0.9900 | 0.6667 | **0.3716** | **0.6761** |
 | Llama-3.1-8B (baseline) | 0.9900 | 0.5000 | 0.2858 | 0.5919 |
 | **Trained Qwen2.5-1.5B** | **0.9900** | **0.6667** | 0.2858 | **0.6475** |
+
+**R1 Fallback Rates (% of steps where Guard/Loop overrode the model):**
+
+| Model | easy_sprint | medium_sprint | hard_sprint | Average |
+|---|---|---|---|---|
+| Rule-Based | — | — | — | — (is the fallback) |
+| Llama-3.1-8B | 0% | 40% | 20% | **20%** |
+| **Trained Qwen2.5-1.5B** | **71%** | **80%** | **90%** | **80%** |
+
+The trained model's R1 scores should be interpreted carefully: with 80% fallback rate, these scores primarily reflect the rule-based agent running, not the trained model. The model's training gap in R1 is T01-fixation — it re-proposes already-assigned tasks on nearly every step.
 
 ### Round 2
 
 | Model | project_easy | project_medium | project_hard | Average |
 |---|---|---|---|---|
-| Rule-Based | 0.2308 | 0.1693 | 0.1049 | 0.1683 |
-| Llama-3.1-8B (baseline) | 0.2567 | 0.1647 | 0.0870 | 0.1694 |
+| Rule-Based | 0.2308 | 0.1693 | **0.1049** | 0.1683 |
+| Llama-3.1-8B (baseline) | **0.2567** | 0.1647 | 0.0870 | 0.1694 |
 | **Trained Qwen2.5-1.5B** | **0.2567** | **0.2027** | 0.0750 | **0.1781** |
 
-The trained 1.5B model achieves the **highest average in Round 2**, beating the 5× larger Llama baseline. The `project_medium` improvement (+20% over rule-based, +23% over Llama) reflects effective instruction-following learned through GRPO.
+**R2 Fallback Rates:**
+
+| Model | project_easy | project_medium | project_hard | Average |
+|---|---|---|---|---|
+| Rule-Based | — | — | — | — |
+| Llama-3.1-8B | 33% | 42% | 23% | **33%** |
+| **Trained Qwen2.5-1.5B** | **43%** | **38%** | **32%** | **38%** |
+
+The trained model achieves the highest R2 average with ~62% model autonomy on average. The `project_medium` improvement (+20% over rule-based, +23% over Llama) is the most credible result: genuine model-driven improvement with STALL-rescued reassignments contributing in sprint 2. The `project_hard` underperformance (0.0750 vs 0.1049 rule-based) at 68% model autonomy is genuinely attributable to model decisions.
 
 ---
 
@@ -182,6 +202,8 @@ The inference layer has three defence mechanisms to handle invalid or degenerate
 **LOOP** — detects repetition. If the model emits the same `(action_type, task_id)` pair twice consecutively, overrides with rule-based fallback. Prevents the greedy-decoding lock-on failure mode.
 
 **STALL** — detects long-running tasks. If a task has been in_progress for more than `max(5, effort×1.5)` days, reassigns to a higher-productivity developer. Unblocks frozen dependency chains before they cascade.
+
+> **Fallback rates in practice:** The trained model triggers fallback on ~80% of R1 steps (primarily `already_assigned` violations — the model re-proposes already-allocated tasks) and ~38% of R2 steps. Llama triggers fallback on ~20% of R1 steps and ~33% of R2 steps. When fallback fires, the rule-based agent makes that decision. Scores should be interpreted in light of these rates.
 
 ---
 
@@ -240,7 +262,7 @@ ai-sprint-manager-openenv/
 ├── inference_r2.py           # R2 LLM agent (60-day + guard/loop/stall)
 ├── train_llm.py              # SFT + GRPO training pipeline
 ├── client.py                 # Typed Python client
-├── project_client.py                 # R2 Typed Python client (for RL training)
+├── project_client.py         # R2 Typed Python client (for RL training)
 ├── ui.py                     # Gradio UI + FastAPI combined server
 ├── start.sh                  # Container startup script
 │
@@ -252,16 +274,16 @@ ai-sprint-manager-openenv/
 │   ├── models.py             # Pydantic Action/Observation/State
 │   ├── tasks.py              # Task & Developer dataclasses
 │   ├── environment.py        # Core RL environment logic (R1)
-│   ├── project_graders.py            # R2 Scoring functions (easy/medium/hard)
-│   ├── project_models.py             # R2 Pydantic Action/Observation/State
+│   ├── project_graders.py    # R2 Scoring functions (easy/medium/hard)
+│   ├── project_models.py     # R2 Pydantic Action/Observation/State
 │   ├── project_environment.py     # Extended environment (R2, 60-day)
-│   ├── project_data_loader.py        # R2 JSON data loader with caching
+│   ├── project_data_loader.py     # R2 JSON data loader with caching
 │   └── data_loader.py        # JSON data loader with caching
 │
 └── server/
     ├── __init__.py
     ├── app.py                # OpenEnv-compliant FastAPI server entry
-    └── project_app.py         # R2 OpenEnv-compliant FastAPI server entry
+    └── project_app.py        # R2 OpenEnv-compliant FastAPI server entry
 ```
 
 ---
@@ -299,6 +321,8 @@ python train_llm.py --phase both --episodes 300 \
        --sft-epochs 2 --gpu-tier t4 \
        --output results/trained_model --push
 ```
+
+📓 **Kaggle Notebook:** [AI Sprint Manager — OpenEnv Hackathon '26](https://www.kaggle.com/code/sejalkshirsagar/ai-sprint-manager-openenv-hackathon-26)
 
 ---
 
