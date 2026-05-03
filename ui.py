@@ -99,10 +99,11 @@ def _load_trained_model() -> bool:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, token=HF_TOKEN or None)
+            # AFTER — force CPU, use float32 (float16 is not well-supported on CPU)
             model = AutoModelForCausalLM.from_pretrained(
-                LOCAL_MODEL_PATH,
-                torch_dtype=torch.float32,   # float16 unsupported on CPU
-                device_map=None,
+                LOCAL_MODEL_PATH, torch_dtype=torch.float32,
+                device_map=None,   # or device_map="cpu"
+                low_cpu_mem_usage=False,
                 token=HF_TOKEN or None,
             )
             model = model.to("cpu")
@@ -1063,8 +1064,7 @@ CSS = """
 footer { display: none !important; }
 """
 
-# AFTER — remove css from Blocks, pass it in launch()
-with gr.Blocks(title="🤖 AI Sprint Manager") as demo:
+with gr.Blocks(title="🤖 AI Sprint Manager", css=CSS) as demo:
 
     gr.Markdown("""
     # 🤖 AI Sprint Manager — OpenEnv
@@ -1236,7 +1236,7 @@ with gr.Blocks(title="🤖 AI Sprint Manager") as demo:
             r2_act.click(      fn=r2_take_action,       inputs=[r2_at, r2_tid, r2_did, r2_pri, r2_tids, r2_sess],         outputs=R2_OUT)
             r2_agent_btn.click(fn=r2_run_trained_agent, inputs=[r2_task_sel, r2_sess],                                    outputs=R2_AGENT_OUT)
 
-app = gr.mount_gradio_app(api, demo, path="/", css=CSS)
+app = gr.mount_gradio_app(api, demo, path="/")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7860)
