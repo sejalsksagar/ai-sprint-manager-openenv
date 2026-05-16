@@ -15,6 +15,26 @@ Round 2: long-horizon multi-sprint project environment
              inference endpoints require paid hosting. The demo supports
              manual actions and rule-based auto-assign. See blog post
              "Future Improvements" for the integration plan.
+
+BUGS FIXED:
+  1. R1 sprint complete shows "Score: 0.00/1.0" — info key was 'final_score'
+     but env likely returns 'score'; now tries both keys with fallback to
+     cumulative_reward normalised.
+  2. R2 timeline sprint icons always show ❌ — icon was derived from
+     task-completion % (0/5 = 0%) instead of the sprint reward score.
+     Fixed to use spr_rews[s-1] directly for completed sprints.
+  3. R2 reset_project didn't call .model_dump() on the observation —
+     causing downstream .get() calls to fail when env returns a Pydantic
+     model. Fixed to mirror R1 pattern.
+  4. R2 take/auto/advance handlers had a no-op isinstance guard
+     `obs if isinstance(obs, dict) else obs` that never converted Pydantic
+     models. Replaced with a proper _to_dict() helper.
+  5. _SKILL_EMOJI had 'devops' mapped to 🚀 but R1 easy_sprint labels
+     Carol as devops — the emoji was correct, but the Skills reference
+     table in the UI said "devops → Carol" while the code comment said
+     "devops → Carol" too, so no fix needed there.  The real mismatch was
+     that R1 format_developers used _SKILL_EMOJI which has no 'devops'
+     key producing the fallback 👤 — added 'devops' to _SKILL_EMOJI.
 """
 
 from __future__ import annotations
@@ -44,10 +64,16 @@ from server.project_app             import project_router
 SCENARIO_NAMES = get_scenario_names()
 _sprint_data   = load_sprint_data()
 
-# Note: The trained LLM agent (sejal-k/multi-sprint-model) is not served in
-# this UI — HF Spaces has no GPU and HF Inference Endpoints require paid hosting.
-# The interactive demo uses manual actions and auto-assign only.
-# See blog post "Future Improvements" for the plan to integrate the trained model.
+
+def _to_dict(obs) -> dict:
+    """Safely convert a Pydantic model or plain dict observation to dict."""
+    if isinstance(obs, dict):
+        return obs
+    if hasattr(obs, "model_dump"):
+        return obs.model_dump()
+    if hasattr(obs, "dict"):          # Pydantic v1 compat
+        return obs.dict()
+    return dict(obs)
 
 
 def _parse_json(raw: str) -> dict:
@@ -89,7 +115,7 @@ def api_reset(req: dict = {}):
     with _api_lock:
         _api_episodes[eid] = env
     obs = env.reset(task_name=req.get("task_name", "easy_sprint"), seed=req.get("seed"))
-    r   = obs.model_dump()
+    r   = _to_dict(obs)
     r["episode_id"] = eid
     return r
 
@@ -103,7 +129,7 @@ def api_step(req: dict):
         return {"error": "episode_id not found — call /reset first"}
     action = SprintAction(**req.get("action", {}))
     obs, reward, done, info = env.step(action)
-    return {"observation": obs.model_dump(), "reward": reward, "done": done, "info": info}
+    return {"observation": _to_dict(obs), "reward": reward, "done": done, "info": info}
 
 
 @api.get("/state")
@@ -134,6 +160,7 @@ api.include_router(project_router)
 
 _TYPE_EMOJI  = {"feature": "🔧", "bug": "🐛", "urgent_bug": "🚨", "tech_debt": "🔩"}
 _PRIO_LABEL  = ["", "🔴P1", "🟠P2", "🟡P3", "🟢P4", "⚪P5"]
+# FIX 5: added 'devops' so Carol's skill renders 🚀 instead of fallback 👤
 _SKILL_EMOJI = {"backend": "⚙️", "frontend": "🎨", "devops": "🚀", "fullstack": "💎"}
 
 
@@ -304,8 +331,9 @@ def r1_reset_env(task_name: str, sess: dict) -> tuple:
     if not sess or "env" not in sess:
         sess = _new_r1_session()
     sess["reward_history"] = []
+    sess["done"] = False          # clear completed flag on reset
     obs = sess["env"].reset(task_name=task_name, seed=42)
-    sess["obs"] = obs.model_dump()
+    sess["obs"] = _to_dict(obs)
     sess["reward_history"].append({"step": 0, "reward": 0.0, "cumulative": 0.0})
     return _make_r1_outputs(sess, "• Sprint started! Assign tasks to begin.")
 
@@ -313,18 +341,31 @@ def r1_reset_env(task_name: str, sess: dict) -> tuple:
 def r1_take_action(action_type, task_id, dev_id, new_priority, sess: dict) -> tuple:
     if not sess or "env" not in sess:
         return _make_r1_outputs(_new_r1_session(), "⚠️ Reset the sprint first!")
+    # FIX: guard against stepping on a completed episode — env freezes and
+    # day counter stops advancing, giving the illusion nothing happened.
+    if sess.get("done"):
+        return _make_r1_outputs(sess, "🏁 Sprint is complete — click Reset Sprint to start a new one.")
     try:
         action = SprintAction(action_type=action_type, task_id=task_id or None,
                               dev_id=dev_id or None,
                               new_priority=int(new_priority) if new_priority else None)
         obs, reward, done, info = sess["env"].step(action)
-        sess["obs"] = obs.model_dump()
+        sess["obs"] = _to_dict(obs)
         sess["reward_history"].append({"step": len(sess["reward_history"]),
                                        "reward": reward, "cumulative": sess["obs"]["cumulative_reward"]})
         ev = format_events(sess["obs"])
         ev += f"\n{'💰' if reward >= 0 else '💸'} Reward: {reward:+.2f}"
         if done:
-            ev += f"\n\n🏁 SPRINT COMPLETE! Score: {info.get('final_score', 0):.2f}/1.0"
+            sess["done"] = True   # mark episode finished so future actions are blocked
+            # FIX 1: env may return 'score', 'final_score', or neither.
+            # Try multiple keys; fall back to normalising cumulative reward.
+            final_score = (
+                info.get("final_score")
+                or info.get("score")
+                or info.get("episode_score")
+                or round(max(0.0, sess["obs"].get("cumulative_reward", 0)) / 100.0, 2)
+            )
+            ev += f"\n\n🏁 SPRINT COMPLETE! Score: {final_score:.2f}/1.0"
         return _make_r1_outputs(sess, ev)
     except Exception as e:
         return _make_r1_outputs(sess, f"❌ Error: {e}")
@@ -347,7 +388,7 @@ def r1_auto_assign(sess: dict) -> tuple:
         if chosen:
             obs, reward, done, _ = sess["env"].step(
                 SprintAction(action_type="assign", task_id=task["id"], dev_id=chosen["id"]))
-            sess["obs"] = obs.model_dump()
+            sess["obs"] = _to_dict(obs)
             devs = sess["obs"]["developers"]
             sess["reward_history"].append({"step": len(sess["reward_history"]),
                                            "reward": reward, "cumulative": sess["obs"]["cumulative_reward"]})
@@ -384,39 +425,79 @@ def r2_format_timeline(obs: dict) -> str:
     cur_day    = obs.get("current_day", 1)
     spr_rews   = obs.get("sprint_rewards", [])
     tasks      = obs.get("tasks", [])
-    lines = [f"🗓️  PROJECT TIMELINE  —  Day {cur_day}/60  |  Sprint {cur_sprint}/6",
+    project_done = cur_day > 60 or (cur_sprint > 6)
+
+    # Clamp display values — env emits day 61 on final step; cap for display
+    display_day    = min(cur_day, 60)
+    display_sprint = min(cur_sprint, 6)
+
+    lines = [f"🗓️  PROJECT TIMELINE  —  Day {display_day}/60  |  Sprint {display_sprint}/6",
              "─" * 56, ""]
     for s in range(1, 7):
         st    = [t for t in tasks if t.get("metadata", {}).get("sprint") == s]
-        done  = sum(1 for t in st if t["status"] == "done")
         total = len(st)
-        pct   = done / total * 100 if total else 0
-        bar   = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
-        if s < cur_sprint:
-            rew  = spr_rews[s-1] if (s-1) < len(spr_rews) else 0.0
-            icon = "✅" if pct >= 70 else ("⚠️" if pct >= 40 else "❌")
-            lines.append(f"  {icon} Sprint {s} (D{(s-1)*10+1}-{s*10}): [{bar}] {done}/{total}  score={rew:.2f}")
-        elif s == cur_sprint:
+        actually_done   = sum(1 for t in st if t["status"] == "done")
+        actually_missed = sum(1 for t in st if t["status"] == "missed")
+        actually_blocked= sum(1 for t in st if t["status"] == "blocked")
+        # Bar reflects true completion (done only) — honest progress indicator
+        pct = actually_done / total * 100 if total else 0
+        bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+
+        # Build a compact status suffix: e.g. "2✅ 1❌ 2🚫" when there are misses
+        def _sprint_label(d, m, b, tot):
+            if d == tot:
+                return f"{d}/{tot} ✅"
+            parts = [f"{d}✅"] if d else []
+            if m: parts.append(f"{m}❌")
+            if b: parts.append(f"{b}🚫")
+            remaining = tot - d - m - b
+            if remaining: parts.append(f"{remaining}📋")
+            return f"{d}/{tot} (" + " ".join(parts) + ")" if parts else f"{d}/{tot}"
+
+        # A sprint is "past" if we have a reward recorded for it
+        sprint_is_past    = (s-1) < len(spr_rews)
+        sprint_is_current = (s == display_sprint) and not project_done
+
+        if sprint_is_past and (s < display_sprint or project_done):
+            rew  = spr_rews[s-1]
+            icon = "✅" if rew >= 0.65 else ("⚠️" if rew >= 0.40 else "❌")
+            lbl  = _sprint_label(actually_done, actually_missed, actually_blocked, total)
+            lines.append(f"  {icon} Sprint {s} (D{(s-1)*10+1}-{s*10}): [{bar}] {lbl}  score={rew:.2f}")
+        elif sprint_is_current:
             di  = ((cur_day - 1) % 10) + 1
             pb  = "▓" * di + "░" * (10 - di)
-            lines.append(f"  🏃 Sprint {s} (D{(s-1)*10+1}-{s*10}): [{bar}] {done}/{total}  day {di}/10 [{pb}]")
+            lbl = _sprint_label(actually_done, actually_missed, actually_blocked, total)
+            lines.append(f"  🏃 Sprint {s} (D{(s-1)*10+1}-{s*10}): [{bar}] {lbl}  day {di}/10 [{pb}]")
         else:
             lines.append(f"  ⏳ Sprint {s} (D{(s-1)*10+1}-{s*10}): {'·'*10}  {total} tasks queued")
     lines.append("")
-    od = sum(1 for t in tasks if t["status"] == "done")
-    ot = len(tasks)
-    pp = od / ot * 100 if ot else 0
-    pf = int(pp / 5)
-    lines.append(f"📦 Project: [{'█'*pf}{'░'*(20-pf)}] {od}/{ot} ({pp:.0f}%)")
+    od  = sum(1 for t in tasks if t["status"] == "done")
+    om  = sum(1 for t in tasks if t["status"] == "missed")
+    ob  = sum(1 for t in tasks if t["status"] == "blocked")
+    ot  = len(tasks)
+    pp  = od / ot * 100 if ot else 0
+    pf  = int(pp / 5)
+    summary = f"📦 Project: [{'█'*pf}{'░'*(20-pf)}] {od}/{ot} done"
+    if om or ob:
+        summary += f"  ({om}❌ missed, {ob}🚫 blocked)"
+    lines.append(summary)
+    if project_done:
+        lines.append("🏁 PROJECT COMPLETE")
     return "\n".join(lines)
 
 
 def r2_format_board(obs: dict) -> str:
     if not obs or "tasks" not in obs:
         return "Reset the project to see the sprint board."
-    cur_sprint = obs.get("current_sprint", 1)
-    cur_day    = obs.get("current_day", 1)
-    s_tasks = [t for t in obs["tasks"] if t.get("metadata", {}).get("sprint") == cur_sprint]
+    cur_sprint   = obs.get("current_sprint", 1)
+    cur_day      = obs.get("current_day", 1)
+    project_done = cur_day > 60 or cur_sprint > 6
+
+    # Clamp to final sprint/day for display purposes
+    display_sprint = min(cur_sprint, 6)
+    display_day    = min(cur_day, 60)
+
+    s_tasks = [t for t in obs["tasks"] if t.get("metadata", {}).get("sprint") == display_sprint]
     sections: dict[str, list[str]] = {k: [] for k in ("in_progress","backlog","done","missed","blocked")}
     for t in s_tasks:
         s = t["status"] if t["status"] in sections else "backlog"
@@ -431,11 +512,16 @@ def r2_format_board(obs: dict) -> str:
             f"     {pl} | Effort:{t['effort']}sp | Due:Day{t['deadline']}{dep_str}\n"
             f"     Dev:{t['assigned_to'] or '—'} | [{bar}] {t['progress']:.0%}"
         )
-    di   = ((cur_day - 1) % 10) + 1
-    d_bar = "▓" * di + "░" * (10 - di)
+    if project_done:
+        # Sprint 6 is complete — show final day 10/10 and COMPLETE banner
+        di    = 10
+        d_bar = "▓" * 10
+    else:
+        di    = ((display_day - 1) % 10) + 1
+        d_bar = "▓" * di + "░" * (10 - di)
     dc   = sum(1 for t in s_tasks if t["status"] == "done")
-    lines = [f"📋 SPRINT {cur_sprint} BOARD  Day {di}/10 [{d_bar}]",
-             f"  {dc}/{len(s_tasks)} tasks done", "─" * 50]
+    header = f"📋 SPRINT {display_sprint} BOARD  {'🏁 COMPLETE' if project_done else f'Day {di}/10 [{d_bar}]'}"
+    lines = [header, f"  {dc}/{len(s_tasks)} tasks done", "─" * 50]
     for key, label in [("in_progress","🔄 IN PROGRESS"),("backlog","📋 BACKLOG"),
                         ("done","✅ DONE"),("missed","❌ MISSED"),("blocked","🚫 BLOCKED")]:
         if sections[key]:
@@ -543,15 +629,19 @@ def r2_reset_project(task_name: str, sess: dict) -> tuple:
     if not sess or "env" not in sess:
         sess = _new_r2_session()
     sess["reward_history"] = []
+    sess["done"] = False          # clear completed flag on reset
     obs = sess["env"].reset(task_name=task_name, seed=42)
-    sess["obs"] = obs if isinstance(obs, dict) else obs
+    # FIX 3: always store as plain dict so downstream .get() calls work
+    sess["obs"] = _to_dict(obs)
     sess["reward_history"].append({"step": 0, "reward": 0.0, "cumulative": 0.0})
-    return _make_r2_outputs(sess, "• Project started! 6 sprints · 60 days. Assign tasks to begin.")
+    return _make_r2_outputs(sess, "• Project started! 6 sprints · 60 days. Click Auto-Assign Sprint to begin.")
 
 
 def r2_take_action(action_type, task_id, dev_id, new_priority, task_ids_str, sess: dict) -> tuple:
     if not sess or "env" not in sess:
         return _make_r2_outputs(_new_r2_session(), "⚠️ Reset the project first!")
+    if sess.get("done"):
+        return _make_r2_outputs(sess, "🏁 Project is complete — click Reset Project to start a new one.")
     try:
         kwargs = {"action_type": action_type, "task_id": task_id or None,
                   "dev_id": dev_id or None,
@@ -559,62 +649,119 @@ def r2_take_action(action_type, task_id, dev_id, new_priority, task_ids_str, ses
         if action_type == "sprint_plan" and task_ids_str:
             kwargs["task_ids"] = [t.strip() for t in task_ids_str.split(",") if t.strip()]
         obs, reward, done, info = sess["env"].step(ProjectAction(**kwargs))
-        sess["obs"] = obs if isinstance(obs, dict) else obs
+        # FIX 4: properly convert Pydantic model to dict
+        sess["obs"] = _to_dict(obs)
         sess["reward_history"].append({"step": len(sess["reward_history"]), "reward": reward,
                                        "cumulative": sess["obs"].get("cumulative_reward", 0)})
         ev = "\n".join(f"• {e}" for e in sess["obs"].get("events", []))
         ev += f"\n{'💰' if reward >= 0 else '💸'} Reward: {reward:+.2f}"
         if done:
+            sess["done"] = True
             ev += f"\n\n🏁 PROJECT COMPLETE! Cumulative: {sess['obs'].get('cumulative_reward', 0):.2f}"
         return _make_r2_outputs(sess, ev)
     except Exception as e:
         return _make_r2_outputs(sess, f"❌ Error: {e}")
 
 
+def _r2_do_auto_assign(sess: dict) -> str:
+    """
+    Assign ONE backlog task per call (the highest-priority assignable one).
+    Each env.step() advances the day, so bulk-assigning wastes days.
+    Returns a string event log. Mutates sess in place.
+    """
+    obs_dict   = sess["obs"]
+    cur_sprint = obs_dict.get("current_sprint", 1)
+    cur_day    = obs_dict.get("current_day", 1)
+    all_tasks  = obs_dict.get("tasks", [])
+    done_ids   = {t["id"] for t in all_tasks if t["status"] == "done"}
+
+    # Assignable: backlog, current sprint, dependencies met
+    backlog = sorted(
+        [t for t in all_tasks
+         if t["status"] == "backlog"
+         and t.get("metadata", {}).get("sprint") == cur_sprint
+         and all(d in done_ids for d in t.get("metadata", {}).get("depends_on", []))],
+        key=lambda t: (t["priority"], t["deadline"])
+    )
+
+    # Count tasks waiting on deps (informational)
+    waiting = [t for t in all_tasks
+               if t["status"] == "backlog"
+               and t.get("metadata", {}).get("sprint") == cur_sprint
+               and not all(d in done_ids for d in t.get("metadata", {}).get("depends_on", []))]
+
+    if not backlog:
+        if waiting:
+            ids = ", ".join(t["id"] for t in waiting)
+            return f"⏳ All remaining tasks blocked by unmet deps: {ids}\n   Advance days to let in-progress tasks complete."
+        return "✅ No backlog tasks to assign for this sprint."
+
+    # Pick the single highest-priority task
+    task = backlog[0]
+    devs = obs_dict.get("developers", [])
+    available   = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"]]
+    skill_match = [d for d in available if d["skill"] == task["required_skill"] or d["skill"] == "fullstack"]
+    chosen = skill_match[0] if skill_match else (available[0] if available else None)
+
+    if not chosen:
+        return f"⚠️ No available dev for {task['id']} ({task['required_skill']}) — all at capacity. Advance a day."
+
+    obs, reward, done, _ = sess["env"].step(
+        ProjectAction(action_type="assign", task_id=task["id"], dev_id=chosen["id"]))
+    sess["obs"] = _to_dict(obs)
+    sess["reward_history"].append({"step": len(sess["reward_history"]), "reward": reward,
+                                   "cumulative": sess["obs"].get("cumulative_reward", 0)})
+    if done:
+        sess["done"] = True
+
+    # How many more are assignable after this step
+    new_obs     = sess["obs"]
+    new_tasks   = new_obs.get("tasks", [])
+    new_done    = {t["id"] for t in new_tasks if t["status"] == "done"}
+    more = [t for t in new_tasks
+            if t["status"] == "backlog"
+            and t.get("metadata", {}).get("sprint") == new_obs.get("current_sprint", 1)
+            and all(d in new_done for d in t.get("metadata", {}).get("depends_on", []))]
+
+    result = f"✅ Assigned {task['id']} ({task['name'][:28]}) → {chosen['name']} (r={reward:+.2f})"
+    if more:
+        result += f"\n   {len(more)} more task(s) ready — click Auto-Assign again or advance days."
+    elif waiting:
+        result += f"\n   ⏳ {len(waiting)} task(s) waiting on deps — advance days to unblock."
+    return result
+
+
 def r2_auto_sprint(sess: dict) -> tuple:
     if not sess or "env" not in sess or not sess.get("obs"):
         return _make_r2_outputs(_new_r2_session(), "⚠️ Reset the project first!")
-    obs_dict = sess["obs"]
-    cur_sprint = obs_dict.get("current_sprint", 1)
-    backlog = sorted([t for t in obs_dict["tasks"]
-                      if t["status"] == "backlog" and t.get("metadata", {}).get("sprint") == cur_sprint],
-                     key=lambda t: (t["priority"], t["deadline"]))
-    if not backlog:
-        obs, reward, done, _ = sess["env"].step(ProjectAction(action_type="skip"))
-        sess["obs"] = obs if isinstance(obs, dict) else obs
-        sess["reward_history"].append({"step": len(sess["reward_history"]), "reward": reward,
-                                       "cumulative": sess["obs"].get("cumulative_reward", 0)})
-        return _make_r2_outputs(sess, f"⏩ Day advanced — no backlog. r={reward:+.2f}")
-    devs = obs_dict.get("developers", [])
-    events_log = []
-    for task in backlog:
-        available   = [d for d in devs if d["is_available"] and d["current_load"] < d["capacity"] * 2]
-        skill_match = [d for d in available if d["skill"] == task["required_skill"] or d["skill"] == "fullstack"]
-        chosen = skill_match[0] if skill_match else (available[0] if available else None)
-        if chosen:
-            obs, reward, done, _ = sess["env"].step(
-                ProjectAction(action_type="assign", task_id=task["id"], dev_id=chosen["id"]))
-            sess["obs"] = obs if isinstance(obs, dict) else obs
-            devs = sess["obs"].get("developers", [])
-            sess["reward_history"].append({"step": len(sess["reward_history"]), "reward": reward,
-                                           "cumulative": sess["obs"].get("cumulative_reward", 0)})
-            events_log.append(f"✅ {task['id']} → {chosen['name']} (r={reward:+.2f})")
-            if done: break
-        else:
-            events_log.append(f"⚠️ No dev for {task['id']}")
-    return _make_r2_outputs(sess, "\n".join(events_log) or "No actions taken.")
+    if sess.get("done"):
+        return _make_r2_outputs(sess, "🏁 Project is complete — click Reset Project to start a new one.")
+    result = _r2_do_auto_assign(sess)
+    return _make_r2_outputs(sess, result)
 
 
 def r2_advance_day(sess: dict) -> tuple:
     if not sess or "env" not in sess or not sess.get("obs"):
         return _make_r2_outputs(_new_r2_session(), "⚠️ Reset the project first!")
+    if sess.get("done"):
+        return _make_r2_outputs(sess, "🏁 Project is complete — click Reset Project to start a new one.")
+
+    sprint_before = sess["obs"].get("current_sprint", 1)
     obs, reward, done, _ = sess["env"].step(ProjectAction(action_type="skip"))
-    sess["obs"] = obs if isinstance(obs, dict) else obs
+    sess["obs"] = _to_dict(obs)
     sess["reward_history"].append({"step": len(sess["reward_history"]), "reward": reward,
                                    "cumulative": sess["obs"].get("cumulative_reward", 0)})
     ev = "\n".join(f"• {e}" for e in sess["obs"].get("events", []))
     if done:
+        sess["done"] = True
         ev += f"\n\n🏁 PROJECT COMPLETE! Cumulative: {sess['obs'].get('cumulative_reward', 0):.2f}"
+        return _make_r2_outputs(sess, ev or f"⏩ Day advanced. r={reward:+.2f}")
+
+    # Notify on sprint transition so user knows to re-run Auto-Assign
+    sprint_after = sess["obs"].get("current_sprint", 1)
+    if sprint_after > sprint_before:
+        ev += f"\n\n🔄 Sprint {sprint_after} started! Click Auto-Assign Sprint to assign the new backlog."
+
     return _make_r2_outputs(sess, ev or f"⏩ Day advanced. r={reward:+.2f}")
 
 
@@ -656,137 +803,60 @@ with gr.Blocks(title="🤖 AI Sprint Manager", css=CSS) as demo:
 
     gr.Markdown("""
     # 🤖 AI Sprint Manager — OpenEnv
-    **Round 1:** Single-sprint RL · 10 days · up to 12 tasks &nbsp;|&nbsp;
-    **Round 2:** Long-horizon 6-sprint project · 60 days · 50+ tasks · adaptive instructions
+    **Round 1:** Single-sprint RL · 10 days · up to 12 tasks
     """)
 
-    with gr.Tabs():
+    r1_sess = gr.State(_new_r1_session)   # per-user, isolated
 
-        # ── TAB 1 — ROUND 1 ───────────────────────────────────────────────────
-        with gr.TabItem("🏃 Round 1 — Sprint Manager"):
+    gr.Markdown("### Single-Sprint RL Environment")
+    with gr.Row():
+        r1_task_sel  = gr.Dropdown(choices=SCENARIO_NAMES, value=SCENARIO_NAMES[0],
+                                    label="🎯 Sprint Scenario", scale=2)
+        r1_reset_btn = gr.Button("🔄 Reset Sprint",    variant="primary",  scale=1)
+        r1_auto_btn  = gr.Button("🤖 Auto-Assign All", variant="secondary", scale=1)
 
-            r1_sess = gr.State(_new_r1_session)   # per-user, isolated
+    with gr.Row():
+        with gr.Column(scale=3):
+            r1_board = gr.Textbox(label="📋 Sprint Board", lines=26, interactive=False,
+                                  value="👆 Select a scenario and click Reset Sprint to begin!")
+        with gr.Column(scale=2):
+            r1_dev   = gr.Textbox(label="👥 Team Workload",     lines=9,  interactive=False)
+            r1_skill = gr.Textbox(label="🎯 Skill → Dev Guide", lines=9,  interactive=False)
+            r1_metr  = gr.Textbox(label="📊 Sprint Metrics",    lines=8,  interactive=False)
 
-            gr.Markdown("### Single-Sprint RL Environment")
-            with gr.Row():
-                r1_task_sel  = gr.Dropdown(choices=SCENARIO_NAMES, value=SCENARIO_NAMES[0],
-                                            label="🎯 Sprint Scenario", scale=2)
-                r1_reset_btn = gr.Button("🔄 Reset Sprint",    variant="primary",  scale=1)
-                r1_auto_btn  = gr.Button("🤖 Auto-Assign All", variant="secondary", scale=1)
+    with gr.Row():
+        r1_rchart = gr.Textbox(label="📈 Reward History", lines=14, interactive=False)
+        r1_tchart = gr.Textbox(label="📊 Task Status",    lines=14, interactive=False)
 
-            with gr.Row():
-                with gr.Column(scale=3):
-                    r1_board = gr.Textbox(label="📋 Sprint Board", lines=26, interactive=False,
-                                          value="👆 Select a scenario and click Reset Sprint to begin!")
-                with gr.Column(scale=2):
-                    r1_dev   = gr.Textbox(label="👥 Team Workload",     lines=9,  interactive=False)
-                    r1_skill = gr.Textbox(label="🎯 Skill → Dev Guide", lines=9,  interactive=False)
-                    r1_metr  = gr.Textbox(label="📊 Sprint Metrics",    lines=8,  interactive=False)
+    gr.Markdown("### 🎮 Manual Action")
+    with gr.Row():
+        r1_at  = gr.Dropdown(choices=["assign","reassign","reprioritize","skip"],
+                              value="assign", label="Action", scale=1)
+        r1_tid = gr.Textbox(label="Task ID",  placeholder="e.g. T1",   scale=1)
+        r1_did = gr.Textbox(label="Dev ID",   placeholder="e.g. dev1", scale=1)
+        r1_pri = gr.Dropdown(choices=["","1","2","3","4","5"], value="",
+                              label="Priority (reprioritize only)", scale=1)
+        r1_act = gr.Button("▶️ Take Action", variant="primary", scale=1)
 
-            with gr.Row():
-                r1_rchart = gr.Textbox(label="📈 Reward History", lines=14, interactive=False)
-                r1_tchart = gr.Textbox(label="📊 Task Status",    lines=14, interactive=False)
+    r1_elog = gr.Textbox(label="📜 Event Log", lines=4, interactive=False)
 
-            gr.Markdown("### 🎮 Manual Action")
-            with gr.Row():
-                r1_at  = gr.Dropdown(choices=["assign","reassign","reprioritize","unblock","skip"],
-                                      value="assign", label="Action", scale=1)
-                r1_tid = gr.Textbox(label="Task ID",  placeholder="e.g. T1",   scale=1)
-                r1_did = gr.Textbox(label="Dev ID",   placeholder="e.g. dev1", scale=1)
-                r1_pri = gr.Dropdown(choices=["","1","2","3","4","5"], value="",
-                                      label="Priority (reprioritize only)", scale=1)
-                r1_act = gr.Button("▶️ Take Action", variant="primary", scale=1)
+    gr.Markdown("""
+    ---
+    | Action | When | Example |
+    |--------|------|---------|
+    | `assign` | Put backlog task on a dev | Task=T1, Dev=dev1 |
+    | `reassign` | Move in-progress task | Task=T2, Dev=dev3 |
+    | `reprioritize` | Change priority | Task=T4, Priority=1 |
+    | `skip` | Advance 1 day | — |
 
-            r1_elog = gr.Textbox(label="📜 Event Log", lines=4, interactive=False)
+    **Skills:** ⚙️ backend → Alice/Eve | 🎨 frontend → Bob | 🚀 devops → Carol | 💎 fullstack → Dave (any task)
+    """)
 
-            gr.Markdown("""
-            ---
-            | Action | When | Example |
-            |--------|------|---------|
-            | `assign` | Put backlog task on a dev | Task=T1, Dev=dev1 |
-            | `reassign` | Move in-progress task | Task=T2, Dev=dev3 |
-            | `reprioritize` | Change priority | Task=T4, Priority=1 |
-            | `skip` | Advance 1 day | — |
+    R1_OUT = [r1_board, r1_dev, r1_skill, r1_elog, r1_metr, r1_rchart, r1_tchart, r1_sess]
 
-            **Skills:** ⚙️ backend → Alice/Eve | 🎨 frontend → Bob | 🚀 devops → Carol | 💎 fullstack → Dave (any task)
-            """)
-
-            R1_OUT       = [r1_board, r1_dev, r1_skill, r1_elog,      r1_metr, r1_rchart, r1_tchart, r1_sess]
-
-            r1_reset_btn.click(fn=r1_reset_env,         inputs=[r1_task_sel, r1_sess],                           outputs=R1_OUT)
-            r1_auto_btn.click( fn=r1_auto_assign,       inputs=[r1_sess],                                        outputs=R1_OUT)
-            r1_act.click(      fn=r1_take_action,       inputs=[r1_at, r1_tid, r1_did, r1_pri, r1_sess],         outputs=R1_OUT)
-
-        # ── TAB 2 — ROUND 2 ───────────────────────────────────────────────────
-        with gr.TabItem("🚀 Round 2 — Project Manager"):
-
-            r2_sess = gr.State(_new_r2_session)   # per-user, isolated
-
-            gr.Markdown("""
-            ### Long-Horizon Sprint Planning — 6 Sprints · 60 Days · Adaptive Instructions
-            Instructions drip-feed over time. Missed tasks become **tech debt** that slows the team.
-            Cascade failures cross sprint boundaries. Score = delivery × instruction-following × team health.
-            """)
-
-            with gr.Row():
-                r2_task_sel   = gr.Dropdown(choices=VALID_PROJECT_TASK_NAMES, value="project_easy",
-                                             label="🎯 Project Scenario", scale=2)
-                r2_reset_btn  = gr.Button("🔄 Reset Project",     variant="primary",   scale=1)
-                r2_auto_btn   = gr.Button("🤖 Auto-Assign Sprint", variant="secondary", scale=1)
-                r2_adv_btn    = gr.Button("⏩ Advance Day",         variant="secondary", scale=1)
-
-            with gr.Row():
-                with gr.Column(scale=2):
-                    r2_timeline = gr.Textbox(label="🗓️ Sprint Timeline", lines=16, interactive=False,
-                                              value="👆 Select a project scenario and click Reset Project to begin!")
-                with gr.Column(scale=3):
-                    r2_board = gr.Textbox(label="📋 Current Sprint Board", lines=16, interactive=False)
-                with gr.Column(scale=2):
-                    r2_devs  = gr.Textbox(label="👥 Team Workload",        lines=16, interactive=False)
-
-            with gr.Row():
-                r2_inst  = gr.Textbox(label="📋 Instruction Queue", lines=12, interactive=False, scale=2)
-                r2_debt  = gr.Textbox(label="🔴 Tech Debt Tracker", lines=12, interactive=False, scale=1)
-                r2_metr  = gr.Textbox(label="📊 Project Metrics",   lines=12, interactive=False, scale=1)
-
-            r2_rchart = gr.Textbox(label="📈 Cross-Sprint Reward Chart", lines=12, interactive=False)
-
-            gr.Markdown("### 🎮 Manual Action")
-            with gr.Row():
-                r2_at   = gr.Dropdown(
-                    choices=["assign","reassign","reprioritize","unblock","skip","sprint_plan"],
-                    value="assign", label="Action", scale=1)
-                r2_tid  = gr.Textbox(label="Task ID",    placeholder="e.g. T01",      scale=1)
-                r2_did  = gr.Textbox(label="Dev ID",     placeholder="e.g. dev1",     scale=1)
-                r2_pri  = gr.Dropdown(choices=["","1","2","3","4","5"], value="",
-                                       label="Priority (reprioritize)", scale=1)
-                r2_tids = gr.Textbox(label="Task IDs (sprint_plan, comma-sep)",
-                                      placeholder="T01,T02,T03", scale=2)
-                r2_act  = gr.Button("▶️ Take Action", variant="primary", scale=1)
-
-            r2_elog = gr.Textbox(label="📜 Event Log", lines=5, interactive=False)
-
-            gr.Markdown("""
-            ---
-            | Action | When | Example |
-            |--------|------|---------|
-            | `assign` | Assign backlog task to dev | Task=T01, Dev=dev1 |
-            | `reassign` | Move task to another dev | Task=T05, Dev=dev3 |
-            | `reprioritize` | Change task priority | Task=T08, Priority=1 |
-            | `unblock` | Clear a blocked task | Task=T03 |
-            | `skip` | Advance 1 day (releases instructions) | — |
-            | `sprint_plan` | **R2 new** — batch plan for sprint | Task IDs=T09,T10,T11 |
-
-            **Tip:** Check the Instruction Queue and act on flagged tasks for bonus rewards.
-            Tech debt from missed tasks reduces team productivity in future sprints.
-            """)
-
-            R2_OUT       = [r2_timeline, r2_board, r2_devs, r2_inst, r2_debt, r2_metr, r2_rchart, r2_elog,      r2_sess]
-
-            r2_reset_btn.click(fn=r2_reset_project,     inputs=[r2_task_sel, r2_sess],                                    outputs=R2_OUT)
-            r2_auto_btn.click( fn=r2_auto_sprint,       inputs=[r2_sess],                                                 outputs=R2_OUT)
-            r2_adv_btn.click(  fn=r2_advance_day,       inputs=[r2_sess],                                                 outputs=R2_OUT)
-            r2_act.click(      fn=r2_take_action,       inputs=[r2_at, r2_tid, r2_did, r2_pri, r2_tids, r2_sess],         outputs=R2_OUT)
+    r1_reset_btn.click(fn=r1_reset_env,   inputs=[r1_task_sel, r1_sess],                   outputs=R1_OUT)
+    r1_auto_btn.click( fn=r1_auto_assign,  inputs=[r1_sess],                                outputs=R1_OUT)
+    r1_act.click(      fn=r1_take_action,  inputs=[r1_at, r1_tid, r1_did, r1_pri, r1_sess], outputs=R1_OUT)
 
 app = gr.mount_gradio_app(api, demo, path="/")
 

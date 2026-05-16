@@ -69,7 +69,6 @@ The agent plays the role of a Tech Lead. Each step it observes the full sprint s
 4. Or click **🤖 Auto-Assign All** to let the system decide
 5. Watch the reward history and task status update in real time
 
-The **Round 2 tab** shows the full 60-day project view: sprint timeline, instruction queue and tech debt tracker.
 
 ---
 

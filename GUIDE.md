@@ -134,75 +134,6 @@ Each task card shows: type emoji | task ID | name | priority | effort (story poi
 
 **📜 Event Log** below the action row shows what just happened — task completions, dev absences, bugs, reward amount.
 
----
-
-## 🖥️ UI Components — Round 2 (Project Manager Tab)
-
-### Top Controls Row
-
-```
-[🎯 Project Scenario ▾]  [🔄 Reset Project]  [🤖 Auto-Assign Sprint]  [⏩ Advance Day]
-```
-
-| Component | What it does |
-|-----------|-------------|
-| **🎯 Project Scenario** | `project_easy` (25 tasks / 6 sprints), `project_medium` (30 tasks), `project_hard` (40 tasks). |
-| **🔄 Reset Project** | Starts a fresh 60-day project. Always click this first. |
-| **🤖 Auto-Assign Sprint** | Assigns all backlog tasks for the *current sprint only* using skill-match heuristic. Does **not** advance the day — use ⏩ after to progress. |
-| **⏩ Advance Day** | Sends a `skip` action — advances one day without assigning. Use to let the day tick forward, release scheduled instructions, and let in-progress tasks make progress. |
-
-### Three-Column Board Row
-
-```
-┌──────────────┬────────────────────┬──────────────┐
-│ 🗓️ Timeline   │ 📋 Sprint Board     │ 👥 Team       │
-│ 6 sprints    │ current sprint only │ Workload     │
-└──────────────┴────────────────────┴──────────────┘
-```
-
-**🗓️ Sprint Timeline** — shows all 6 sprints at a glance:
-- ✅ = sprint completed ≥70% delivery
-- ⚠️ = 40–69% delivery
-- ❌ = below 40% delivery
-- 🏃 = current sprint (with day progress bar)
-- ⏳ = future sprint
-
-Also shows the overall project delivery bar (all 6 sprints combined).
-
-**📋 Current Sprint Board** — same format as R1 board but scoped to the current sprint's tasks. Shows dependency info (`Deps: T01,T02`) so you know which tasks are blocked.
-
-**👥 Team Workload** — same as R1 but also shows `⚠️prod=0.8` warning when a developer's productivity has dropped due to tech debt.
-
-### Metrics Row
-
-```
-┌──────────────────────┬───────────────────┬──────────────────┐
-│ 📋 Instruction Queue │ 🔴 Tech Debt       │ 📊 Project Metrics│
-└──────────────────────┴───────────────────┴──────────────────┘
-```
-
-**📋 Instruction Queue** — shows stakeholder instructions that have been released. Each instruction has:
-- ⚠️ = not yet followed (act on this!)
-- ✅ = already followed
-- Release day and target sprint
-
-These feed the `inst_score` metric. Ignoring them costs 30% of the final score.
-
-**🔴 Tech Debt Tracker** — lists every task that was missed at a sprint boundary. Each missed task permanently reduces team productivity by 2%. Miss 5 tasks in sprint 1 and every developer is 10% slower for the rest of the project.
-
-**📊 Project Metrics** — all key numbers: cumulative reward, team balance, instruction-following score (0–1), tech debt count, average sprint score, task counts.
-
-### Cross-Sprint Reward Chart
-
-Shows per-sprint score bars (✅/⚠️/❌ thresholds) plus a cumulative sparkline across all 60 steps.
-
-### R2 Manual Action Row
-
-Same fields as R1, plus two new additions:
-- **`sprint_plan`** action: batch-plans multiple tasks for the sprint in one call
-- **Task IDs (sprint_plan)**: comma-separated list, e.g. `T01,T02,T03`
-
----
 
 ## 🧪 Testing Checklist — Round 1 (Sprint Manager)
 
@@ -245,97 +176,12 @@ Repeat Steps 1–3 for `medium_sprint` and `hard_sprint`:
 
 ---
 
-## 🧪 Testing Checklist — Round 2 (Project Manager)
-
-Follow these steps in order to confirm Round 2 is working correctly.
-
-### Step 1 — Basic reset and timeline load
-
-1. Open the **🚀 Round 2 — Project Manager** tab
-2. Select `project_easy` from the scenario dropdown
-3. Click **🔄 Reset Project**
-4. ✅ **Expected:** Sprint Timeline shows Sprint 1 as 🏃 (current), sprints 2–6 as ⏳, Sprint Board shows Sprint 1 tasks in BACKLOG, Instruction Queue is empty (instructions release later), Tech Debt shows none
-
-### Step 2 — Auto-Assign Sprint (Sprint 1)
-
-1. Click **🤖 Auto-Assign Sprint**
-2. ✅ **Expected:** All Sprint 1 backlog tasks move to IN PROGRESS, Team Workload bars fill, Project Metrics reward increases. The Sprint Timeline and Cross-Sprint Reward Chart also update.
-
-### Step 3 — Advance days through Sprint 1
-
-1. Click **⏩ Advance Day** repeatedly (or use Action = `skip` in the manual row) until Sprint 1 ends (Day 10)
-2. ✅ **Expected:**
-   - Tasks complete and move to DONE as the days pass
-   - Instruction Queue starts populating as instructions are released on their scheduled days
-   - At Day 10, Sprint Timeline updates Sprint 1 to ✅ / ⚠️ / ❌ depending on delivery rate
-   - Sprint Board switches to Sprint 2 tasks
-   - Cross-Sprint Reward Chart shows Sprint 1 bar
-
-### Step 4 — Auto-Assign Sprint for all remaining sprints
-
-Repeat for each sprint (2 through 6):
-1. Click **🤖 Auto-Assign Sprint** at the start of each sprint
-2. Click **⏩ Advance Day** through the 10 days of that sprint
-3. ✅ **Expected per sprint:**
-   - Sprint Timeline updates each sprint's status icon after it completes
-   - If tasks were missed in a previous sprint, Tech Debt Tracker lists them and Team Workload shows `⚠️prod=X.XX` warnings
-   - Instruction Queue items get ✅ when followed, ⚠️ when ignored
-   - Cross-Sprint Reward Chart grows one bar per sprint
-
-### Step 5 — Follow an instruction
-
-1. When the Instruction Queue shows a ⚠️ item, read the target task
-2. Manually assign or reprioritize that task as instructed
-3. ✅ **Expected:** The ⚠️ in the Instruction Queue changes to ✅, Event Log shows instruction-following reward, Project Metrics `inst_score` increases
-
-### Step 6 — Full project completion
-
-After Day 60 (Sprint 6 ends):
-1. ✅ **Expected:** All 6 sprints show a status icon in the Timeline, Project Metrics shows a final delivery score, overall project delivery bar reflects total completion
-
+ 
 ### Step 7 — All three scenarios
 
 Repeat Steps 1–6 for `project_medium` and `project_hard`:
 - `project_medium` (30 tasks): More complex dependency chains — some tasks will be BLOCKED until dependencies are done. Use `unblock` after resolving them.
 - `project_hard` (40 tasks): Aggressive deadlines. Expect tech debt to accumulate. Watch the `⚠️prod` warnings grow and observe the productivity penalty in the Reward Chart.
-
----
-
-## 🔄 What Happens Each Step
-
-```
-Day 1 → Day 2 → Day 3 → ... → Day 10 → DONE (R1)
-Day 1 → Day 2 → ... → Day 60 → DONE (R2, 6 sprints)
-  ↑        ↑        ↑
-agent    agent    agent
-acts     acts     acts
-```
-
-**One step = one day:**
-
-1. Agent receives observation (all tasks, all devs, current day, active instructions)
-2. Agent picks an action
-3. Environment validates the action (guard checks)
-4. Developers work — progress increases on assigned tasks
-5. Random events fire (dev sick, new bug, stall detection)
-6. Instructions release if their day has come
-7. Reward is calculated and returned
-8. Repeat until done
-
----
-
-## 💰 Reward Design — Why It Works for RL
-
-```
-Good actions  →  positive reward immediately
-Bad actions   →  negative reward immediately
-Task done on time  →  bonus
-Task missed deadline  →  penalty
-Sprint ends (R2)  →  sprint delivery score
-Day 60 (R2)  →  final project score
-```
-
-Signal at every step = efficient RL training. A learning agent doesn't have to wait until the end to know if it's doing well.
 
 ---
 
@@ -438,21 +284,5 @@ curl -X POST http://localhost:7860/step \
 openenv validate
 # Expected: [OK] ai-sprint-manager: Ready
 ```
-
----
-
-## 🔬 Is This a Real RL Environment?
-
-| Criterion | Our Environment |
-|-----------|----------------|
-| Sequential decisions | ✅ Each day depends on previous assignments |
-| Large state space | ✅ Tasks × Developers × Day — combinatorial |
-| Non-trivial action space | ✅ 5 types × 12 tasks × 5 devs |
-| Shaped reward | ✅ Signal every step, not just episode end |
-| Stochastic transitions | ✅ Random dev absences, mid-sprint bugs |
-| Clean episode boundaries | ✅ reset() gives fresh state every time |
-| Partial observability | ✅ Agent can't predict future events |
-| Trainable with RL | ✅ GRPO / PPO / any policy gradient |
-| Per-session isolation | ✅ Each UI user has independent env |
 
 ---
